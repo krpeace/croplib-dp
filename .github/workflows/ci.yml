@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install -e ".[dev]"
+      - name: ruff (문법·스타일)
+        run: ruff check .
+      - name: ruff (포맷)
+        run: ruff format --check .
+      - name: pytest (테스트)
+        run: pytest -q

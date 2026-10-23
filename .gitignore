@@ -1,0 +1,33 @@
+# 보안 — 키는 절대 커밋하지 않는다 (환경변수 / GitHub Secrets 에만)
+.env
+.env.*
+!.env.example
+apikey.txt
+*.pem
+
+# 수집 원본·결과물 (DB와 Storage에만 둔다)
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# 로그
+*.log
+
+# OS·IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
