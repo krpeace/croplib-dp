@@ -17,7 +17,7 @@ CropMon의 데이터 파이프라인 (crop library data pipeline). 공공 API에
 ```
 DATA_GO_KR=... SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... python -m croplib_dp.collectors.water --slot "2026-10-25 02" --no-wait
 ```
-결과는 `out/` 폴더에 파일로 남습니다(DB 쓰기는 다음 단계). GitHub Actions의 `collect-dryrun`을 눌러도 같은 일을 합니다.
+결과는 `out/` 폴더에 파일로 남습니다. `--write`를 붙이면 계약 검사를 통과한 결과를 Supabase에 씁니다. GitHub Actions의 `collect-dryrun`을 눌러도 같은 일을 합니다(`write`를 켜면 DB 쓰기).
 
 ## 개발
 ```

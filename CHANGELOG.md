@@ -12,4 +12,5 @@
 - 수집기 (물1-3): 단기예보·ASOS 조회(재시도·마감·직전 발표 대체·인증 오류 멈춤·키 감추기), Supabase 사전 자료 읽기, 한 회차 계산 → DB 표 모양의 줄과 수집 기록. 결과는 파일로(DB 쓰기는 물3)
 - 손으로 누르는 시험 실행 `.github/workflows/collect-dryrun.yml`. 요약·오류를 알림(annotation)으로도 남김
 - ASOS 일시 오류는 두 번 더 시도 (첫 시험 실행에서 한 번 실패한 뒤 더함)
+- DB 올리기 (물3): 올리기 전 계약 검사(v1.2), Supabase 덮어쓰기, 예보 원자료 Storage 보관(`raw_path`), 수집기 `--write`, 시험 실행 버튼에 "DB에 쓰기"
 - `.env.example` 키 이름을 GitHub Secrets와 같게(`DATA_GO_KR`, `KMA_HUB`)

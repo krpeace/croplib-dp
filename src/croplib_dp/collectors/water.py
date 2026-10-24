@@ -52,6 +52,7 @@ from croplib_dp.core.outlook import (
 from croplib_dp.core.water_balance import observed_water_balance
 from croplib_dp.io import kma
 from croplib_dp.io.coefficients import load_error_rows, load_s3_coef, load_s4_coef
+from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import (
     Dictionaries,
     crop_height,
@@ -133,9 +134,7 @@ def _iso(t: Any) -> str | None:
 @dataclass
 class RunLog:
     entries: list[dict] = field(default_factory=list)
-    raw: list[tuple[str, bytes]] = field(
-        default_factory=list
-    )  # (이름, 응답 원문) — 물3에서 Storage에 압축 보관
+    raw: list[tuple[str, bytes]] = field(default_factory=list)  # (이름, 응답 원문) — 시험 실행 결과 파일용
 
     def add(
         self, clock: Clock, kind: str, target: str, attempt: int, res: dict, status: str, note: str = ""
@@ -166,6 +165,7 @@ class ForecastCollector:
         self.key, self.nx, self.ny, self.http, self.clock, self.log = key, int(nx), int(ny), http, clock, log
         self.issues: dict[pd.Timestamp, pd.DataFrame] = {}
         self.complete8: dict[pd.Timestamp, bool] = {}
+        self.raw_pages: dict[pd.Timestamp, list[bytes]] = {}  # 계산에 쓴 발표의 응답 원문 (Storage 보관용)
         self.fatal = ""
 
     def get_issue(self, issue: Any, attempt: int = 1) -> tuple[str, dict | None]:
@@ -182,6 +182,7 @@ class ForecastCollector:
             if chk["required_ok"] and not self.complete8.get(issue):
                 self.issues[issue] = usable_items(df, issue)
                 self.complete8[issue] = chk["complete8"]
+                self.raw_pages[issue] = [body for _, body in res["bodies"]]
         if status == "fatal":
             self.fatal = f"[{res.get('code') or res.get('http')}] {res.get('msg') or res.get('error')}"
         note = "; ".join(chk["missing"]) if chk and chk["missing"] else ""
@@ -237,6 +238,30 @@ class ForecastCollector:
                 break
         if not caught:
             self.catch_up(issue)
+        return out
+
+    def raw_path(self, issue: Any) -> str:
+        """Storage 버킷 raw 안의 위치: fcst/<격자>/<연>/<월>/<발표>.json.gz
+        발표마다 한 파일이고, 다시 받으면 덮어쓴다."""
+        issue = pd.Timestamp(issue)
+        return f"fcst/{self.nx}_{self.ny}/{issue:%Y}/{issue:%m}/{issue:%Y%m%d_%H%M}.json.gz"
+
+    def raw_files(self) -> dict[str, bytes]:
+        """계산에 쓴 발표마다 응답 원문(여러 쪽)을 한 파일로 압축.
+        단기예보 API는 지난 하루치만 주므로 여기 쌓아 둔다."""
+        out = {}
+        for issue, pages in self.raw_pages.items():
+            doc = dict(
+                issue=f"{issue:%Y-%m-%d %H:%M}",
+                grid=f"{self.nx}_{self.ny}",
+                pages=[
+                    p.decode("utf-8", "replace") if isinstance(p, bytes | bytearray) else str(p)
+                    for p in pages
+                ],
+            )
+            out[self.raw_path(issue)] = gzip.compress(
+                json.dumps(doc, ensure_ascii=False).encode("utf-8"), mtime=0
+            )
         return out
 
     def archive(self) -> ForecastArchive:
@@ -316,11 +341,16 @@ class SlotResult:
     water_outlook: list[dict] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
     stations: list[dict] = field(default_factory=list)  # 지점별 요약 (사람이 읽는 보고)
+    raw_files: dict[str, bytes] = field(default_factory=dict)  # Storage 버킷 raw 에 올릴 파일
+    problems: list[str] = field(default_factory=list)  # 계약 검사·올리기에서 생긴 문제
+    uploaded: bool = False
 
     @property
     def failed(self) -> bool:
-        return any(r["result"] == "실패" for r in self.forecast_runs) or any(
-            not s["asos_ok"] for s in self.stations
+        return (
+            any(r["result"] == "실패" for r in self.forecast_runs)
+            or any(not s["asos_ok"] for s in self.stations)
+            or bool(self.problems)
         )
 
 
@@ -456,12 +486,17 @@ def run_station(
                 obs_prev_date=None if svc["obs_prev"] is None else svc["obs_prev"].isoformat(),
                 attempts=max(int(col["attempts"]), 1),
                 collector=COLLECTOR,
-                raw_path=None,
+                raw_path=_raw_path(collector, svc.get("src_run") or issue),
                 error=(svc["error"] or None),
             )
         )
         summary.update(result=res_name, on_time=on_time, attempts=col["attempts"], error=svc["error"])
     return summary
+
+
+def _raw_path(collector: "ForecastCollector", issue: Any) -> str | None:
+    issue = pd.Timestamp(issue)
+    return collector.raw_path(issue) if issue in collector.raw_pages else None
 
 
 def run_slot(
@@ -513,6 +548,8 @@ def run_slot(
                 )
             )
         summary = run_station(name, issue, stn_id, d, weather, col, collector, err_all, result)
+        if collector is not None:
+            result.raw_files.update(collector.raw_files())
         summary["asos_ok"] = res.get("status") == "ok" if res else True
         summary["asos_last"] = str(weather[-1]["date"]) if weather else None
         summary["asos_status"] = res.get("status") if res else "조회 안 함"
@@ -536,8 +573,11 @@ def summary_text(r: SlotResult) -> str:
                 + (f", 전망 출발 {c['start_dr_mm']} mm, 관수 필요 예상 {c['need']}" if "need" in c else "")
                 + f" (Kc 중기 {c['kc_mid']}, 후기 {c['kc_end']})"
             )
+    if r.problems:
+        lines += ["", "## 문제"] + [f"- {x}" for x in r.problems]
     lines += [
         "",
+        f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
         f"water_balance_daily {len(r.water_balance_daily)}, water_outlook {len(r.water_outlook)}",
     ]
@@ -563,6 +603,63 @@ def write_outputs(r: SlotResult, out_dir: Path) -> Path:
     return d
 
 
+# ── DB에 올리기 (물3) ───────────────────────────────────────────────────
+RUN_KEY = ("run_at", "stn_id", "collector")  # water_outlook 줄에 run_id 대신 붙여 둔 회차 열쇠
+
+
+def check_contract(r: SlotResult, taw_by_scenario: dict[str, float]) -> list[str]:
+    """네 표를 계약 v1.2로 검사. 어긋난 곳 설명 목록"""
+    return (
+        check_rows("forecast_runs", r.forecast_runs)
+        + check_rows("weather_daily", r.weather_daily)
+        + check_rows("water_balance_daily", r.water_balance_daily, taw_by_scenario)
+        + check_rows("water_outlook", r.water_outlook, taw_by_scenario, ignore=("run_id",), extra=RUN_KEY)
+    )
+
+
+def _run_key(row: dict) -> tuple:
+    return (pd.Timestamp(row["run_at"]), str(row["stn_id"]), row["collector"])
+
+
+def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> SlotResult:
+    """계약 검사 → 원자료(Storage) → weather_daily → water_balance_daily → forecast_runs → water_outlook.
+    계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 '실패'와 이유를 담아 올린다.
+    원자료 올리기가 실패하면 기록에 남기고 raw_path를 비운 채 계속한다(계산 결과가 더 중요)."""
+    problems = check_contract(r, taw_by_scenario)
+    if problems:
+        r.problems += problems
+        reason = ("계약 검사: " + problems[0])[:500]
+        runs = [dict(x, result="실패", on_time=False, error=reason) for x in r.forecast_runs]
+        if runs and not check_rows("forecast_runs", runs):
+            writer.upsert("forecast_runs", runs, SPECS["forecast_runs"].key)
+        return r
+    for path, data in sorted(r.raw_files.items()):
+        try:
+            writer.upload("raw", path, data)
+        except RuntimeError as e:
+            r.problems.append(str(e)[:300])
+            for x in r.forecast_runs:
+                if x["raw_path"] == path:
+                    x["raw_path"] = None
+    writer.upsert("weather_daily", r.weather_daily, SPECS["weather_daily"].key)
+    writer.upsert("water_balance_daily", r.water_balance_daily, SPECS["water_balance_daily"].key)
+    saved = writer.upsert("forecast_runs", r.forecast_runs, SPECS["forecast_runs"].key, returning=True)
+    run_id = {_run_key(x): x["run_id"] for x in saved}
+    outlook = []
+    for o in r.water_outlook:
+        k = _run_key(o)
+        if k not in run_id:
+            raise RuntimeError(f"water_outlook 의 회차 {k} 가 forecast_runs 에 없습니다")
+        outlook.append({"run_id": run_id[k], **{c: v for c, v in o.items() if c not in RUN_KEY}})
+    writer.upsert("water_outlook", outlook, SPECS["water_outlook"].key)
+    r.uploaded = True
+    return r
+
+
+def taw_map(d: Dictionaries) -> dict[str, float]:
+    return {s["scenario_id"]: float(s["taw_mm"]) for s in d.scenarios}
+
+
 def _env(name: str) -> str:
     v = os.environ.get(name, "").strip()
     if not v:
@@ -576,12 +673,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 전체)")
     p.add_argument("--no-wait", action="store_true", help="재시도 없이 지금 한 번만 받기 (시험 실행)")
+    p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase에 쓰기")
     a = p.parse_args(argv)
     clock = Clock()
     name, issue = parse_slot(a.slot) if a.slot else current_slot(clock.now())
     d = load_dictionaries(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
     stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
     r = run_slot(name, issue, d, _env("DATA_GO_KR"), clock=clock, stations=stations, wait=not a.no_wait)
+    if a.write:
+        from croplib_dp.io.supabase_write import SupabaseWriter
+
+        publish(r, SupabaseWriter(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")), taw_map(d))
     out = write_outputs(r, Path(a.out))
     print(summary_text(r))
     print(f"결과 폴더: {out}")
