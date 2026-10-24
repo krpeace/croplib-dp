@@ -1,7 +1,8 @@
 name: collect-dryrun
 
 # 물 수집기 시험 실행: 사람이 Actions 화면에서 눌렀을 때만 돈다 (예약 실행은 물2에서 collect.yml로 더한다).
-# 실제 공공 API로 한 회차를 계산하고, 결과 파일을 이 실행의 Artifacts에 올린다. DB에는 쓰지 않는다.
+# 실제 공공 API로 한 회차를 계산하고, 결과 파일을 이 실행의 Artifacts에 올린다.
+# DB에는 "write"를 켰을 때만 쓴다(계약 검사를 통과해야 함).
 # 키는 GitHub Secrets에서만 읽고, 기록에는 감춘 주소만 남긴다.
 
 on:
@@ -17,6 +18,10 @@ on:
         default: ""
       wait:
         description: "마감(발표 + 90분)까지 재시도하며 기다리기"
+        type: boolean
+        default: false
+      write:
+        description: "계약 검사를 통과하면 Supabase DB에 쓰기"
         type: boolean
         default: false
 
@@ -39,7 +44,7 @@ jobs:
           cache: pip
       - name: 설치
         run: pip install .
-      - name: 한 회차 계산 (DB 쓰기 없음)
+      - name: 한 회차 계산 (write를 켜면 DB 쓰기)
         env:
           DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -47,11 +52,13 @@ jobs:
           SLOT: ${{ inputs.slot }}
           STATIONS: ${{ inputs.stations }}
           WAIT: ${{ inputs.wait }}
+          WRITE: ${{ inputs.write }}
         run: |
           args=(--out out)
           if [ -n "$SLOT" ]; then args+=(--slot "$SLOT"); fi
           if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
           if [ "$WAIT" != "true" ]; then args+=(--no-wait); fi
+          if [ "$WRITE" = "true" ]; then args+=(--write); fi
           set +e
           python -m croplib_dp.collectors.water "${args[@]}" 2> err.txt
           code=$?

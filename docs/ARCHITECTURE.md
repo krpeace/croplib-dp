@@ -54,8 +54,20 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 - 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록을 남긴다. 예보가 없는 지점은 관측 물수지만 계산하고, ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다.
 - 서버는 받은 예보를 쌓아 두지 않는다. 그래서 하루 넘게 지난 관측 결측일은 예보로 채우지 못하고 앞 7일 평균이 된다. 물3에서 예보 원자료를 Storage에 쌓으면 현장 PC처럼 채운다.
 - 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--out out]`. 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표 4개(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
-- ASOS 조회가 일시 오류(시간 초과·서버 오류)면 20초, 60초 뒤 두 번 더 시도한다.
+- ASOS 조회가 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 세 번 더 시도한다. 시험 실행에서 공공데이터포털이 몇 분 동안 모든 요청에 응답하지 않은 적이 두 번 있었다.
 - 시험 실행: GitHub Actions → `collect-dryrun` → Run workflow. 손으로 누를 때만 돌고, 결과 파일은 그 실행의 Artifacts(7일 보관)에 올라간다. 요약과 오류는 실행의 알림(annotation)에도 남겨, API로 결과를 확인할 수 있다.
+
+## DB에 올리기 (물3)
+| 모듈 | 하는 일 |
+|---|---|
+| `io/contract.py` | 올리기 전 계약 검사(v1.2): 열 이름, 빈 칸, 값 범위(ETo 0~15, 기온 −40~50, 습도 0~100, Ks 0~1, Dr 0~TAW, 선행일 0~4 등), 정해진 이름(상태 코드, 회차 결과), 키 중복 |
+| `io/supabase_write.py` | PostgREST 덮어쓰기(같은 키는 새 값으로, 500줄씩), Storage 올리기 |
+| `collectors/water.publish` | 계약 검사 → 원자료(Storage `raw`) → `weather_daily` → `water_balance_daily` → `forecast_runs`(번호 받기) → `water_outlook` |
+
+- 계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 "실패"와 이유(`error`)를 담아 올린다. 종료 코드 1.
+- 원자료는 예보 발표마다 한 파일(`fcst/<격자>/<연>/<월>/<발표>.json.gz`)이고, 다시 받으면 덮어쓴다. ASOS 응답은 언제든 다시 받을 수 있어 보관하지 않는다. 원자료 올리기가 실패하면 문제로 남기고 `raw_path`를 비운 채 계속한다.
+- 같은 회차를 다시 돌리면 줄이 늘지 않고 새 값으로 바뀐다. 회차 기록(`forecast_runs`)도 마지막 실행으로 바뀐다.
+- 실행: 수집기에 `--write`. 시험 실행 버튼에서는 `write`를 켠다.
 
 ## 예약 실행 (이후 추가)
 `.github/workflows/collect.yml` — 02:20·17:20(KST). 지연과 60일 자동 중지 대비는 CropMon 이행계획 3-2절을 따른다.

@@ -549,7 +549,7 @@ def test_asos_temporary_error_is_retried():
         "retry",
         "ok",
     ]
-    assert clock.now() == TS("2026-06-10 02:21:20")  # 20초 + 60초 기다림
+    assert clock.now() == TS("2026-06-10 02:22:00")  # 30초 + 90초 기다림
 
 
 def test_asos_keeps_failing_marks_slot_failed():
@@ -563,3 +563,15 @@ def test_asos_keeps_failing_marks_slot_failed():
     s = next(s for s in r.stations if s["stn_id"] == "216")
     assert not s["asos_ok"] and s["asos_status"] == "retry" and r.failed
     assert r.forecast_runs[0]["result"] == "정시 성공"  # 다른 지점(춘천)은 그대로 계산
+
+
+def test_summary_shows_failed_response_line():
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+
+    def down(url, timeout):
+        return (503, b"") if "stnIds=216" in url else api(url, timeout)
+
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock)
+    text = W.summary_text(r)
+    assert "  ! asos 216 2026-04-01~2026-06-09 시도 4: retry HTTP 503" in text
