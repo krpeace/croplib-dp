@@ -18,7 +18,7 @@
 | `core/forecast_daily.py` | 단기예보 항목 → 대상일별 하루 입력, 받은 발표 확인, 직전 발표로 대신하기 | `fcst_archive`, `kma_fcst.check_issue` |
 | `core/solar.py` | 예보로 일사량 추정 (S1·S3·S4) | `rs_model` |
 | `core/forecast_eto.py` | 예보 ETo·ETc (S4 고정 계수, 안 되면 S3) | `cropwater_fcst.forecast_table` |
-| `core/outlook.py` | 3일 전망: 오차표, 세 경로(중심·빠르면·늦으면), 아침·저녁 출발, 관측 지연 (`water_outlook` 한 줄) | `fcst_wb.service_outlook` |
+| `core/outlook.py` | 3일 전망: 오차표, 세 경로(중심·빠르면·늦으면), 아침·저녁 출발, 관측 지연 (`water_outlook` 한 줄), 요약: 관수 필요 예상일(주 지표 3일)·권장 관수량·3일 합 (`water_outlook_summary` 한 줄) | `fcst_wb.service_outlook`, 서비스 엑셀 "관수 전망" |
 
 `io/coefficients.py`는 패키지 안 `data/`의 춘천 계수 파일(S3·S4 일사 계수, 예보 ETo 오차표)을 읽는다.
 
@@ -62,7 +62,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 |---|---|
 | `io/contract.py` | 올리기 전 계약 검사(v1.2): 열 이름, 빈 칸, 값 범위(ETo 0~15, 기온 −40~50, 습도 0~100, Ks 0~1, Dr 0~TAW, 선행일 0~4 등), 정해진 이름(상태 코드, 회차 결과), 키 중복 |
 | `io/supabase_write.py` | PostgREST 덮어쓰기(같은 키는 새 값으로, 500줄씩), Storage 올리기 |
-| `collectors/water.publish` | 계약 검사 → 원자료(Storage `raw`) → `weather_daily` → `water_balance_daily` → `forecast_runs`(번호 받기) → `water_outlook` |
+| `collectors/water.publish` | 계약 검사 → 원자료(Storage `raw`) → `weather_daily` → `water_balance_daily` → `forecast_runs`(번호 받기) → `water_outlook` → `water_outlook_summary` |
 
 - 계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 "실패"와 이유(`error`)를 담아 올린다. 종료 코드 1.
 - 원자료는 예보 발표마다 한 파일(`fcst/<격자>/<연>/<월>/<발표>.json.gz`)이고, 다시 받으면 덮어쓴다. ASOS 응답은 언제든 다시 받을 수 있어 보관하지 않는다. 원자료 올리기가 실패하면 문제로 남기고 `raw_path`를 비운 채 계속한다.

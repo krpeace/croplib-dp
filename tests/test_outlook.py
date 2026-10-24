@@ -296,3 +296,50 @@ def test_stage_climate_defaults_when_short():
     a = adjust_crop(CROP, c, 3.2)
     assert a.kc_mid == pytest.approx(kc_climate_adjust(1.20, DEFAULT_U2, DEFAULT_RHMIN, 3.2))
     assert adjust_crop(CROP, c, None) == CROP  # 작물 높이가 없으면 보정하지 않음
+
+
+# ── 3일 전망 요약 (계약 v1.3, 서비스 엑셀 "관수 전망" 위쪽) ──────────────
+def test_need_day_looks_at_main_three_days_only():
+    """엑셀처럼 주 지표 3일만 본다: 4번째(참고) 날에야 RAW에 닿으면 '3일 안에 없음'"""
+    D = "2026-06-10"
+    owb = _owb(_days("2026-06-01", [5.0] * 9, [0.0] * 9))  # 6/9 끝 Dr 45
+    ft = _ft(D, etc=5.0)
+    ft["rain"], ft["rain_exp"] = 0.0, 0.0
+    ol = service_outlook(ft, owb, 120.0, 60.0, 0.95, None, "아침", TS(D) + pd.Timedelta(hours=2))
+    assert list(ol["days"].Dr_center)[:3] == pytest.approx([50.0, 55.0, 60.0])
+    assert ol["need"]["center"] == 3  # 6/12(3번째 날) 끝 60 = RAW
+    owb2 = _owb(_days("2026-06-02", [5.0] * 8, [0.0] * 8))  # 6/9 끝 Dr 40 → 45, 50, 55, 60(4번째 날)
+    ol2 = service_outlook(ft, owb2, 120.0, 60.0, 0.95, None, "아침", TS(D) + pd.Timedelta(hours=2))
+    assert ol2["days"].Dr_center.iloc[3] == pytest.approx(60.0)
+    assert ol2["need"]["center"] is None and pd.isna(ol2["advice"][0])  # 참고일은 보지 않음
+
+
+def test_outlook_summary_row():
+    from croplib_dp.core.outlook import outlook_summary
+
+    D = "2026-06-10"
+    owb = _owb(_days("2026-05-31", [5.0] * 10, [0.0] * 10))  # 6/9 끝 Dr 50
+    ol = service_outlook(_ft(D), owb, 120.0, 60.0, 0.95, None, "저녁", TS(D) + pd.Timedelta(hours=17))
+    s = outlook_summary(ol, 60.0, kc_start=1.0)
+    assert s["horizon_days"] == 3 and s["start_date"] == dt.date(2026, 6, 10)  # 저녁: 그날을 먼저 진행
+    assert s["dr_start_mm"] == pytest.approx(54.0) and s["status_start"] == "caution"
+    assert (s["need_center_in"], s["need_late_in"]) == (3, None) and s["need_early_in"] < 3
+    assert s["advice_net_mm"] == pytest.approx(60.0) and s["advice_gross_mm"] == pytest.approx(60.0 / 0.95)
+    assert s["etc_sum_mm"] == pytest.approx(12.0) and s["etc_sum_err_mm"] == pytest.approx(12.0 * 0.25)
+    assert s["rain_sum_mm"] == pytest.approx(10.0) and s["rain_expected_sum_mm"] == pytest.approx(6.0)
+    assert s["calc_version"]
+
+
+def test_outlook_summary_now_and_none():
+    from croplib_dp.core.outlook import outlook_summary
+
+    D = "2026-06-10"
+    owb = _owb(_days("2026-05-25", [5.0] * 16, [0.0] * 16))  # 6/9 끝 Dr ≥ RAW
+    ol = service_outlook(_ft(D), owb, 120.0, 60.0, 0.95, None, "아침", TS(D) + pd.Timedelta(hours=2))
+    s = outlook_summary(ol, 60.0, kc_start=1.0)
+    assert s["need_center_in"] == 0 and s["status_start"] == "need" and s["start_date"] == dt.date(2026, 6, 9)
+    owb = _owb(_days("2026-06-08", [0.5, 0.5], [0.0, 0.0]))  # 6/9 끝 Dr 1
+    ol = service_outlook(_ft(D, etc=1.0), owb, 120.0, 60.0, 0.95, None, "아침", TS(D) + pd.Timedelta(hours=2))
+    s = outlook_summary(ol, 60.0, kc_start=0.0)
+    assert (s["need_center_in"], s["need_early_in"], s["need_late_in"]) == (None, None, None)
+    assert s["advice_net_mm"] is None and s["advice_gross_mm"] is None and s["status_start"] == "dormant"
