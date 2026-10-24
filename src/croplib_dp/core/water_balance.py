@@ -100,13 +100,29 @@ def observed_water_balance(
     crop: CropParams | None,
     soil: Soil,
     irrigation: Mapping[dt.date, float] | None = None,
+    forecast_fill: Mapping[dt.date, tuple[float, float]] | None = None,
+    end: dt.date | None = None,
 ) -> list[dict]:
     """날짜순 일 기상값(date, eto_mm, rain_mm, filled) → 날마다 관측 물수지.
     crop이 None이면 Kc = 1 (기준작물, cropwater_multi와 같음).
     irrigation: {날짜: 공급 관수량 mm}. 근권에는 × soil.ea 로 들어간다. 공개 조건은 관수 기록이 없다.
-    반환 열은 `water_balance_daily`와 같다.
+    forecast_fill: {날짜: (ETo, 기대 강수)} 관측 ETo가 없는 날에 쓸 그날 아침 발표 D+0
+    예보(outlook.fill_from_forecast).
+                   강수는 ASOS 행이 아예 없는 날에만 쓴다. 예보도 없으면 들어온 값(앞 7일 평균)을 쓴다.
+    end: 마지막 날. 관측보다 뒤면 빈 날을 더해 예보로 채운다(관측이 늦게 올 때, cropwater
+    fcst_wb.observed_wb).
+    반환 열은 `water_balance_daily`와 같고, obs_row(ASOS 행이 있었나)를 더 붙인다.
+    eto_src: 관측 / 예보(D+0 예보로 채움) / 없음(앞 7일 평균 또는 값 없음).
     filled = 채운 값에 기대는 날(채운 날부터 끝 Dr이 0이 되기 전까지)."""
     irrigation = irrigation or {}
+    forecast_fill = forecast_fill or {}
+    days = list(days)
+    if end is not None:
+        last = days[-1]["date"] if days else None
+        day = (last + dt.timedelta(days=1)) if last is not None else end
+        while day <= end:
+            days.append(dict(date=day, eto_mm=None, rain_mm=None, filled=True, obs_row=False))
+            day += dt.timedelta(days=1)
     rows: list[dict] = []
     dr = soil.dr0_mm
     tainted = False
@@ -114,7 +130,14 @@ def observed_water_balance(
         day = d["date"]
         eto = d.get("eto_mm")
         rain = d.get("rain_mm")
-        filled_day = bool(d.get("filled")) or _missing(eto)
+        obs_row = bool(d["obs_row"]) if "obs_row" in d else rain is not None
+        filled_day = bool(d.get("filled")) or _missing(eto) or not obs_row
+        src = "없음" if filled_day else "관측"
+        if filled_day and day in forecast_fill:
+            eto, f_rain = forecast_fill[day]
+            src = "예보"
+            if not obs_row:
+                rain = f_rain
         kc = 1.0 if crop is None else crop.kc(day)
         etc = 0.0 if _missing(eto) else kc * eto
         P = 0.0 if _missing(rain) else float(rain)
@@ -126,7 +149,7 @@ def observed_water_balance(
                 date=day,
                 kc=kc,
                 eto_mm=eto,
-                eto_src="없음" if filled_day else "관측",
+                eto_src=src,
                 etc_mm=etc,
                 rain_mm=rain,
                 irr_net_mm=i_net,
@@ -137,6 +160,7 @@ def observed_water_balance(
                 dr_mm=dr_new,
                 status=soil_status(dr_new, soil.raw_mm, kc, observed=True),
                 filled=tainted,
+                obs_row=obs_row,
                 calc_version=CALC_VERSION,
             )
         )
