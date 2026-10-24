@@ -68,7 +68,9 @@ jobs:
             [ -f "$f" ] || continue
             found=1
             cat "$f" >> "$GITHUB_STEP_SUMMARY"
-            echo "::notice title=수집 요약::$(esc < "$f")"
+            # 알림 한 건은 4 KB에서 잘린다: 지점 줄 + 예보 지점의 조건 줄만
+            brief=$(awk '/^- /{fc=($0 ~ /예보/)} /^  - /{if(!fc) next} {print}' "$f")
+            echo "::notice title=수집 요약::$(printf '%s\n' "$brief" | esc)"
           done
           if [ "$found" = 0 ]; then echo "요약 파일 없음" >> "$GITHUB_STEP_SUMMARY"; fi
       - name: 결과 파일 올리기

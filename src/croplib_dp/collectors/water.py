@@ -324,13 +324,20 @@ class SlotResult:
         )
 
 
+ASOS_RETRY_S = (20, 60)  # ASOS 일시 오류(시간 초과·서버 오류)면 20초, 60초 뒤 다시 (모두 3번)
+
+
 def fetch_weather(key, stn_id, st, start, end, http, clock, log) -> tuple[list[dict], dict]:
-    """ASOS start~end → (일 기상값 목록, ASOS 조회 결과)"""
-    res = kma.fetch_asos_days(key, stn_id, start, end, http)
-    for page, body in res["bodies"]:
-        log.raw.append((f"asos_{stn_id}_{start:%Y%m%d}_{end:%Y%m%d}_p{page}", body))
+    """ASOS start~end → (일 기상값 목록, ASOS 조회 결과). 일시 오류(retry)는 두 번 더 시도한다"""
+    for attempt in range(1, len(ASOS_RETRY_S) + 2):
+        res = kma.fetch_asos_days(key, stn_id, start, end, http)
+        for page, body in res["bodies"]:
+            log.raw.append((f"asos_{stn_id}_{start:%Y%m%d}_{end:%Y%m%d}_a{attempt}_p{page}", body))
+        log.add(clock, "asos", f"{stn_id} {start}~{end}", attempt, res, res["status"])
+        if res["status"] != "retry" or attempt > len(ASOS_RETRY_S):
+            break
+        clock.sleep(ASOS_RETRY_S[attempt - 1])
     items = [it for it in res["items"] if start <= dt.date.fromisoformat(str(it.get("tm", ""))[:10]) <= end]
-    log.add(clock, "asos", f"{stn_id} {start}~{end}", 1, res, res["status"] if items else res["status"])
     return daily_weather(items, station_meta(st)), res
 
 
