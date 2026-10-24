@@ -106,11 +106,11 @@ def observed_water_balance(
     """날짜순 일 기상값(date, eto_mm, rain_mm, filled) → 날마다 관측 물수지.
     crop이 None이면 Kc = 1 (기준작물, cropwater_multi와 같음).
     irrigation: {날짜: 공급 관수량 mm}. 근권에는 × soil.ea 로 들어간다. 공개 조건은 관수 기록이 없다.
-    forecast_fill: {날짜: (ETo, 기대 강수)} 관측 ETo가 없는 날에 쓸 그날 아침 발표 D+0
-    예보(outlook.fill_from_forecast).
-                   강수는 ASOS 행이 아예 없는 날에만 쓴다. 예보도 없으면 들어온 값(앞 7일 평균)을 쓴다.
-    end: 마지막 날. 관측보다 뒤면 빈 날을 더해 예보로 채운다(관측이 늦게 올 때, cropwater
-    fcst_wb.observed_wb).
+    forecast_fill: {날짜: (ETo, 기대 강수)} 관측 ETo가 없는 날에 쓸 그날 아침 발표 D+0 예보
+                   (outlook.fill_from_forecast). 강수는 ASOS 행이 아예 없는 날에만 쓴다.
+                   예보도 없으면 들어온 값(앞 7일 평균)을 쓴다.
+    end: 마지막 날. 관측보다 뒤면 빈 날을 더해 예보로 채운다
+         (관측이 늦게 올 때, cropwater fcst_wb.observed_wb).
     반환 열은 `water_balance_daily`와 같고, obs_row(ASOS 행이 있었나)를 더 붙인다.
     eto_src: 관측 / 예보(D+0 예보로 채움) / 없음(앞 7일 평균 또는 값 없음).
     filled = 채운 값에 기대는 날(채운 날부터 끝 Dr이 0이 되기 전까지)."""

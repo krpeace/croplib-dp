@@ -4,9 +4,8 @@
 (kma_fcst.Store → fcst_archive.ops_service_table → cropwater_fcst.forecast_table(S4 고정, S3 대체)
  → fcst_wb.observed_wb(예보로 채움) → fcst_wb.service_outlook)를 그대로 실행해 만든 것이다.
 만드는 스크립트: `tests/data/make_forecast_golden.py`, 가짜 입력: `tests/data/forecast_fixture.py`.
-입력에는 빠진 발표 2개(직전 발표로 대신), 하늘상태가 빠진 발표 1개(S3), 관측 지연(전날 관측 없음), 큰 비가
-들어
-있다.
+입력에는 빠진 발표 2개(직전 발표로 대신), 하늘상태가 빠진 발표 1개(S3),
+관측 지연(전날 관측 없음), 큰 비가 들어 있다.
 """
 
 import datetime as dt

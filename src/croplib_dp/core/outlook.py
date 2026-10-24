@@ -1,9 +1,9 @@
 """앞으로 3일 물 전망 (DB `water_outlook`).
 
-원본: cropwater `fcst_wb.py`의 서비스 경로 — service_outlook, 오차표(pooled_errors·err_lookup), 세
-경로(run_paths),
-관측이 빠진 날 채우기(fill_from_forecast), 관측 지연(last_observed), 그날 예보 고르기(day_forecast)
-(feat/cycle02-forecast).
+원본: cropwater `fcst_wb.py`의 서비스 경로 (feat/cycle02-forecast)
+  - service_outlook, 오차표(pooled_errors·err_lookup), 세 경로(run_paths)
+  - 관측이 빠진 날 채우기(fill_from_forecast), 관측 지연(last_observed)
+  - 그날 예보 고르기(day_forecast)
 검증용 경로(예보 강수 그대로·비 무시·관측 강수·기준선·참값)와 판정 집계는 옮기지 않았다.
 
   출발: 관측 물수지의 마지막 관측일 끝 부족한 물(Dr)
@@ -94,8 +94,8 @@ def fill_from_forecast(ft: pd.DataFrame, col: str = "ETo_main") -> dict:
 
 
 def wb_frame(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
-    """관측 물수지 목록(water_balance.observed_water_balance) → 날짜 색인 표(Dr, P, I_net, obs_row,
-    ETo_src)"""
+    """관측 물수지 목록(water_balance.observed_water_balance)
+    → 날짜 색인 표(Dr, P, I_net, obs_row, ETo_src)"""
     out = []
     for r in rows:
         rain = r.get("rain_mm")
@@ -119,9 +119,8 @@ def last_observed(owb: pd.DataFrame, before: Any) -> pd.Timestamp | None:
 
 
 def day_forecast(ft: pd.DataFrame, day: Any, etc_col: str = "ETc_main"):
-    """하루(day)를 먼저 진행할 예보 행: 그날 아침 발표 D+0 → 없으면 그날을 대상으로 한 가장 최근 서비스
-    발표(그날
-    02시까지)"""
+    """하루(day)를 먼저 진행할 예보 행: 그날 아침 발표 D+0.
+    없으면 그날을 대상으로 한 가장 최근 서비스 발표(그날 02시까지)"""
     day = pd.Timestamp(day)
     t = pd.to_datetime(ft.target)
     m = ft[(ft.run_name == "아침") & (ft.lead_day == 0) & (t == day) & ft[etc_col].notna()]
@@ -149,8 +148,8 @@ def first_need(drs: list, raw: float) -> int | None:
 
 
 def _pre_day(m, day: pd.Timestamp, etc_col: str, rain_obs: float | None = None, irr: float = 0.0) -> dict:
-    """관측 대신 아침 D+0 예보로 하루를 먼저 진행할 입력. rain_obs: 그날 관측 강수를 이미 알면 세 경로 모두 그
-    값"""
+    """관측 대신 아침 D+0 예보로 하루를 먼저 진행할 입력.
+    rain_obs: 그날 관측 강수를 이미 알면 세 경로 모두 그 값"""
     rain0 = 0.0 if pd.isna(m["rain"]) else float(m["rain"])
     rexp = float(m["rain_exp"]) if "rain_exp" in m and pd.notna(m["rain_exp"]) else rain0
     known = rain_obs is not None and not pd.isna(rain_obs)
@@ -224,10 +223,10 @@ def service_outlook(
     obs_last: Any = None,
 ) -> dict:
     """한 서비스 발표의 전망.
-    obs_last: 관측이 있는 마지막 날(없으면 D−1). 그 뒤 D−1까지는 관측이 아직 없는 날 → 아침 D+0 예보로 먼저
-    진행.
-    반환: dict(days=대상일 표, start=출발 고갈량(중심), dr_obs_prev, prev, pre, lag_days, need{center, early,
-    late},
+    obs_last: 관측이 있는 마지막 날(없으면 D−1).
+              그 뒤 D−1까지는 관측이 아직 없는 날 → 아침 D+0 예보로 먼저 진행.
+    반환: dict(days=대상일 표, start=출발 고갈량(중심), dr_obs_prev, prev, pre, lag_days,
+              need{center, early, late},
               cum3=(3일 ETc 합, ± 오차, 출처, 상대 오차), advice=(순관수량, 공급 관수량))"""
     d = ft[(ft.run_name == run_name) & (ft.run == pd.Timestamp(run))].sort_values("lead_day").copy()
     if d.empty:

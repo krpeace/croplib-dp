@@ -1,8 +1,8 @@
 """cropwater(feat/cycle02-forecast) 운영 서비스 계산으로 예보 대조 기준값을 만든다. 가짜 입력만 쓴다.
 
 실행: python -I tests/data/make_forecast_golden.py <cropwater 폴더> > tests/data/forecast_golden.json
-cropwater 의 운영 경로(cropwater_ops.ops_prepare → build_service → fcst_wb.service_from)를 파일 없이 그대로
-따라간다.
+cropwater 의 운영 경로(cropwater_ops.ops_prepare → build_service → fcst_wb.service_from)를
+파일 없이 그대로 따라간다.
 """
 
 import datetime as dt

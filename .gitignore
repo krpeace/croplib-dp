@@ -9,6 +9,7 @@ apikey.txt
 data/*
 !data/.gitkeep
 output/*
+out/
 !output/.gitkeep
 
 # Python

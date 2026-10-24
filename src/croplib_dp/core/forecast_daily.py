@@ -135,8 +135,9 @@ def _hourly_targets(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class ForecastArchive:
-    """요소별 예보 묶음. hourly[elem]: issue, lead, target, value, code / daily[elem](TMX·TMN): issue,
-    target_date, value"""
+    """요소별 예보 묶음.
+    hourly[elem]: issue, lead, target, value, code
+    daily[elem] (TMX·TMN): issue, target_date, value"""
 
     def __init__(self) -> None:
         self.hourly: dict[str, pd.DataFrame] = {}
@@ -236,8 +237,8 @@ def _latest_as_of(hdf: pd.DataFrame, run: pd.Timestamp) -> pd.DataFrame:
 
 def sun_weights(times: Any, lat: float | None = None, lon: float | None = None) -> np.ndarray:
     """시각별 태양고도의 사인값(밤은 0) — 낮 시간 하늘상태·강수확률을 일사 비중으로 평균할 때의 가중치.
-    KST(동경 135°) 시각 → 태양시 = 시각 + (경도 − 135)/15 + 균시차[FAO-56 식32]. 위도가 없으면 06~18시 같은
-    가중치."""
+    KST(동경 135°) 시각 → 태양시 = 시각 + (경도 − 135)/15 + 균시차[FAO-56 식32].
+    위도가 없으면 06~18시 같은 가중치."""
     t = pd.DatetimeIndex(times)
     if lat is None:
         return np.where((t.hour >= 6) & (t.hour <= 18), 1.0, 0.0)
@@ -368,10 +369,8 @@ def error_kind(issue: Any) -> str:
 
 
 def backup_source(arch: ForecastArchive, run: Any, max_age_h: int = BACKUP_MAX_H) -> pd.Timestamp | None:
-    """서비스 발표 run을 쓸 수 있으면 run, 아니면 run 이전 max_age_h 시간 안에서 필수 6요소가 찬 가장 최근
-    발표.
-    없으면
-    None"""
+    """서비스 발표 run을 쓸 수 있으면 run.
+    아니면 run 이전 max_age_h 시간 안에서 필수 6요소가 찬 가장 최근 발표. 없으면 None"""
     run = pd.Timestamp(run)
     comp = arch.complete_issues
     if run in set(comp):
@@ -393,8 +392,8 @@ def service_table(
     서비스 발표가 없으면 직전 발표로 대신한다. 대신한 발표는 그 발표 시각까지의 자료로 하루 입력을 만들고,
     선행일을 두 가지로 적는다: lead_day = 서비스 발표 기준, src_lead = 대체 발표 날짜 기준(S4 계수·오차 r).
     추가 열: src_run, src_lead, backup, err_name(오차표 발표 종류), err_lead.
-    대신할 발표도 없는 회차는 arch.failed_slots에 (구분, 발표시각)으로 남긴다. start·end: 서비스 발표시각
-    범위"""
+    대신할 발표도 없는 회차는 arch.failed_slots에 (구분, 발표시각)으로 남긴다.
+    start·end: 서비스 발표시각 범위"""
     out = []
     arch.failed_slots = []
     iss = arch.issues
