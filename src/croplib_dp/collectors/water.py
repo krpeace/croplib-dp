@@ -567,6 +567,20 @@ def summary_text(r: SlotResult) -> str:
         if s.get("error"):
             head += f", 오류: {s['error']}"
         lines.append(head)
+        if (
+            not s.get("asos_ok", True) or s.get("result") == "실패"
+        ):  # 실패한 조회의 응답을 한 줄씩 (원인 찾기용)
+            for kind in ("asos", "fcst"):
+                e = next(
+                    (e for e in reversed(r.log.entries) if e["kind"] == kind and e["status"] != "ok"), None
+                )
+                if e is not None and (
+                    kind == "asos" and e["target"].startswith(s["stn_id"]) or kind == "fcst"
+                ):
+                    lines.append(
+                        f"  ! {kind} {e['target']} 시도 {e['attempt']}: {e['status']} "
+                        f"HTTP {e['http']} 코드 {e['code']} {e['msg'] or ''} {e['note'] or ''}".rstrip()
+                    )
         for c in s["scenarios"]:
             lines.append(
                 f"  - {c['scenario_id']}: {c.get('last_date')} Dr {c.get('dr_mm')} mm {c.get('status')}"
