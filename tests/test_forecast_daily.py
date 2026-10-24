@@ -1,8 +1,8 @@
 """단기예보 항목 → 하루 입력 (core/forecast_daily.py).
 
 cropwater `tests/test_fcst.py`·`tests/test_ops.py`(feat/cycle02-forecast)의 해당 테스트를 가져왔다.
-포털 CSV 읽기 테스트는 그 코드를 옮기지 않아 뺐고, OpenAPI 파일 테스트는 같은 항목을 바로 넣는 방식으로
-바꿨다.
+포털 CSV 읽기 테스트는 그 코드를 옮기지 않아 뺐다.
+OpenAPI 파일 테스트는 같은 항목을 바로 넣는 방식으로 바꿨다.
 입력은 모두 가짜 값이다.
 """
 

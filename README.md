@@ -13,6 +13,12 @@ CropMon의 데이터 파이프라인 (crop library data pipeline). 공공 API에
 ## 지금 상태 (v0.1.0 준비 중)
 관측 계산(ETo, 관측 물수지, 토양수분 상태)과 예보 계산(3일 전망)을 옮겼습니다. 11/06 공개를 목표로 수집기와 DB 업로드를 이어서 만듭니다. 일정은 CropMon 기획 문서를 따릅니다.
 
+## 한 회차 돌려 보기
+```
+DATA_GO_KR=... SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... python -m croplib_dp.collectors.water --slot "2026-10-25 02" --no-wait
+```
+결과는 `out/` 폴더에 파일로 남습니다(DB 쓰기는 다음 단계). GitHub Actions의 `collect-dryrun`을 눌러도 같은 일을 합니다.
+
 ## 개발
 ```
 pip install -e ".[dev]"

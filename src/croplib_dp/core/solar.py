@@ -1,8 +1,7 @@
 """예보로 일사량(Rs) 추정. 단기예보에는 일사가 없어서 기온차·강수·하늘상태로 추정한다.
 
-원본: cropwater `rs_model.py` (feat/cycle02-forecast). 계수를 다시 맞추는 함수(fit, fit_s4)는 검증용이라
-옮기지
-않았다.
+원본: cropwater `rs_model.py` (feat/cycle02-forecast).
+계수를 다시 맞추는 함수(fit, fit_s4)는 검증용이라 옮기지 않았다.
   S1: FAO-56 식(50) Hargreaves, kRs 0.16 (내륙 기본값)
   S3: 식(50) + 강수유무 — Rs/Ra = a + b·√(Tmax−Tmin) + c·강수유무  (지점 계수, 춘천 2025 관측으로 맞춤)
   S4: S3 + 하늘상태 — Rs/Ra = a + b·√ΔT + c·강수확률 하루 최대 + d·구름많음 비율 + e·흐림 비율 (선행일별 계수)

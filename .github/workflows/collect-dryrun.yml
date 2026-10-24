@@ -1,0 +1,66 @@
+name: collect-dryrun
+
+# 물 수집기 시험 실행: 사람이 Actions 화면에서 눌렀을 때만 돈다 (예약 실행은 물2에서 collect.yml로 더한다).
+# 실제 공공 API로 한 회차를 계산하고, 결과 파일을 이 실행의 Artifacts에 올린다. DB에는 쓰지 않는다.
+# 키는 GitHub Secrets에서만 읽고, 기록에는 감춘 주소만 남긴다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "발표시각 (예: 2026-10-25 02). 비우면 지금 회차"
+        required: false
+        default: ""
+      stations:
+        description: "지점 번호 쉼표 목록 (예: 101). 비우면 전체 10곳"
+        required: false
+        default: ""
+      wait:
+        description: "마감(발표 + 90분)까지 재시도하며 기다리기"
+        type: boolean
+        default: false
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dryrun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 한 회차 계산 (DB 쓰기 없음)
+        env:
+          DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SLOT: ${{ inputs.slot }}
+          STATIONS: ${{ inputs.stations }}
+          WAIT: ${{ inputs.wait }}
+        run: |
+          args=(--out out)
+          if [ -n "$SLOT" ]; then args+=(--slot "$SLOT"); fi
+          if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
+          if [ "$WAIT" != "true" ]; then args+=(--no-wait); fi
+          python -m croplib_dp.collectors.water "${args[@]}"
+      - name: 요약을 실행 화면에 표시
+        if: always()
+        run: cat out/*/summary.md >> "$GITHUB_STEP_SUMMARY" || echo "요약 파일 없음" >> "$GITHUB_STEP_SUMMARY"
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collect-dryrun
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
