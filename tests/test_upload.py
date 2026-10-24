@@ -205,3 +205,32 @@ def test_main_write_option(monkeypatch, tmp_path):
     assert fake.tables["water_outlook"] and "DB 올리기: 완료" in (
         tmp_path / "20260610_0200" / "summary.md"
     ).read_text(encoding="utf-8")
+
+
+# ── 예약을 여러 번 걸어 둔 실행: 이미 끝난 회차는 건너뛰기 ─────────────
+def test_slot_done_only_when_on_time_success():
+    rows = {"value": []}
+    seen = []
+
+    def db(url, headers):
+        seen.append(url)
+        return 200, json.dumps(rows["value"]).encode()
+
+    d = _dicts()
+    assert not W.slot_done("https://x.supabase.co", "srv", d, ISSUE, db)
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(seen[0]).query))
+    assert q["run_at"] == "eq.2026-06-10T02:00:00+09:00" and q["collector"] == "eq.actions"
+    rows["value"] = [{"stn_id": "101", "result": "지연 수집"}]
+    assert not W.slot_done("https://x.supabase.co", "srv", d, ISSUE, db)  # 지연·백업이면 다시 돈다
+    rows["value"] = [{"stn_id": "101", "result": "정시 성공"}]
+    assert W.slot_done("https://x.supabase.co", "srv", d, ISSUE, db)
+
+
+def test_main_skip_if_done(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATA_GO_KR", KEY)
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "srv")
+    monkeypatch.setattr(W, "load_dictionaries", lambda url, key: _dicts())
+    monkeypatch.setattr(W, "slot_done", lambda *a, **k: True)
+    monkeypatch.setattr(W, "run_slot", lambda *a, **k: pytest.fail("이미 끝난 회차를 다시 돌림"))
+    assert W.main(["--slot", "2026-06-10 02", "--out", str(tmp_path), "--write", "--skip-if-done"]) == 0

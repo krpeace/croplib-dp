@@ -1,14 +1,16 @@
 name: collect
 
-# 물 예약 수집: 매일 02:20·17:20 (한국 시각). 단기예보 서비스 발표(02시·17시)를 마감(발표 + 90분)까지 재시도하며 받고,
+# 물 예약 수집: 매일 02시·17시 회차 (한국 시각 02:15·17:15부터 세 번 걸어 둠). 단기예보 서비스 발표(02시·17시)를 마감(발표 + 90분)까지 재시도하며 받고,
 # 계약 검사를 통과한 결과를 Supabase에 쓴다. 회차가 실패하면 5분 뒤 한 번 더 돌린다.
 # GitHub 예약 실행은 몰릴 때 늦게 시작할 수 있다(보통 수 분~30분). 늦게 시작해도 마감 안이면 재시도하고,
 # 마감을 넘기면 한 번만 받아 "지연 수집"으로 남긴다.
 
 on:
   schedule:
-    - cron: "20 17 * * *" # 02:20 KST (UTC 17:20, 전날)
-    - cron: "20 8 * * *" # 17:20 KST (UTC 08:20)
+    # GitHub 예약 실행은 몰리면 늦게 시작하거나 건너뛴다(10/25 첫 실행이 2시간 9분 늦음).
+    # 회차마다 세 번 걸어 두고, 이미 '정시 성공'인 회차는 바로 끝낸다(--skip-if-done).
+    - cron: "15,35,55 17 * * *" # 02:15·02:35·02:55 KST (UTC 17시, 전날)
+    - cron: "15,35,55 8 * * *" # 17:15·17:35·17:55 KST (UTC 08시)
   workflow_dispatch:
     inputs:
       slot:
@@ -55,7 +57,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write 2> err.txt
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write --skip-if-done 2> err.txt
           code=$?
           cat err.txt >&2
           exit $code
@@ -65,7 +67,7 @@ jobs:
         run: |
           sleep 300
           set +e
-          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write 2> err.txt
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write --skip-if-done 2> err.txt
           code=$?
           cat err.txt >&2
           exit $code

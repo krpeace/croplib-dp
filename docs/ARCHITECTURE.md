@@ -72,13 +72,14 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 ## 예약 실행 (물2)
 | 파일 | 언제 | 하는 일 |
 |---|---|---|
-| `.github/workflows/collect.yml` | 매일 02:20·17:20 (KST), 손으로도 | 회차 정하기 → 수집·계산·DB 쓰기(마감까지 재시도) → 실패하면 5분 뒤 한 번 더 → 요약·알림 |
-| `.github/workflows/monitor.yml` | 2시간마다, 수집 끝날 때 | 수집 감시: 문제가 있으면 "수집 경고" 이슈를 열거나 댓글, 사라지면 닫음 |
+| `.github/workflows/collect.yml` | 매일 02:15·02:35·02:55, 17:15·17:35·17:55 (KST), 손으로도 | 회차 정하기 → 수집·계산·DB 쓰기(마감까지 재시도) → 실패하면 5분 뒤 한 번 더 → 요약·알림 |
+| `.github/workflows/monitor.yml` | 매시 40분, 수집 끝날 때 | 수집 감시: 문제가 있으면 "수집 경고" 이슈를 열거나 댓글, 사라지면 닫음 |
 | `.github/workflows/keepalive.yml` | 매달 1일 12:40 (KST) | 60일 무활동 자동 중지를 막으려고 예약 실행(collect, monitor, keepalive)을 API로 다시 켬 |
 | `.github/workflows/collect-dryrun.yml` | 손으로만 | 시험 실행 (DB 쓰기는 선택) |
 
 - 세 실행은 같은 `concurrency: collect` 묶음이라 동시에 돌지 않는다(앞 실행이 끝날 때까지 기다림).
 - 회차는 시작 시각으로 한 번 정하고(`current_slot`), 다시 실행할 때도 같은 회차를 쓴다.
+- GitHub 예약 실행은 몰리면 늦거나 건너뛴다(10/25 첫 실행 2시간 9분 지연). 그래서 회차마다 세 번 걸고, 이미 "정시 성공"인 회차는 바로 끝낸다(`--skip-if-done`). 지연·백업·실패면 다시 돌아 결과를 낫게 한다.
 - 두 번 모두 실패하면 실행이 실패로 끝나고 GitHub가 저장소 주인에게 실패 메일을 보낸다. 회차 기록(`forecast_runs`)에도 "실패"와 이유가 남는다. 
 
 ## 수집 감시 (공3)
