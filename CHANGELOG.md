@@ -4,3 +4,5 @@
 
 ## 0.1.0 (예정, 2026-11-06 CropMon 공개와 함께)
 - 저장소 생성, 개발 규칙·자동 검사 세팅
+- 관측 계산 (물1-1): cropwater `feat/cycle02-forecast`에서 FAO-56 식, ASOS 하루 값 → ETo, 관측 물수지, 토양수분 상태 판정(계약 v1 코드)을 옮김
+- cropwater 대조 테스트: 같은 가짜 입력에서 cropwater와 같은 숫자가 나오는지 확인

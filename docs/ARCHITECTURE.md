@@ -8,6 +8,15 @@
 - `io/`는 API 조회와 DB 쓰기를 맡고, 쓰기 전에 계약 검사를 한다.
 - `collectors/`는 둘을 이어 주는 출처별 진입점이다.
 
+## core 모듈
+| 모듈 | 하는 일 | 원본 (cropwater) |
+|---|---|---|
+| `core/fao56.py` | FAO-56 식: ETo(식6), 풍속 환산, 일사, Kc 곡선·기후보정, 하루 물수지(식84~88), 결측일 | `fao56_core.py` |
+| `core/daily_weather.py` | ASOS 하루 값 → 일 기상값·ETo, 빠진 날 채우기 (`weather_daily` 한 줄) | `cropwater_multi.compute_station` |
+| `core/water_balance.py` | 관측 물수지와 상태 판정, 계약 상태 코드 (`water_balance_daily` 한 줄) | `fcst_wb.observed_wb`, `soil_status` |
+
+계산 결과에는 `core.CALC_VERSION`(패키지 버전)을 붙인다. 예보 계산(물1-2)과 수집기(물1-3)는 다음 PR에서 더한다.
+
 ## cropwater에서 가져올 때 달라지는 것
 cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CSV·폴더)에 상태를 둔다. 서버(GitHub Actions)는 매번 빈 컴퓨터에서 시작하므로 상태를 DB로 옮겨야 한다.
 
