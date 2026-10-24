@@ -1,0 +1,169 @@
+"""수집 감시 (core/monitor.py, io/github_issue.py, collectors/monitor.py). 가짜 DB·가짜 GitHub로 돈다."""
+
+import datetime as dt
+import json
+import urllib.parse
+
+import pandas as pd
+import pytest
+
+from croplib_dp.collectors import monitor as M
+from croplib_dp.core.monitor import STALE_H, check_health, kst, report
+from croplib_dp.io.github_issue import LABEL, TITLE, IssueAlerts
+
+TS = pd.Timestamp
+NAMES = {"101": "춘천", "216": "태백"}
+
+
+def _run(run_at, result="정시 성공", finished=None, on_time=True, error=None):
+    t = TS(run_at)
+    return dict(
+        run_at=t.tz_localize("Asia/Seoul").tz_convert("UTC").isoformat(),  # DB는 UTC로 돌려준다
+        run_name="아침" if t.hour == 2 else "저녁",
+        stn_id="101",
+        started_at=None,
+        finished_at=(finished or t + pd.Timedelta(minutes=25)).tz_localize("Asia/Seoul").isoformat(),
+        result=result,
+        on_time=on_time,
+        error=error,
+    )
+
+
+OK_WEATHER = {"101": dt.date(2026, 10, 25), "216": dt.date(2026, 10, 25)}
+
+
+# ── 규칙 ────────────────────────────────────────────────────────────────
+def test_kst_converts_db_time():
+    assert kst("2026-10-24T17:00:00+00:00") == TS("2026-10-25 02:00")
+    assert kst("2026-10-25 02:00") == TS("2026-10-25 02:00")
+
+
+def test_all_good():
+    now = TS("2026-10-26 08:00")
+    runs = [_run("2026-10-25 17:00"), _run("2026-10-26 02:00")]
+    assert check_health(now, runs, OK_WEATHER, NAMES) == []
+    assert "이상 없음" in report([], now)
+
+
+def test_stale_after_13_hours():
+    runs = [_run("2026-10-25 17:00")]  # 17:25에 끝남
+    assert check_health(TS("2026-10-26 06:00"), runs, OK_WEATHER, NAMES) == []  # 12.6시간
+    a = check_health(TS("2026-10-26 06:30"), runs, OK_WEATHER, NAMES)
+    assert [(x.level, x.code) for x in a] == [("error", "stale")] and "101 춘천 갱신 멈춤" in a[0].text
+    assert STALE_H == 13
+
+
+def test_failed_and_backup():
+    now = TS("2026-10-26 03:00")
+    a = check_health(now, [_run("2026-10-26 02:00", "실패", error="[30] SERVICE_KEY")], OK_WEATHER, NAMES)
+    assert [(x.level, x.code) for x in a] == [("error", "failed")] and "[30] SERVICE_KEY" in a[0].text
+    a = check_health(now, [_run("2026-10-26 02:00", "백업: 직전 발표", on_time=False)], OK_WEATHER, NAMES)
+    assert [(x.level, x.code) for x in a] == [("warn", "late")] and "정시 아니오" in a[0].text
+    a = check_health(now, [_run("2026-10-25 17:00", "실패"), _run("2026-10-26 02:00")], OK_WEATHER, NAMES)
+    assert a == []  # 마지막 회차만 본다 (회복)
+
+
+def test_no_runs_at_all():
+    a = check_health(TS("2026-10-26 08:00"), [], OK_WEATHER, NAMES)
+    assert [(x.level, x.code) for x in a] == [("error", "stale")]
+
+
+def test_asos_checked_in_evening_only():
+    runs = [_run("2026-10-26 17:00")]
+    weather = {"101": dt.date(2026, 10, 25), "216": dt.date(2026, 10, 24)}
+    assert check_health(TS("2026-10-26 17:40"), runs, weather, NAMES) == []
+    a = check_health(TS("2026-10-26 18:10"), runs, weather, NAMES)
+    assert [(x.level, x.code) for x in a] == [("warn", "asos")] and "216 태백" in a[0].text
+    assert "101" not in a[0].text.split("—")[1]
+
+
+def test_alert_keys_stable_for_same_problem():
+    runs = [_run("2026-10-25 17:00")]
+    k1 = [a.key for a in check_health(TS("2026-10-26 07:00"), runs, OK_WEATHER, NAMES)]
+    k2 = [a.key for a in check_health(TS("2026-10-26 09:00"), runs, OK_WEATHER, NAMES)]
+    assert k1 == k2  # 시간이 지나도 같은 경고 → 댓글을 다시 달지 않음
+
+
+# ── GitHub 이슈 ─────────────────────────────────────────────────────────
+class FakeGitHub:
+    def __init__(self, has_label=True):
+        self.issues: list[dict] = []
+        self.comments: list[tuple[int, str]] = []
+        self.has_label = has_label
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, method, url, headers, body):
+        assert headers["Authorization"] == "Bearer tok"
+        path = urllib.parse.urlparse(url).path.removeprefix("/repos/o/r")
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        self.calls.append((method, path))
+        data = json.loads(body) if body else None
+        if path.startswith("/labels/") and method == "GET":
+            return (200, b"{}") if self.has_label else (404, b'{"message":"Not Found"}')
+        if path == "/labels":
+            self.has_label = True
+            return 201, b"{}"
+        if path == "/issues" and method == "GET":
+            assert q["labels"] == LABEL and q["state"] == "open"
+            return 200, json.dumps([i for i in self.issues if i["state"] == "open"]).encode()
+        if path == "/issues" and method == "POST":
+            i = dict(number=len(self.issues) + 1, state="open", **data)
+            self.issues.append(i)
+            return 201, json.dumps(i).encode()
+        n = int(path.split("/")[2])
+        issue = self.issues[n - 1]
+        if path.endswith("/comments"):
+            self.comments.append((n, data["body"]))
+            return 201, b"{}"
+        issue.update(data)
+        return 200, json.dumps(issue).encode()
+
+
+def test_issue_lifecycle():
+    gh = FakeGitHub(has_label=False)
+    s = IssueAlerts("o/r", "tok", http=gh)
+    assert s.sync([], "이상 없음") == "none"
+    assert s.sync(["error:stale:101"], "멈춤") == "opened"
+    assert gh.issues[0]["title"] == TITLE and gh.issues[0]["labels"] == [LABEL] and gh.has_label
+    assert s.sync(["error:stale:101"], "멈춤 (2시간 뒤)") == "unchanged" and gh.comments == []
+    assert "2시간 뒤" in gh.issues[0]["body"]  # 본문은 최신으로
+    assert s.sync(["error:stale:101", "warn:asos:x"], "멈춤 + 관측") == "commented"
+    assert gh.comments == [(1, "멈춤 + 관측")]
+    assert s.sync([], "이상 없음") == "closed" and gh.issues[0]["state"] == "closed"
+    assert gh.comments[-1][1].startswith("✅ 정상 회복")
+    assert s.sync(["error:failed:x"], "실패") == "opened" and len(gh.issues) == 2  # 다시 생기면 새 이슈
+
+
+def test_github_error_raises():
+    def bad(method, url, headers, body):
+        return 403, b'{"message":"Resource not accessible by integration"}'
+
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        IssueAlerts("o/r", "tok", http=bad).find_open()
+
+
+# ── 감시 한 번 ──────────────────────────────────────────────────────────
+def test_read_state_and_run(monkeypatch):
+    runs = [_run("2026-10-26 02:00", "지연 수집", on_time=False)]
+    seen = []
+
+    def db(url, headers):
+        u = urllib.parse.urlparse(url)
+        table, q = u.path.split("/rest/v1/")[1], dict(urllib.parse.parse_qsl(u.query))
+        seen.append((table, q))
+        if table == "forecast_runs":
+            assert q["collector"] == "eq.actions" and q["order"] == "run_at.desc"
+            return 200, json.dumps(runs).encode()
+        if table == "stations":
+            return 200, json.dumps(
+                [{"stn_id": "101", "name_ko": "춘천"}, {"stn_id": "216", "name_ko": "태백"}]
+            ).encode()
+        rows = [{"date": "2026-10-25"}] if q["stn_id"] == "eq.101" else []
+        return 200, json.dumps(rows).encode()
+
+    state = M.read_state("https://x.supabase.co", "srv", db)
+    assert state["weather_last"] == {"101": dt.date(2026, 10, 25), "216": None}
+    gh = FakeGitHub()
+    text, action = M.run_monitor(state, IssueAlerts("o/r", "tok", http=gh), now=TS("2026-10-26 18:30"))
+    assert action == "opened" and "지연 수집" in text and "216 태백" in text
+    assert "SUPABASE" not in text and "srv" not in gh.issues[0]["body"]

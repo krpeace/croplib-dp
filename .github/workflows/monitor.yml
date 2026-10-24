@@ -1,0 +1,41 @@
+name: monitor
+
+# 수집 감시 (공3): 2시간마다 DB의 회차 기록과 관측 마지막 날을 보고, 문제가 있으면 "수집 경고" 이슈를 열거나 댓글을 단다.
+# 저장소 주인에게는 이슈·댓글이 메일로 간다. 문제가 사라지면 "정상 회복" 댓글을 달고 이슈를 닫는다.
+
+on:
+  schedule:
+    - cron: "10 */2 * * *" # 2시간마다 (UTC 기준 짝수 시 10분)
+  workflow_dispatch:
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 감시
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m croplib_dp.collectors.monitor | tee monitor.txt
+      - name: 결과를 알림(annotation)에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          [ -s monitor.txt ] && echo "::notice title=수집 감시::$(esc < monitor.txt)" || true

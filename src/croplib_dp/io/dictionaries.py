@@ -24,9 +24,12 @@ def rest_get(url: str, headers: dict) -> tuple[int, bytes]:
     return r.status_code, r.content
 
 
-def read_table(base_url: str, key: str, table: str, http: RestGet = rest_get) -> list[dict]:
-    """PostgREST로 표 전체를 읽는다. 실패하면 오류를 낸다(조용히 넘어가지 않는다)."""
-    url = f"{base_url.rstrip('/')}/rest/v1/{table}?select=*"
+def read_table(
+    base_url: str, key: str, table: str, http: RestGet = rest_get, query: str = "select=*"
+) -> list[dict]:
+    """PostgREST로 표를 읽는다(query: PostgREST 조건, 기본은 전체).
+    실패하면 오류를 낸다(조용히 넘어가지 않는다)."""
+    url = f"{base_url.rstrip('/')}/rest/v1/{table}?{query}"
     status, body = http(url, {"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"})
     if status != 200:
         text = (

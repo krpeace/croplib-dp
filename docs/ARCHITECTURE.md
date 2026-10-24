@@ -73,9 +73,19 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 | 파일 | 언제 | 하는 일 |
 |---|---|---|
 | `.github/workflows/collect.yml` | 매일 02:20·17:20 (KST), 손으로도 | 회차 정하기 → 수집·계산·DB 쓰기(마감까지 재시도) → 실패하면 5분 뒤 한 번 더 → 요약·알림 |
-| `.github/workflows/keepalive.yml` | 매달 1일 12:40 (KST) | 60일 무활동 자동 중지를 막으려고 예약 실행(collect, keepalive)을 API로 다시 켬 |
+| `.github/workflows/monitor.yml` | 2시간마다, 수집 끝날 때 | 수집 감시: 문제가 있으면 "수집 경고" 이슈를 열거나 댓글, 사라지면 닫음 |
+| `.github/workflows/keepalive.yml` | 매달 1일 12:40 (KST) | 60일 무활동 자동 중지를 막으려고 예약 실행(collect, monitor, keepalive)을 API로 다시 켬 |
 | `.github/workflows/collect-dryrun.yml` | 손으로만 | 시험 실행 (DB 쓰기는 선택) |
 
 - 세 실행은 같은 `concurrency: collect` 묶음이라 동시에 돌지 않는다(앞 실행이 끝날 때까지 기다림).
 - 회차는 시작 시각으로 한 번 정하고(`current_slot`), 다시 실행할 때도 같은 회차를 쓴다.
-- 두 번 모두 실패하면 실행이 실패로 끝나고 GitHub가 저장소 주인에게 실패 메일을 보낸다. 회차 기록(`forecast_runs`)에도 "실패"와 이유가 남는다. 따로 만드는 알림 메일·무갱신 알림은 공3.
+- 두 번 모두 실패하면 실행이 실패로 끝나고 GitHub가 저장소 주인에게 실패 메일을 보낸다. 회차 기록(`forecast_runs`)에도 "실패"와 이유가 남는다. 
+
+## 수집 감시 (공3)
+| 모듈 | 하는 일 |
+|---|---|
+| `core/monitor.py` | 경고 규칙: 마지막 회차가 13시간 넘게 지남(오류), 마지막 회차 실패(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고) |
+| `io/github_issue.py` | "수집 경고" 이슈 열기·댓글·닫기. 새 경고가 생길 때만 댓글(같은 경고로 메일이 쌓이지 않게) |
+| `collectors/monitor.py` | DB에서 최근 서버 회차 기록·지점별 관측 마지막 날을 읽어 규칙을 돌리고 이슈에 반영 |
+
+알림은 GitHub 이슈로 한다. 저장소 주인에게 이슈·댓글이 메일로 가므로 메일 서버 키가 필요 없다. 다른 주소로 받으려면 메일 발송 서비스를 따로 붙인다(지금은 안 함).
