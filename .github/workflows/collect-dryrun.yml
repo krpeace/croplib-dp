@@ -58,7 +58,8 @@ jobs:
           if [ -n "$SLOT" ]; then args+=(--slot "$SLOT"); fi
           if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
           if [ "$WAIT" != "true" ]; then args+=(--no-wait); fi
-          if [ "$WRITE" = "true" ]; then args+=(--write); fi
+          # DB에 쓸 때는 이미 정시 성공한 회차를 덮어쓰지 않는다(정기 수집 기록 보호).
+          if [ "$WRITE" = "true" ]; then args+=(--write --skip-if-done); fi
           set +e
           python -m croplib_dp.collectors.water "${args[@]}" 2> err.txt
           code=$?
