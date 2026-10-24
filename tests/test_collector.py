@@ -527,3 +527,39 @@ def test_main_runs_and_writes(monkeypatch, tmp_path):
     monkeypatch.setattr(W, "run_slot", lambda *a, **k: real(*a, **{**k, "http": api}))
     assert W.main(["--slot", "2026-06-10 02", "--out", str(tmp_path), "--stations", "101"]) == 0
     assert (tmp_path / "20260610_0200" / "summary.md").exists()
+
+
+def test_asos_temporary_error_is_retried():
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+    fails = {"n": 0}
+
+    def flaky(url, timeout):
+        if "AsosDalyInfoService" in url and "stnIds=216" in url and fails["n"] < 2:
+            fails["n"] += 1
+            return 502, b"bad gateway"
+        return api(url, timeout)
+
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=flaky, clock=clock)
+    s = next(s for s in r.stations if s["stn_id"] == "216")
+    assert s["asos_ok"] and not r.failed
+    tries = [e for e in r.log.entries if e["kind"] == "asos" and e["target"].startswith("216")]
+    assert [e["attempt"] for e in tries] == [1, 2, 3] and [e["status"] for e in tries] == [
+        "retry",
+        "retry",
+        "ok",
+    ]
+    assert clock.now() == TS("2026-06-10 02:21:20")  # 20초 + 60초 기다림
+
+
+def test_asos_keeps_failing_marks_slot_failed():
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+
+    def down(url, timeout):
+        return (503, b"") if "stnIds=216" in url else api(url, timeout)
+
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock)
+    s = next(s for s in r.stations if s["stn_id"] == "216")
+    assert not s["asos_ok"] and s["asos_status"] == "retry" and r.failed
+    assert r.forecast_runs[0]["result"] == "정시 성공"  # 다른 지점(춘천)은 그대로 계산

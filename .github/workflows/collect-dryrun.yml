@@ -52,10 +52,27 @@ jobs:
           if [ -n "$SLOT" ]; then args+=(--slot "$SLOT"); fi
           if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
           if [ "$WAIT" != "true" ]; then args+=(--no-wait); fi
-          python -m croplib_dp.collectors.water "${args[@]}"
-      - name: 요약을 실행 화면에 표시
+          set +e
+          python -m croplib_dp.collectors.water "${args[@]}" 2> err.txt
+          code=$?
+          cat err.txt >&2
+          exit $code
+      - name: 요약을 실행 화면과 알림(annotation)에 표시
         if: always()
-        run: cat out/*/summary.md >> "$GITHUB_STEP_SUMMARY" || echo "요약 파일 없음" >> "$GITHUB_STEP_SUMMARY"
+        # 알림은 API로도 읽을 수 있어서, 실행 기록을 내려받지 못하는 곳에서도 결과를 확인할 수 있다.
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -s err.txt ]; then echo "::error title=수집기 오류::$(tail -n 40 err.txt | esc)"; fi
+          found=0
+          for f in out/*/summary.md; do
+            [ -f "$f" ] || continue
+            found=1
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            # 알림 한 건은 4 KB에서 잘린다: 지점 줄 + 예보 지점의 조건 줄만
+            brief=$(awk '/^- /{fc=($0 ~ /예보/)} /^  - /{if(!fc) next} {print}' "$f")
+            echo "::notice title=수집 요약::$(printf '%s\n' "$brief" | esc)"
+          done
+          if [ "$found" = 0 ]; then echo "요약 파일 없음" >> "$GITHUB_STEP_SUMMARY"; fi
       - name: 결과 파일 올리기
         if: always()
         uses: actions/upload-artifact@v4

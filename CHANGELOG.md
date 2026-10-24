@@ -10,5 +10,6 @@
 - 춘천(101) 일사 계수·예보 오차표를 패키지 자료(`croplib_dp/data/`)로 가져옴
 - 예보 대조 테스트: 가짜 단기예보 4회차에서 cropwater 운영 서비스와 같은 3일 전망
 - 수집기 (물1-3): 단기예보·ASOS 조회(재시도·마감·직전 발표 대체·인증 오류 멈춤·키 감추기), Supabase 사전 자료 읽기, 한 회차 계산 → DB 표 모양의 줄과 수집 기록. 결과는 파일로(DB 쓰기는 물3)
-- 손으로 누르는 시험 실행 `.github/workflows/collect-dryrun.yml`
+- 손으로 누르는 시험 실행 `.github/workflows/collect-dryrun.yml`. 요약·오류를 알림(annotation)으로도 남김
+- ASOS 일시 오류는 두 번 더 시도 (첫 시험 실행에서 한 번 실패한 뒤 더함)
 - `.env.example` 키 이름을 GitHub Secrets와 같게(`DATA_GO_KR`, `KMA_HUB`)
