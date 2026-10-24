@@ -69,5 +69,13 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 - 같은 회차를 다시 돌리면 줄이 늘지 않고 새 값으로 바뀐다. 회차 기록(`forecast_runs`)도 마지막 실행으로 바뀐다.
 - 실행: 수집기에 `--write`. 시험 실행 버튼에서는 `write`를 켠다.
 
-## 예약 실행 (이후 추가)
-`.github/workflows/collect.yml` — 02:20·17:20(KST). 지연과 60일 자동 중지 대비는 CropMon 이행계획 3-2절을 따른다.
+## 예약 실행 (물2)
+| 파일 | 언제 | 하는 일 |
+|---|---|---|
+| `.github/workflows/collect.yml` | 매일 02:20·17:20 (KST), 손으로도 | 회차 정하기 → 수집·계산·DB 쓰기(마감까지 재시도) → 실패하면 5분 뒤 한 번 더 → 요약·알림 |
+| `.github/workflows/keepalive.yml` | 매달 1일 12:40 (KST) | 60일 무활동 자동 중지를 막으려고 예약 실행(collect, keepalive)을 API로 다시 켬 |
+| `.github/workflows/collect-dryrun.yml` | 손으로만 | 시험 실행 (DB 쓰기는 선택) |
+
+- 세 실행은 같은 `concurrency: collect` 묶음이라 동시에 돌지 않는다(앞 실행이 끝날 때까지 기다림).
+- 회차는 시작 시각으로 한 번 정하고(`current_slot`), 다시 실행할 때도 같은 회차를 쓴다.
+- 두 번 모두 실패하면 실행이 실패로 끝나고 GitHub가 저장소 주인에게 실패 메일을 보낸다. 회차 기록(`forecast_runs`)에도 "실패"와 이유가 남는다. 따로 만드는 알림 메일·무갱신 알림은 공3.

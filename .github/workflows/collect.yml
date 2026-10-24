@@ -1,0 +1,100 @@
+name: collect
+
+# 물 예약 수집: 매일 02:20·17:20 (한국 시각). 단기예보 서비스 발표(02시·17시)를 마감(발표 + 90분)까지 재시도하며 받고,
+# 계약 검사를 통과한 결과를 Supabase에 쓴다. 회차가 실패하면 5분 뒤 한 번 더 돌린다.
+# GitHub 예약 실행은 몰릴 때 늦게 시작할 수 있다(보통 수 분~30분). 늦게 시작해도 마감 안이면 재시도하고,
+# 마감을 넘기면 한 번만 받아 "지연 수집"으로 남긴다.
+
+on:
+  schedule:
+    - cron: "20 17 * * *" # 02:20 KST (UTC 17:20, 전날)
+    - cron: "20 8 * * *" # 17:20 KST (UTC 08:20)
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "발표시각 (예: 2026-10-25 02). 비우면 지금 회차"
+        required: false
+        default: ""
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    env:
+      DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 회차 정하기
+        id: slot
+        env:
+          SLOT: ${{ inputs.slot }}
+        run: |
+          if [ -z "$SLOT" ]; then
+            SLOT=$(python -c "from croplib_dp.collectors.water import current_slot, kst_now; n, i = current_slot(kst_now()); print(f'{i:%Y-%m-%d %H}')")
+          fi
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"
+          echo "회차: $SLOT"
+      - name: 수집·계산·DB 쓰기
+        id: first
+        continue-on-error: true
+        run: |
+          set +e
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write 2> err.txt
+          code=$?
+          cat err.txt >&2
+          exit $code
+      - name: 실패하면 5분 뒤 한 번 더
+        id: retry
+        if: steps.first.outcome == 'failure'
+        run: |
+          sleep 300
+          set +e
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write 2> err.txt
+          code=$?
+          cat err.txt >&2
+          exit $code
+      - name: 요약을 실행 화면과 알림(annotation)에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -s err.txt ]; then echo "::error title=수집기 오류::$(tail -n 40 err.txt | esc)"; fi
+          found=0
+          for f in out/*/summary.md; do
+            [ -f "$f" ] || continue
+            found=1
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            brief=$(awk '/^- /{fc=($0 ~ /예보/)} /^  - /{if(!fc) next} {print}' "$f")
+            echo "::notice title=수집 요약::$(printf '%s\n' "$brief" | esc)"
+          done
+          if [ "$found" = 0 ]; then echo "요약 파일 없음" >> "$GITHUB_STEP_SUMMARY"; fi
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collect-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
+      - name: 회차 결과
+        if: always()
+        run: |
+          echo "첫 실행: ${{ steps.first.outcome }}, 다시 실행: ${{ steps.retry.outcome }}"
+          if [ "${{ steps.first.outcome }}" = "failure" ] && [ "${{ steps.retry.outcome }}" != "success" ]; then
+            echo "::error title=회차 실패::두 번 모두 실패했습니다. 위 요약과 오류를 확인하세요."
+            exit 1
+          fi

@@ -1,0 +1,26 @@
+name: keepalive
+
+# GitHub는 공개 저장소에 60일 동안 활동이 없으면 예약 실행을 멈춘다.
+# 매달 1일, 예약 실행(collect, 이 파일)을 API로 다시 켜서 멈추지 않게 한다. (CropMon 이행계획 3-2절)
+
+on:
+  schedule:
+    - cron: "40 3 1 * *" # 매달 1일 12:40 KST
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  enable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 예약 실행 다시 켜기
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for wf in collect.yml keepalive.yml; do
+            gh api -X PUT "repos/$REPO/actions/workflows/$wf/enable"
+            echo "$wf 켜 둠"
+          done
