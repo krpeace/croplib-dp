@@ -549,7 +549,7 @@ def test_asos_temporary_error_is_retried():
         "retry",
         "ok",
     ]
-    assert clock.now() == TS("2026-06-10 02:21:20")  # 20초 + 60초 기다림
+    assert clock.now() == TS("2026-06-10 02:22:00")  # 30초 + 90초 기다림
 
 
 def test_asos_keeps_failing_marks_slot_failed():
@@ -574,4 +574,4 @@ def test_summary_shows_failed_response_line():
 
     r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock)
     text = W.summary_text(r)
-    assert "  ! asos 216 2026-04-01~2026-06-09 시도 3: retry HTTP 503" in text
+    assert "  ! asos 216 2026-04-01~2026-06-09 시도 4: retry HTTP 503" in text

@@ -354,11 +354,11 @@ class SlotResult:
         )
 
 
-ASOS_RETRY_S = (20, 60)  # ASOS 일시 오류(시간 초과·서버 오류)면 20초, 60초 뒤 다시 (모두 3번)
+ASOS_RETRY_S = (30, 90, 180)  # ASOS 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 다시 (모두 4번)
 
 
 def fetch_weather(key, stn_id, st, start, end, http, clock, log) -> tuple[list[dict], dict]:
-    """ASOS start~end → (일 기상값 목록, ASOS 조회 결과). 일시 오류(retry)는 두 번 더 시도한다"""
+    """ASOS start~end → (일 기상값 목록, ASOS 조회 결과). 일시 오류(retry)는 세 번 더 시도한다"""
     for attempt in range(1, len(ASOS_RETRY_S) + 2):
         res = kma.fetch_asos_days(key, stn_id, start, end, http)
         for page, body in res["bodies"]:
