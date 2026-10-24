@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,8 @@ from croplib_dp.io.dictionaries import (
     crop_height,
     crop_params,
     load_dictionaries,
+    read_table,
+    rest_get,
     soil_of,
     station_meta,
 )
@@ -674,6 +677,21 @@ def taw_map(d: Dictionaries) -> dict[str, float]:
     return {s["scenario_id"]: float(s["taw_mm"]) for s in d.scenarios}
 
 
+def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -> bool:
+    """이 회차가 이미 '정시 성공'으로 끝났나 (예보 지점 모두).
+    예약을 여러 번 걸어 둔 실행이 같은 일을 다시 하지 않게 한다.
+    정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다."""
+    stations = [k for k, st in d.stations.items() if st.get("has_forecast")]
+    if not stations:
+        return False
+    run_at = urllib.parse.quote(_iso(issue), safe="")
+    rows = read_table(
+        base, key, "forecast_runs", http, f"select=stn_id,result&run_at=eq.{run_at}&collector=eq.{COLLECTOR}"
+    )
+    ok = {str(r["stn_id"]) for r in rows if r["result"] == "정시 성공"}
+    return set(stations) <= ok
+
+
 def _env(name: str) -> str:
     v = os.environ.get(name, "").strip()
     if not v:
@@ -688,10 +706,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 전체)")
     p.add_argument("--no-wait", action="store_true", help="재시도 없이 지금 한 번만 받기 (시험 실행)")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase에 쓰기")
+    p.add_argument(
+        "--skip-if-done", action="store_true", help="이 회차가 이미 '정시 성공'이면 아무것도 하지 않고 끝내기"
+    )
     a = p.parse_args(argv)
     clock = Clock()
     name, issue = parse_slot(a.slot) if a.slot else current_slot(clock.now())
     d = load_dictionaries(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
+    if a.skip_if_done and slot_done(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), d, issue):
+        print(f"{name} {issue:%Y-%m-%d %H:%M} 회차는 이미 정시 성공으로 끝났습니다. 다시 하지 않습니다.")
+        return 0
     stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
     r = run_slot(name, issue, d, _env("DATA_GO_KR"), clock=clock, stations=stations, wait=not a.no_wait)
     if a.write:
