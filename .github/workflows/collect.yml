@@ -22,6 +22,7 @@ concurrency:
 
 permissions:
   contents: read
+  issues: write # 수집 감시가 "수집 경고" 이슈를 연다
 
 jobs:
   collect:
@@ -90,6 +91,12 @@ jobs:
           path: out/
           retention-days: 7
           if-no-files-found: warn
+      - name: 수집 감시 (문제가 있으면 "수집 경고" 이슈)
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m croplib_dp.collectors.monitor
       - name: 회차 결과
         if: always()
         run: |
