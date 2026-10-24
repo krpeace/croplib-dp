@@ -76,6 +76,9 @@ def test_collector_rows_pass_contract():
     assert set(r.water_balance_daily[0]) == set(SPECS["water_balance_daily"].columns)
     assert set(r.forecast_runs[0]) == set(SPECS["forecast_runs"].columns)
     assert set(r.water_outlook[0]) == (set(SPECS["water_outlook"].columns) - {"run_id"}) | set(W.RUN_KEY)
+    s = r.water_outlook_summary[0]
+    assert set(s) == (set(SPECS["water_outlook_summary"].columns) - {"run_id"}) | set(W.RUN_KEY)
+    assert s["horizon_days"] == 3 and s["start_date"] == "2026-06-09"
 
 
 def test_contract_catches_bad_values():
@@ -130,12 +133,15 @@ def test_publish_writes_all_tables_with_run_id():
     assert r.uploaded and not r.problems and not r.failed
     order = [urllib.parse.urlparse(u).path for _, u, _, _ in fake.requests]
     tables = [p.removeprefix("/rest/v1/") for p in order if p.startswith("/rest/")]
-    assert tables[0] == "weather_daily" and tables[-1] == "water_outlook"
+    assert tables[0] == "weather_daily" and tables[-2:] == ["water_outlook", "water_outlook_summary"]
     assert tables.index("forecast_runs") < tables.index("water_outlook")
     assert all(p.startswith("/storage/") for p in order[: len(r.raw_files)])  # 원자료를 먼저 올린다
     out = fake.tables["water_outlook"]
     assert {o["run_id"] for o in out} == {101} and not ({"run_at", "stn_id", "collector"} & set(out[0]))
     assert set(out[0]) == set(SPECS["water_outlook"].columns)
+    summ = fake.tables["water_outlook_summary"]
+    assert len(summ) == 3 and {x["run_id"] for x in summ} == {101}  # 춘천 조건 3개(사과 2, 배추 1)
+    assert set(summ[0]) == set(SPECS["water_outlook_summary"].columns)
     assert len(fake.tables["water_balance_daily"]) == len(r.water_balance_daily)
     runs = fake.tables["forecast_runs"]
     assert runs[0]["raw_path"] == "fcst/73_134/2026/06/20260610_0200.json.gz"
@@ -234,3 +240,10 @@ def test_main_skip_if_done(monkeypatch, tmp_path):
     monkeypatch.setattr(W, "slot_done", lambda *a, **k: True)
     monkeypatch.setattr(W, "run_slot", lambda *a, **k: pytest.fail("이미 끝난 회차를 다시 돌림"))
     assert W.main(["--slot", "2026-06-10 02", "--out", str(tmp_path), "--write", "--skip-if-done"]) == 0
+
+
+def test_contract_catches_bad_summary():
+    r = _slot()
+    s = dict(r.water_outlook_summary[0], need_center_in=-1, status_start="dry", dr_start_mm=999.0)
+    p = check_rows("water_outlook_summary", [s], _taw(), ignore=("run_id",), extra=W.RUN_KEY)[0]
+    assert "need_center_in=-1" in p and "status_start='dry'" in p and "dr_start_mm=999.0" in p

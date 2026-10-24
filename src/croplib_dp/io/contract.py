@@ -1,4 +1,4 @@
-"""올리기 전 계약 검사 (데이터 계약 v1.2, CropMon `docs/DATA_CONTRACT.md`).
+"""올리기 전 계약 검사 (데이터 계약 v1.3, CropMon `docs/DATA_CONTRACT.md`).
 
 DB는 구조(키, 연결, 이름이 정해진 칸)만 막고, 값의 범위는 여기서 막는다(CropMon 결정 0004).
 한 줄이라도 어긋나면 그 회차의 계산 결과는 올리지 않고, 회차 기록에 '실패'와 이유를 남긴다.
@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-CONTRACT_VERSION = "v1.2"
+CONTRACT_VERSION = "v1.3"
 STATUS = ("need", "caution", "normal", "wet", "dormant")
 
 
@@ -150,9 +150,45 @@ SPECS: dict[str, TableSpec] = {
         key=("run_id", "scenario_id", "target_date"),
     ),
 }
+SPECS["water_outlook_summary"] = TableSpec(
+    columns=(
+        "run_id",
+        "scenario_id",
+        "horizon_days",
+        "start_date",
+        "dr_start_mm",
+        "status_start",
+        "need_center_in",
+        "need_early_in",
+        "need_late_in",
+        "advice_net_mm",
+        "advice_gross_mm",
+        "etc_sum_mm",
+        "etc_sum_err_mm",
+        "rain_sum_mm",
+        "rain_expected_sum_mm",
+        "calc_version",
+    ),
+    required=("scenario_id", "horizon_days", "start_date", "status_start", "calc_version"),
+    ranges={
+        "horizon_days": (1, 14),
+        "need_center_in": (0, 14),
+        "need_early_in": (0, 14),
+        "need_late_in": (0, 14),
+        "advice_net_mm": (0, 500),
+        "advice_gross_mm": (0, 600),
+        "etc_sum_mm": (0, 200),
+        "etc_sum_err_mm": (0, 200),
+        "rain_sum_mm": (0, 2000),
+        "rain_expected_sum_mm": (0, 2000),
+    },
+    enums={"status_start": STATUS},
+    key=("run_id", "scenario_id"),
+)
 DR_COLUMNS = {
     "water_balance_daily": ("dr_prev_mm", "dr_mm"),
     "water_outlook": ("dr_center_mm", "dr_early_mm", "dr_late_mm"),
+    "water_outlook_summary": ("dr_start_mm", "advice_net_mm"),
 }
 
 

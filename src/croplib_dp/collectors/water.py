@@ -46,6 +46,7 @@ from croplib_dp.core.outlook import (
     fill_from_forecast,
     last_observed,
     outlook_rows,
+    outlook_summary,
     pooled_errors,
     service_outlook,
     wb_frame,
@@ -342,6 +343,7 @@ class SlotResult:
     weather_daily: list[dict] = field(default_factory=list)
     water_balance_daily: list[dict] = field(default_factory=list)
     water_outlook: list[dict] = field(default_factory=list)
+    water_outlook_summary: list[dict] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
     stations: list[dict] = field(default_factory=list)  # 지점별 요약 (사람이 읽는 보고)
     raw_files: dict[str, bytes] = field(default_factory=dict)  # Storage 버킷 raw 에 올릴 파일
@@ -462,6 +464,18 @@ def run_station(
                             )
                         )
                     )
+                summ = outlook_summary(ol, soil.raw_mm, crop.kc(_start_day(ol)))
+                result.water_outlook_summary.append(
+                    _jsonable(
+                        dict(
+                            run_at=_iso(issue),
+                            stn_id=stn_id,
+                            collector=COLLECTOR,
+                            scenario_id=s["scenario_id"],
+                            **summ,
+                        )
+                    )
+                )
                 info.update(start_dr_mm=round(ol["start"], 1), need=ol["need"])
             except Exception as e:  # 계산 오류도 회차 실패로 남긴다(조용히 넘어가지 않음)
                 svc.update(ok=False, error=f"{type(e).__name__}: {e}"[:200])
@@ -495,6 +509,10 @@ def run_station(
         )
         summary.update(result=res_name, on_time=on_time, attempts=col["attempts"], error=svc["error"])
     return summary
+
+
+def _start_day(ol: dict) -> dt.date:
+    return (ol["pre"][-1]["date"] if ol["pre"] else ol["prev"]).date()
 
 
 def _raw_path(collector: "ForecastCollector", issue: Any) -> str | None:
@@ -596,7 +614,8 @@ def summary_text(r: SlotResult) -> str:
         "",
         f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
-        f"water_balance_daily {len(r.water_balance_daily)}, water_outlook {len(r.water_outlook)}",
+        f"water_balance_daily {len(r.water_balance_daily)}, water_outlook {len(r.water_outlook)}, "
+        f"water_outlook_summary {len(r.water_outlook_summary)}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -604,7 +623,13 @@ def summary_text(r: SlotResult) -> str:
 def write_outputs(r: SlotResult, out_dir: Path) -> Path:
     d = out_dir / f"{r.issue:%Y%m%d_%H%M}"
     d.mkdir(parents=True, exist_ok=True)
-    for t in ("forecast_runs", "weather_daily", "water_balance_daily", "water_outlook"):
+    for t in (
+        "forecast_runs",
+        "weather_daily",
+        "water_balance_daily",
+        "water_outlook",
+        "water_outlook_summary",
+    ):
         (d / f"{t}.json").write_text(
             json.dumps(getattr(r, t), ensure_ascii=False, indent=1), encoding="utf-8"
         )
@@ -631,6 +656,13 @@ def check_contract(r: SlotResult, taw_by_scenario: dict[str, float]) -> list[str
         + check_rows("weather_daily", r.weather_daily)
         + check_rows("water_balance_daily", r.water_balance_daily, taw_by_scenario)
         + check_rows("water_outlook", r.water_outlook, taw_by_scenario, ignore=("run_id",), extra=RUN_KEY)
+        + check_rows(
+            "water_outlook_summary",
+            r.water_outlook_summary,
+            taw_by_scenario,
+            ignore=("run_id",),
+            extra=RUN_KEY,
+        )
     )
 
 
@@ -639,7 +671,8 @@ def _run_key(row: dict) -> tuple:
 
 
 def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> SlotResult:
-    """계약 검사 → 원자료(Storage) → weather_daily → water_balance_daily → forecast_runs → water_outlook.
+    """계약 검사 → 원자료(Storage) → weather_daily → water_balance_daily → forecast_runs
+    → water_outlook(·요약).
     계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 '실패'와 이유를 담아 올린다.
     원자료 올리기가 실패하면 기록에 남기고 raw_path를 비운 채 계속한다(계산 결과가 더 중요)."""
     problems = check_contract(r, taw_by_scenario)
@@ -662,13 +695,14 @@ def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> Sl
     writer.upsert("water_balance_daily", r.water_balance_daily, SPECS["water_balance_daily"].key)
     saved = writer.upsert("forecast_runs", r.forecast_runs, SPECS["forecast_runs"].key, returning=True)
     run_id = {_run_key(x): x["run_id"] for x in saved}
-    outlook = []
-    for o in r.water_outlook:
-        k = _run_key(o)
-        if k not in run_id:
-            raise RuntimeError(f"water_outlook 의 회차 {k} 가 forecast_runs 에 없습니다")
-        outlook.append({"run_id": run_id[k], **{c: v for c, v in o.items() if c not in RUN_KEY}})
-    writer.upsert("water_outlook", outlook, SPECS["water_outlook"].key)
+    for table in ("water_outlook", "water_outlook_summary"):
+        rows = []
+        for o in getattr(r, table):
+            k = _run_key(o)
+            if k not in run_id:
+                raise RuntimeError(f"{table} 의 회차 {k} 가 forecast_runs 에 없습니다")
+            rows.append({"run_id": run_id[k], **{c: v for c, v in o.items() if c not in RUN_KEY}})
+        writer.upsert(table, rows, SPECS[table].key)
     r.uploaded = True
     return r
 

@@ -282,7 +282,11 @@ def service_outlook(
     d["main"] = d.order <= MAIN_DAYS
     starts = {k: (res[k][n0 - 1] if n0 else dr0) for k in ("center", "early", "late")}
     start = starts["center"]
-    need = {k: (0 if starts[k] >= raw else first_need(res[k][n0:], raw)) for k in ("center", "early", "late")}
+    # 관수 필요 예상일은 서비스 엑셀처럼 주 지표 3일만 본다(마지막 참고일은 보지 않음, 2026-10-25 사용자 결정)
+    need = {
+        k: (0 if starts[k] >= raw else first_need(res[k][n0 : n0 + MAIN_DAYS], raw))
+        for k in ("center", "early", "late")
+    }
     main = d[d.main]
     c3 = err_lookup(err, "cum3", run_name, int(main.lead_day.iloc[0]), int(main.month.iloc[0]))
     if "err_name" in main and bool(main.get("backup", pd.Series(False)).any()):
@@ -338,3 +342,31 @@ def outlook_rows(ol: dict, raw: float) -> list[dict]:
             )
         )
     return rows
+
+
+def outlook_summary(ol: dict, raw: float, kc_start: float | None) -> dict:
+    """서비스 전망 → `water_outlook_summary` 한 줄 (run_id, scenario_id는 쓰는 쪽이 붙인다).
+    서비스 엑셀 "관수 전망" 위쪽과 같다. kc_start: 출발 날짜의 Kc (휴면기·과습 판정용).
+    출발 날짜가 관측 물수지 날이면(먼저 진행한 날이 없으면) 과습도 판정한다."""
+    d = ol["days"]
+    main = d[d["main"]]
+    pre = ol["pre"]
+    start_date = (pre[-1]["date"] if pre else ol["prev"]).date()
+    net, gross = ol["advice"]
+    rain_exp = main["rain_exp"] if "rain_exp" in main else main["rain"]
+    return dict(
+        horizon_days=MAIN_DAYS,
+        start_date=start_date,
+        dr_start_mm=_num(ol["start"]),
+        status_start=soil_status(ol["start"], raw, kc_start, observed=not pre),
+        need_center_in=ol["need"]["center"],
+        need_early_in=ol["need"]["early"],
+        need_late_in=ol["need"]["late"],
+        advice_net_mm=_num(net),
+        advice_gross_mm=_num(gross),
+        etc_sum_mm=_num(ol["cum3"][0]),
+        etc_sum_err_mm=_num(ol["cum3"][1]),
+        rain_sum_mm=float(main["rain"].astype(float).fillna(0.0).sum()),
+        rain_expected_sum_mm=float(rain_exp.astype(float).fillna(0.0).sum()),
+        calc_version=CALC_VERSION,
+    )
