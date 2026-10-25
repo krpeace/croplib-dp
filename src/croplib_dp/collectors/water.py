@@ -278,12 +278,14 @@ class ForecastCollector:
 # ── 결과 분류 ───────────────────────────────────────────────────────────
 def slot_result(col: dict, svc: dict) -> str:
     """회차 결과 (데이터 계약 forecast_runs.result 다섯 가지). cropwater slot_result와 같은 순서.
-    cropwater의 '백업: 직전 발표 (S3)'는 '백업: 직전 발표'로 두고 일사 방식 칸(rs_method)에 S3를 남긴다."""
+    cropwater의 '백업: 직전 발표 (S3)'는 '백업: 직전 발표'로 두고 일사 방식 칸(rs_method)에 S3를 남긴다.
+    svc["rs_base"]: 그 지점의 평소 일사 방식. 하늘상태 계수(S4)가 없는 지점(춘천 밖, 물6)은 S3가 평소 방식이라
+    S3로 계산해도 '백업'이 아니다. 없으면 S4(춘천)로 본다."""
     if not svc.get("ok"):
         return "실패"
     if col.get("late") and col.get("required_ok") and not svc.get("backup"):
         return "지연 수집"
-    if col.get("complete8") and not svc.get("backup") and svc.get("rs_method") == "S4":
+    if col.get("complete8") and not svc.get("backup") and svc.get("rs_method") == svc.get("rs_base", "S4"):
         return "정시 성공"
     if svc.get("backup"):
         return "백업: 직전 발표"
@@ -407,6 +409,8 @@ def run_station(
         s3, s4 = load_s3_coef(stn_id), load_s4_coef(stn_id)
         err = pooled_errors(err_all, stn_id)
     svc = dict(ok=forecast, backup=None, rs_method=None, src_run=None, obs_prev=None, error="")
+    if forecast:
+        svc["rs_base"] = "S4" if len(s4) else "S3"  # 하늘상태 계수가 없는 지점은 S3가 평소 방식
     if forecast and collector.fatal:
         svc.update(ok=False, error=collector.fatal)
     elif forecast and (stab.empty or stab[(stab.run == issue) & (stab.run_name == name)].empty):

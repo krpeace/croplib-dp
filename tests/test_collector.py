@@ -575,3 +575,35 @@ def test_summary_shows_failed_response_line():
     r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock)
     text = W.summary_text(r)
     assert "  ! asos 216 2026-04-01~2026-06-09 시도 4: retry HTTP 503" in text
+
+
+# ── 물6: 춘천 밖 예보 지점 (계수는 기본값·춘천 오차표를 빌려 씀) ──────────
+def test_other_station_forecast_uses_fallback_coefficients():
+    d = _dicts()
+    d.stations["216"] = dict(d.stations["216"], has_forecast=True)
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+    r = W.run_slot("아침", ISSUE, d, KEY, http=api, clock=clock)
+    fr = {x["stn_id"]: x for x in r.forecast_runs}
+    assert list(fr) == ["101", "216"]  # 예보 지점마다 회차 기록
+    assert (
+        fr["216"]["result"] == "정시 성공" and fr["216"]["rs_method"] == "S3"
+    )  # 지점 S4 계수 없음 → S3(기본값)
+    assert fr["101"]["rs_method"] == "S4"
+    vil = [u for u in api.calls if "base_date" in u]
+    assert len(vil) == 18  # 지점마다 서비스 발표 + 앞선 24시간 8개
+    out = [o for o in r.water_outlook if o["scenario_id"] == "216-apple-main-k3-loam-2026"]
+    assert [o["lead_day"] for o in out] == [0, 1, 2, 3]
+    assert all(o["etc_err_mm"] is not None for o in out)  # 춘천 오차표를 빌려 오차 범위가 나온다
+    s216 = [s for s in r.water_outlook_summary if s["scenario_id"] == "216-apple-main-k3-loam-2026"]
+    assert len(s216) == 1 and s216[0]["horizon_days"] == 3
+    assert W.check_contract(r, W.taw_map(d)) == []
+    assert not r.failed
+
+
+def test_slot_result_s3_is_normal_where_no_s4_coefficients():
+    col = dict(complete8=True, late=False, required_ok=True)
+    assert W.slot_result(col, dict(ok=True, rs_method="S4")) == "정시 성공"  # 춘천(기본 S4)
+    assert W.slot_result(col, dict(ok=True, rs_method="S3")) == "백업: S3"  # 춘천에서 S3면 백업
+    assert W.slot_result(col, dict(ok=True, rs_method="S3", rs_base="S3")) == "정시 성공"  # 계수 없는 지점
+    assert W.slot_result(col, dict(ok=True, rs_method="S3", rs_base="S3", backup="직전")) == "백업: 직전 발표"
