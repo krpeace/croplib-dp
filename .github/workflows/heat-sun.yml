@@ -1,0 +1,80 @@
+name: heat-sun
+
+# 적산온도·적산일사 (온1): 하루 한 번 09:20 KST. 지점마다 ASOS 일자료를 평년 기간(지난 10년)과 올해 받아
+# 한 해 표를 만들고, 계약 검사(v1.4)를 통과하면 heat_daily·sun_daily 에 덮어쓴다.
+# 예약은 두 번 걸어 둔다(GitHub 예약 실행이 늦거나 건너뛰는 일이 있어서). 덮어쓰기라 두 번 돌아도 결과가 같다.
+# 사람이 Actions 화면에서 눌러 시험할 수도 있다 (write 를 끄면 DB 에 쓰지 않음).
+
+on:
+  schedule:
+    - cron: "20,50 0 * * *" # 09:20·09:50 KST
+  workflow_dispatch:
+    inputs:
+      stations:
+        description: "지점 번호 쉼표 목록 (예: 101). 비우면 전체"
+        required: false
+        default: ""
+      write:
+        description: "계약 검사를 통과하면 Supabase DB에 쓰기"
+        type: boolean
+        default: false
+
+concurrency:
+  group: heat-sun
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  heat-sun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 받기·계산·DB 쓰기 (실패하면 5분 뒤 한 번 더)
+        env:
+          STATIONS: ${{ inputs.stations }}
+          # 예약 실행은 항상 쓰고, 사람이 누를 때는 write 입력을 따른다
+          WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+        run: |
+          args=(--out out)
+          if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
+          if [ "$WRITE" = "true" ]; then args+=(--write); fi
+          set +e
+          for attempt in 1 2; do
+            python -m croplib_dp.collectors.heat_sun "${args[@]}" 2> err.txt
+            code=$?
+            cat err.txt >&2
+            [ $code = 0 ] && break
+            [ $attempt = 1 ] && { echo "실패, 5분 뒤 다시"; sleep 300; }
+          done
+          exit $code
+      - name: 요약을 실행 화면과 알림(annotation)에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -s err.txt ]; then echo "::error title=수집기 오류::$(tail -n 40 err.txt | esc)"; fi
+          for f in out/*/brief.md; do
+            [ -f "$f" ] || continue
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=적산온도·적산일사 요약::$(cat "$f" | esc)"
+          done
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heat-sun
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
