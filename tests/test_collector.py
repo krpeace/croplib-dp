@@ -607,3 +607,30 @@ def test_slot_result_s3_is_normal_where_no_s4_coefficients():
     assert W.slot_result(col, dict(ok=True, rs_method="S3")) == "백업: S3"  # 춘천에서 S3면 백업
     assert W.slot_result(col, dict(ok=True, rs_method="S3", rs_base="S3")) == "정시 성공"  # 계수 없는 지점
     assert W.slot_result(col, dict(ok=True, rs_method="S3", rs_base="S3", backup="직전")) == "백업: 직전 발표"
+
+
+# ── 짧은 요약 (실행 화면 알림용, 지점이 10곳이어도 잘리지 않게) ─────────
+def test_brief_text_one_line_per_station_and_short():
+    d = _dicts()
+    d.stations["216"] = dict(d.stations["216"], has_forecast=True)
+    clock = FakeClock("2026-06-10 02:20")
+    r = W.run_slot("아침", ISSUE, d, KEY, http=FakeApi(clock, ISSUES), clock=clock)
+    text = W.brief_text(r)
+    lines = text.splitlines()
+    assert lines[0].startswith("# 물 수집 아침 2026-06-10 02:00")
+    st = [x for x in lines if x.startswith("- ")]
+    assert [x.split(":")[0] for x in st] == ["- 101 춘천", "- 216 태백"]  # 지점마다 한 줄
+    assert "정시 성공" in st[0] and "ASOS ~06-09" in st[0]
+    # 기본 조건(사과 기본 재배 방식·배추)만 짧게, 재배 방식 4가지를 모두 늘어놓지 않는다
+    assert "사과" in st[0] and "k1" not in st[0]
+    assert "DB 올리기: 안 함" in text
+    big = W.SlotResult(run_name="아침", issue=ISSUE)
+    big.stations = [dict(r.stations[0], stn_id=str(i)) for i in range(10)]
+    assert len(W.brief_text(big).encode()) < 3000  # 알림 칸(약 4KB) 안
+
+
+def test_write_outputs_also_writes_brief(tmp_path):
+    clock = FakeClock("2026-06-10 02:20")
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=FakeApi(clock, ISSUES), clock=clock)
+    d = W.write_outputs(r, tmp_path)
+    assert (d / "brief.md").read_text(encoding="utf-8") == W.brief_text(r)

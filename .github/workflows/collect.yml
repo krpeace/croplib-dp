@@ -81,7 +81,9 @@ jobs:
             [ -f "$f" ] || continue
             found=1
             cat "$f" >> "$GITHUB_STEP_SUMMARY"
-            brief=$(awk '/^- /{fc=($0 ~ /예보/)} /^  - /{if(!fc) next} {print}' "$f")
+            # 알림 칸은 약 4KB 에서 잘리므로 짧은 요약(brief.md, 지점마다 한 줄)을 쓴다. 전체는 실행 요약 화면에.
+            b="$(dirname "$f")/brief.md"
+            if [ -f "$b" ]; then brief=$(cat "$b"); else brief=$(head -c 3000 "$f"); fi
             echo "::notice title=수집 요약::$(printf '%s\n' "$brief" | esc)"
           done
           if [ "$found" = 0 ]; then echo "요약 파일 없음" >> "$GITHUB_STEP_SUMMARY"; fi
