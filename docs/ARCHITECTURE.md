@@ -19,6 +19,7 @@
 | `core/solar.py` | 예보로 일사량 추정 (S1·S3·S4) | `rs_model` |
 | `core/forecast_eto.py` | 예보 ETo·ETc (S4 고정 계수, 안 되면 S3) | `cropwater_fcst.forecast_table` |
 | `core/outlook.py` | 3일 전망: 오차표, 세 경로(중심·빠르면·늦으면), 아침·저녁 출발, 관측 지연 (`water_outlook` 한 줄), 요약: 관수 필요 예상일(주 지표 3일)·권장 관수량·3일 합 (`water_outlook_summary` 한 줄) | `fcst_wb.service_outlook`, 서비스 엑셀 "관수 전망" |
+| `core/heat_sun.py` | 적산온도(GDD, maxmin)·도달일, 같은 날 평균 평년, 1/1~12/31 한 해 표(결측은 평년으로 채움), 평년보다 며칠 빠른가 (`heat_daily`·`sun_daily`) | cropweather `temp_core.calc_gdd`·`gdd_reaching_dates` |
 
 `io/coefficients.py`는 패키지 안 `data/`의 춘천 계수 파일(S3·S4 일사 계수, 예보 ETo 오차표)을 읽는다.
 
