@@ -437,7 +437,13 @@ def run_station(
             result.water_balance_daily.append(
                 _jsonable(dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS}))
             )
-        info = dict(scenario_id=s["scenario_id"], kc_mid=round(crop.kc_mid, 4), kc_end=round(crop.kc_end, 4))
+        info = dict(
+            scenario_id=s["scenario_id"],
+            crop_id=s.get("crop_id"),
+            is_default=bool(s.get("is_default")),
+            kc_mid=round(crop.kc_mid, 4),
+            kc_end=round(crop.kc_end, 4),
+        )
         if wb:
             info.update(
                 last_date=str(wb[-1]["date"]), dr_mm=round(wb[-1]["dr_mm"], 1), status=wb[-1]["status"]
@@ -624,6 +630,40 @@ def summary_text(r: SlotResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+CROP_KO = {"apple": "사과", "kimchi_cabbage": "배추"}
+
+
+def brief_text(r: SlotResult) -> str:
+    """짧은 요약: 지점마다 한 줄, 기본 조건(작물마다 기본 재배 방식)만. 실행 화면 알림(annotation)은
+    약 4KB 에서 잘리므로, 지점이 10곳이어도 들어가게 한다. 전체는 summary.md 에 있다."""
+    lines = [f"# 물 수집 {r.run_name} {r.issue:%Y-%m-%d %H:%M} (계산 {CALC_VERSION})"]
+    if r.problems:
+        lines += [f"! {x}"[:300] for x in r.problems[:5]]
+    for s in r.stations:
+        last = str(s.get("asos_last") or "")[5:] or "없음"
+        parts = [s.get("result", "관측만"), f"ASOS ~{last}"]
+        for c in s.get("scenarios", []):
+            if not c.get("is_default"):
+                continue
+            crop = CROP_KO.get(c.get("crop_id"), c.get("crop_id") or "")
+            p = f"{crop} {c.get('status', '?')}"
+            if c.get("dr_mm") is not None and c.get("status") != "dormant":
+                p += f" {c['dr_mm']:.0f}mm"
+            need = (c.get("need") or {}).get("center")
+            if need is not None:
+                p += f" 예상일 {need}"
+            parts.append(p)
+        head = f"- {s['stn_id']} {s.get('name') or ''}: " + " · ".join(parts)
+        if s.get("error"):
+            head += f" · 오류: {s['error']}"[:200]
+        lines.append(head)
+    lines.append(
+        f"DB 올리기: {'완료' if r.uploaded else '안 함'} · 전망 {len(r.water_outlook)}줄 · "
+        f"요약 {len(r.water_outlook_summary)}줄 · 물수지 {len(r.water_balance_daily)}줄"
+    )
+    return "\n".join(lines) + "\n"
+
+
 def write_outputs(r: SlotResult, out_dir: Path) -> Path:
     d = out_dir / f"{r.issue:%Y%m%d_%H%M}"
     d.mkdir(parents=True, exist_ok=True)
@@ -641,6 +681,7 @@ def write_outputs(r: SlotResult, out_dir: Path) -> Path:
         "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in r.log.entries), encoding="utf-8"
     )
     (d / "summary.md").write_text(summary_text(r), encoding="utf-8")
+    (d / "brief.md").write_text(brief_text(r), encoding="utf-8")
     raw = d / "raw"
     raw.mkdir(exist_ok=True)
     for name, body in r.log.raw:
