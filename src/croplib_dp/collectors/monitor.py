@@ -18,7 +18,7 @@ RUN_COLS = "run_at,run_name,stn_id,started_at,finished_at,result,on_time,error"
 
 
 def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
-    """최근 서버 회차 기록, 지점 이름, 지점별 관측 마지막 날"""
+    """최근 서버 회차 기록, 지점 이름, 지점별 관측 마지막 날, 지점별 적산온도 올해 값 마지막 날"""
     runs = read_table(
         base,
         key,
@@ -28,17 +28,31 @@ def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
     )
     stations = read_table(base, key, "stations", http, "select=stn_id,name_ko&order=sort_order")
     last: dict[str, dt.date | None] = {}
+    heat: dict[str, dt.date | None] = {}
     for st in stations:
         rows = read_table(
             base, key, "weather_daily", http, f"select=date&stn_id=eq.{st['stn_id']}&order=date.desc&limit=1"
         )
         last[str(st["stn_id"])] = dt.date.fromisoformat(rows[0]["date"][:10]) if rows else None
-    return dict(runs=runs, names={str(s["stn_id"]): s["name_ko"] for s in stations}, weather_last=last)
+        rows = read_table(
+            base,
+            key,
+            "heat_daily",
+            http,
+            f"select=date&stn_id=eq.{st['stn_id']}&gdd_cum=not.is.null&order=date.desc&limit=1",
+        )
+        heat[str(st["stn_id"])] = dt.date.fromisoformat(rows[0]["date"][:10]) if rows else None
+    return dict(
+        runs=runs,
+        names={str(s["stn_id"]): s["name_ko"] for s in stations},
+        weather_last=last,
+        heat_last=heat,
+    )
 
 
 def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None) -> tuple[str, str]:
     now = now if now is not None else kst_now()
-    alerts = check_health(now, state["runs"], state["weather_last"], state["names"])
+    alerts = check_health(now, state["runs"], state["weather_last"], state["names"], state.get("heat_last"))
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"
     return text, action

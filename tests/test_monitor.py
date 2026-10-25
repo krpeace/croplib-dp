@@ -167,3 +167,13 @@ def test_read_state_and_run(monkeypatch):
     text, action = M.run_monitor(state, IssueAlerts("o/r", "tok", http=gh), now=TS("2026-10-26 18:30"))
     assert action == "opened" and "지연 수집" in text and "216 태백" in text
     assert "SUPABASE" not in text and "srv" not in gh.issues[0]["body"]
+
+
+def test_heat_checked_after_noon():
+    runs = [_run("2026-10-26 02:00")]
+    heat = {"101": dt.date(2026, 10, 25), "216": dt.date(2026, 10, 23)}
+    assert check_health(TS("2026-10-26 11:30"), runs, OK_WEATHER, NAMES, heat_last=heat) == []
+    a = check_health(TS("2026-10-26 12:30"), runs, OK_WEATHER, NAMES, heat_last=heat)
+    assert [(x.level, x.code) for x in a] == [("warn", "heat")] and "216 태백" in a[0].text
+    assert "101" not in a[0].text.split("—")[1]
+    assert check_health(TS("2026-10-26 12:30"), runs, OK_WEATHER, NAMES) == []  # 넘기지 않으면 보지 않음

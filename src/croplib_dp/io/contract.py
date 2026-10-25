@@ -1,4 +1,4 @@
-"""올리기 전 계약 검사 (데이터 계약 v1.3, CropMon `docs/DATA_CONTRACT.md`).
+"""올리기 전 계약 검사 (데이터 계약 v1.4, CropMon `docs/DATA_CONTRACT.md`).
 
 DB는 구조(키, 연결, 이름이 정해진 칸)만 막고, 값의 범위는 여기서 막는다(CropMon 결정 0004).
 한 줄이라도 어긋나면 그 회차의 계산 결과는 올리지 않고, 회차 기록에 '실패'와 이유를 남긴다.
@@ -9,7 +9,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-CONTRACT_VERSION = "v1.3"
+CONTRACT_VERSION = "v1.4"
 STATUS = ("need", "caution", "normal", "wet", "dormant")
 
 
@@ -184,6 +184,59 @@ SPECS["water_outlook_summary"] = TableSpec(
     },
     enums={"status_start": STATUS},
     key=("run_id", "scenario_id"),
+)
+SPECS["heat_daily"] = TableSpec(
+    columns=(
+        "stn_id",
+        "crop_id",
+        "date",
+        "t_base_c",
+        "gdd_day",
+        "gdd_cum",
+        "gdd_normal_day",
+        "gdd_normal_cum",
+        "lead_days",
+        "normal_from",
+        "normal_to",
+        "filled",
+        "calc_version",
+    ),
+    required=("stn_id", "crop_id", "date", "t_base_c", "normal_from", "normal_to", "filled", "calc_version"),
+    ranges={
+        "t_base_c": (-10, 30),
+        "gdd_day": (0, 40),
+        "gdd_cum": (0, 8000),
+        "gdd_normal_day": (0, 40),
+        "gdd_normal_cum": (0, 8000),
+        "lead_days": (-366, 366),
+        "normal_from": (1900, 2100),
+        "normal_to": (1900, 2100),
+    },
+    key=("stn_id", "crop_id", "date"),
+)
+SPECS["sun_daily"] = TableSpec(
+    columns=(
+        "stn_id",
+        "date",
+        "rs_day_mj",
+        "rs_cum_mj",
+        "rs_normal_day_mj",
+        "rs_normal_cum_mj",
+        "normal_from",
+        "normal_to",
+        "filled",
+        "calc_version",
+    ),
+    required=("stn_id", "date", "normal_from", "normal_to", "filled", "calc_version"),
+    ranges={
+        "rs_day_mj": (0, 40),
+        "rs_cum_mj": (0, 10000),
+        "rs_normal_day_mj": (0, 40),
+        "rs_normal_cum_mj": (0, 10000),
+        "normal_from": (1900, 2100),
+        "normal_to": (1900, 2100),
+    },
+    key=("stn_id", "date"),
 )
 DR_COLUMNS = {
     "water_balance_daily": ("dr_prev_mm", "dr_mm"),
