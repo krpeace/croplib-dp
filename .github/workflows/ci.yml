@@ -22,3 +22,57 @@ jobs:
         run: ruff format --check .
       - name: pytest (테스트)
         run: pytest -q
+
+  # 비밀키 검사 (이슈 #20, 결정 0013). check 와 나란히 돈다.
+  secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: 저장소 이력 전체 받기
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks 설치 (8.30.1 고정, sha256 검사)
+        run: |
+          GITLEAKS_VERSION="8.30.1"
+          ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          CHECKSUMS="gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+
+          curl -sSL -O "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}"
+          curl -sSL -O "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${CHECKSUMS}"
+
+          grep "${ARCHIVE}" "${CHECKSUMS}" | sha256sum --check --status
+          tar -xzf "${ARCHIVE}" gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          rm -f "${ARCHIVE}" "${CHECKSUMS}"
+          gitleaks version
+
+      - name: 자체 시험 (가짜 키 탐지 확인)
+        run: |
+          TMP_DIR=$(mktemp -d)
+          # AWS Access Key ID 모양의 가짜 값. 저장소 파일에 온전한 키가 남지 않도록 쪼개 붙인다.
+          P1="AKIA"
+          P2="234567QW"
+          P3="ERTYUIOP"
+          echo "aws_key=${P1}${P2}${P3}" > "${TMP_DIR}/fake_key.txt"
+
+          # 종료 코드가 정확히 1 이고 출력에 규칙 이름이 있어야 "탐지"로 인정한다.
+          # (사용법 오류 등으로 난 실패를 탐지로 착각하지 않기 위함)
+          RC=0
+          OUT=$(gitleaks dir --redact --verbose "${TMP_DIR}" 2>&1) || RC=$?
+          rm -rf "${TMP_DIR}"
+
+          if [ "${RC}" -ne 1 ]; then
+            echo "::error::자체 시험 실패: 종료 코드가 1 이 아닙니다 (${RC})."
+            exit 1
+          fi
+          if ! echo "${OUT}" | grep -q "aws-access-token"; then
+            echo "::error::자체 시험 실패: 출력에 규칙 이름(aws-access-token)이 없습니다."
+            exit 1
+          fi
+          echo "정상: 가짜 키 탐지 (종료 코드 1, 규칙 이름 확인)"
+
+      - name: 저장소 비밀키 검사 (전체 이력)
+        run: gitleaks git --redact --verbose .
