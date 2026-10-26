@@ -14,7 +14,7 @@
 - **전체 이력 검사:** `gitleaks git --redact --verbose .`
 - **`--redact` 필수:** 모든 gitleaks 실행에 붙여 결과 로그에 비밀 값이 찍히지 않게 한다.
 - **자체 시험:** 실행 중에 가짜 AWS 키 모양 값을 쪼개 붙여 임시 폴더에 만들고 gitleaks 가 잡는지 본다. 저장소 파일에는 온전한 값이 없다. CropMon 판보다 조여서, 종료 코드가 **정확히 1** 이고 출력에 규칙 이름(`aws-access-token`)이 있어야 통과한다. 사용법 오류로 난 실패를 탐지로 착각하지 않게 하기 위함이다.
-- **`.gitleaks.toml`:** `[extend] useDefault = true`. 예외(allowlist)는 정말 가짜인 값 하나하나만, 이유 주석과 함께 넣는다. 폴더 통째로, 넓은 정규식은 쓰지 않는다. 지금은 예외가 없다.
+- **`.gitleaks.toml`:** `[extend] useDefault = true`. 예외(allowlist)는 정말 가짜인 값 하나하나만, 이유 주석과 함께 넣는다. 폴더 통째로, 넓은 정규식은 쓰지 않는다. 예외는 커밋과 파일을 둘 다 지정(AND)해 한 곳만 풀어 주고, 값 자체는 파일에 쓰지 않는다.
 - 워크플로의 `${{ secrets.* }}` 는 키 이름이지 값이 아니므로 그대로 둔다.
 
 ## 검사에 걸렸을 때
@@ -25,3 +25,8 @@
 ## 합친 뒤 사용자가 할 일
 - Settings → Branches → main 보호 규칙의 필수 검사에 `secrets` 추가 (한 번 돈 뒤에 목록에 나타난다).
 - Settings → Code security 에서 Secret scanning · Push protection 켜짐 확인.
+
+## 첫 검사 결과 (2026-10-26)
+- 전체 이력에서 2건(generic-api-key): `tests/test_heat_sun_collector.py` 16번째 줄(커밋 275605f), `tests/test_collector.py` 25번째 줄(커밋 f57ddb2). 둘 다 시험용 가짜 서비스 키 상수였다.
+- 사용자 승인 뒤 두 가지를 했다. (a) 시험 값을 분명한 가짜 모양으로 바꿨다. 주소 인코딩 시험이 쓰는 특수문자(`+`, `/`, `==`)는 그대로라 시험 의미는 줄지 않았다. (b) 이력에 남은 옛 값 2건을 커밋+파일 단위로 allowlist 에 넣었다.
+
