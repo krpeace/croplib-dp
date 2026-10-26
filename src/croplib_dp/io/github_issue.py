@@ -26,9 +26,17 @@ def http_request(method: str, url: str, headers: dict, body: bytes | None) -> tu
 
 class IssueAlerts:
     def __init__(
-        self, repo: str, token: str, http: Request = http_request, api: str = "https://api.github.com"
+        self,
+        repo: str,
+        token: str,
+        http: Request = http_request,
+        api: str = "https://api.github.com",
+        title: str = TITLE,
+        label: str = LABEL,
+        label_desc: str = "수집 감시 자동 알림",
     ):
         self.repo, self.token, self.http, self.api = repo, token, http, api.rstrip("/")
+        self.title, self.label, self.label_desc = title, label, label_desc
 
     def _call(self, method: str, path: str, data: dict | None = None, ok=(200, 201)) -> object:
         headers = {
@@ -45,14 +53,14 @@ class IssueAlerts:
 
     def ensure_label(self) -> None:
         try:
-            self._call("GET", f"/labels/{urllib.parse.quote(LABEL)}")
+            self._call("GET", f"/labels/{urllib.parse.quote(self.label)}")
         except RuntimeError:
             self._call(
-                "POST", "/labels", {"name": LABEL, "color": "d93f0b", "description": "수집 감시 자동 알림"}
+                "POST", "/labels", {"name": self.label, "color": "d93f0b", "description": self.label_desc}
             )
 
     def find_open(self) -> dict | None:
-        issues = self._call("GET", f"/issues?state=open&labels={urllib.parse.quote(LABEL)}&per_page=10")
+        issues = self._call("GET", f"/issues?state=open&labels={urllib.parse.quote(self.label)}&per_page=10")
         issues = [i for i in issues if "pull_request" not in i]
         return issues[0] if issues else None
 
@@ -74,7 +82,7 @@ class IssueAlerts:
             return "closed"
         if issue is None:
             self.ensure_label()
-            self._call("POST", "/issues", {"title": TITLE, "body": body, "labels": [LABEL]})
+            self._call("POST", "/issues", {"title": self.title, "body": body, "labels": [self.label]})
             return "opened"
         new = set(keys) - self._keys(issue.get("body"))
         self._call("PATCH", f"/issues/{issue['number']}", {"body": body})

@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: "40 * * * *" # 매시 40분 (예약이 몰리는 정각을 피하고, 건너뛰는 실행이 있어도 빈틈이 짧게)
   workflow_dispatch:
+    inputs:
+      drill:
+        description: "알림 연습: start 는 가짜 실패로 연습 이슈를 열고(메일이 감), end 는 닫는다. none 은 평소 감시. 연습은 DB를 읽지 않고 진짜 경고 이슈를 건드리지 않는다"
+        type: choice
+        options: [none, start, end]
+        default: none
 
 concurrency:
   group: monitor
@@ -33,7 +39,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python -m croplib_dp.collectors.monitor | tee monitor.txt
+          DRILL: ${{ inputs.drill }}
+        run: |
+          set -o pipefail
+          case "$DRILL" in
+            start|end) python -m croplib_dp.collectors.monitor --drill "$DRILL" | tee monitor.txt ;;
+            *) python -m croplib_dp.collectors.monitor | tee monitor.txt ;;
+          esac
       - name: 결과를 알림(annotation)에 표시
         if: always()
         run: |

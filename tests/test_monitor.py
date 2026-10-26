@@ -177,3 +177,75 @@ def test_heat_checked_after_noon():
     assert [(x.level, x.code) for x in a] == [("warn", "heat")] and "216 태백" in a[0].text
     assert "101" not in a[0].text.split("—")[1]
     assert check_health(TS("2026-10-26 12:30"), runs, OK_WEATHER, NAMES) == []  # 넘기지 않으면 보지 않음
+
+
+# ── 알림 연습 (--drill) ─────────────────────────────────────────────────
+class FakeGitHubByLabel(FakeGitHub):
+    """연습은 진짜 경고와 다른 라벨을 쓴다. 라벨이 맞는 이슈만 찾는다."""
+
+    def __init__(self, label):
+        super().__init__()
+        self.label = label
+
+    def __call__(self, method, url, headers, body):
+        if urllib.parse.urlparse(url).path.endswith("/issues") and method == "GET":
+            q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+            assert q["labels"] == self.label
+            found = [i for i in self.issues if i["state"] == "open" and self.label in i["labels"]]
+            return 200, json.dumps(found).encode()
+        return super().__call__(method, url, headers, body)
+
+
+def test_drill_start_opens_a_practice_issue_with_its_own_title_and_label():
+    gh = FakeGitHubByLabel(M.DRILL_LABEL)
+    sink = M.drill_sink("o/r", "tok", http=gh)
+    text, action = M.run_drill("start", sink, now=TS("2026-10-26 10:00"))
+    assert action == "opened"
+    issue = gh.issues[0]
+    assert issue["title"] == M.DRILL_TITLE and issue["labels"] == [M.DRILL_LABEL]
+    assert M.DRILL_LABEL != LABEL and M.DRILL_TITLE != TITLE
+    assert "실제 문제가 아닙니다" in text  # 연습이라는 말이 본문 맨 위에 있다
+    assert text.splitlines()[0].startswith("🧪")
+    assert "실패" in text  # 진짜 감시 규칙(check_health)이 실패 회차를 잡아 만든 글
+
+
+def test_drill_end_closes_with_recovery_comment_and_start_again_after_close_opens_new():
+    gh = FakeGitHubByLabel(M.DRILL_LABEL)
+    sink = M.drill_sink("o/r", "tok", http=gh)
+    assert M.run_drill("end", sink, now=TS("2026-10-26 10:00"))[1] == "none"  # 열린 연습이 없으면 할 일 없음
+    M.run_drill("start", sink, now=TS("2026-10-26 10:00"))
+    assert M.run_drill("start", sink, now=TS("2026-10-26 10:05"))[1] == "unchanged"  # 메일이 또 가지 않는다
+    _, action = M.run_drill("end", sink, now=TS("2026-10-26 10:10"))
+    assert action == "closed" and gh.issues[0]["state"] == "closed"
+    assert gh.comments[-1][1].startswith("✅ 정상 회복")
+    assert M.run_drill("start", sink, now=TS("2026-10-26 10:20"))[1] == "opened" and len(gh.issues) == 2
+
+
+def test_drill_never_reads_the_db_or_touches_the_real_alert_issue(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("연습은 DB를 읽지 않는다")
+
+    monkeypatch.setattr(M, "read_state", boom)
+    gh = FakeGitHubByLabel(M.DRILL_LABEL)
+    # 진짜 경고 이슈가 열려 있어도 연습은 건드리지 않는다 (라벨이 달라 찾지 못한다)
+    gh.issues.append({"number": 1, "state": "open", "title": TITLE, "labels": [LABEL], "body": "진짜"})
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    original = M.drill_sink
+    monkeypatch.setattr(M, "drill_sink", lambda repo, token: original(repo, token, http=gh))
+    assert M.main(["--drill", "start"]) == 0
+    assert len(gh.issues) == 2 and gh.issues[1]["title"] == M.DRILL_TITLE
+    assert gh.issues[0]["body"] == "진짜" and gh.comments == []
+
+
+def test_main_rejects_unknown_drill_mode():
+    with pytest.raises(SystemExit):
+        M.main(["--drill", "oops"])
+
+
+def test_default_alert_sink_is_unchanged():
+    gh = FakeGitHub()
+    IssueAlerts("o/r", "tok", http=gh).sync(["error:failed:x"], "실패")
+    assert gh.issues[0]["title"] == TITLE and gh.issues[0]["labels"] == [LABEL]
