@@ -1,0 +1,23 @@
+# Gitleaks 설정 (이슈 #20, 결정 0013)
+# 기본 제공 규칙을 모두 사용한다 (MIT 라이선스).
+# 예외(allowlist)는 정말 가짜인 값 하나하나만 이유 주석과 함께 추가한다.
+# 폴더 통째로, 넓은 정규식 예외는 금지. 추가는 사용자 승인 뒤에만 한다.
+
+[extend]
+useDefault = true
+
+# 예외 1: 시험 코드의 가짜 서비스 키 상수(`KEY`). 기록에 남은 옛 값 하나.
+# 커밋과 파일을 둘 다 지정해(AND) 그 한 곳만 풀어 준다. 지금 파일의 값은 분명한 가짜 모양으로 이미 바꿨다.
+# 규칙 generic-api-key, tests/test_heat_sun_collector.py 16번째 줄 (커밋 275605f).
+[[allowlists]]
+description = "시험용 가짜 키 상수 (옛 값, 이력에만 남음): test_heat_sun_collector.py"
+condition = "AND"
+commits = ["275605f280de54641c4ade08abf5ac54b379f421"]
+paths = ['''tests/test_heat_sun_collector\.py''']
+
+# 예외 2: 위와 같은 이유. 규칙 generic-api-key, tests/test_collector.py 25번째 줄 (커밋 f57ddb2).
+[[allowlists]]
+description = "시험용 가짜 키 상수 (옛 값, 이력에만 남음): test_collector.py"
+condition = "AND"
+commits = ["f57ddb299ff7c4215c5ecb688e4c98fedd9b9d57"]
+paths = ['''tests/test_collector\.py''']

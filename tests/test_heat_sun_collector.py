@@ -13,7 +13,7 @@ from croplib_dp.collectors import heat_sun as H
 from croplib_dp.io.contract import check_rows
 from croplib_dp.io.dictionaries import Dictionaries
 
-KEY = "SECRET+KEY/123=="
+KEY = "FAKE+KEY/dummy-value=="
 TODAY = pd.Timestamp("2026-10-25 09:20")
 
 
