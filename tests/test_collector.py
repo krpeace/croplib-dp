@@ -285,8 +285,8 @@ def test_service_key_encoding_and_mask():
     assert kma.service_key("ab%2Bc") == "ab%2Bc"  # 인코딩 키는 그대로
     url = kma.vilage_url(KEY, TS("2026-06-10 02:00"), 73, 134)
     assert "base_date=20260610&base_time=0200&nx=73&ny=134" in url
-    assert kma.mask_key(url).count("serviceKey=***") == 1 and "SECRET" not in kma.mask_key(url)
-    assert "SECRET" not in kma.mask_key(f"ConnectionError: HTTPSConnectionPool url: {url} (timeout)")
+    assert kma.mask_key(url).count("serviceKey=***") == 1 and "dummy-value" not in kma.mask_key(url)
+    assert "dummy-value" not in kma.mask_key(f"ConnectionError: HTTPSConnectionPool url: {url} (timeout)")
 
 
 def test_fetch_pages_follows_total():
@@ -305,7 +305,7 @@ def test_fetch_pages_follows_total():
         raise TimeoutError(f"read timed out: {url}")
 
     res = kma.fetch_pages(lambda p: f"http://x/?serviceKey={KEY}&pageNo={p}", boom)
-    assert res["status"] == "retry" and "SECRET" not in res["error"]
+    assert res["status"] == "retry" and "dummy-value" not in res["error"]
 
 
 def test_obs_row_complete():
@@ -462,7 +462,7 @@ def test_write_outputs(tmp_path):
     assert "정시 성공" in (d / "summary.md").read_text(encoding="utf-8")
     assert len(list((d / "raw").glob("*.json.gz"))) >= 10
     text = "".join(p.read_text(encoding="utf-8") for p in d.glob("*.*"))
-    assert "SECRET" not in text
+    assert "dummy-value" not in text
 
 
 # ── 사전 자료 ───────────────────────────────────────────────────────────
