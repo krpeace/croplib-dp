@@ -23,3 +23,4 @@
 - 예약 실행 (물2): `collect.yml` 매일 02:20·17:20, 실패하면 5분 뒤 한 번 더. `keepalive.yml` 매달 예약 실행을 다시 켜 60일 자동 중지를 막음
 - DB 올리기 (물3): 올리기 전 계약 검사(v1.2), Supabase 덮어쓰기, 예보 원자료 Storage 보관(`raw_path`), 수집기 `--write`, 시험 실행 버튼에 "DB에 쓰기"
 - `.env.example` 키 이름을 GitHub Secrets와 같게(`DATA_GO_KR`, `KMA_HUB`)
+- 알림 연습: `monitor.yml` 을 손으로 실행할 때 `drill` 을 start/end 로 고르면 가짜 실패로 연습 이슈를 열고 닫아, 메일이 오는지 본다 (결정 0011). 진짜 경고와 제목·라벨이 달라 서로 섞이지 않음
