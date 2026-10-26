@@ -22,7 +22,7 @@ from croplib_dp.io import kma  # noqa: E402
 from croplib_dp.io.dictionaries import Dictionaries, crop_params, load_dictionaries, read_table  # noqa: E402
 
 TS = pd.Timestamp
-KEY = "SECRET+KEY/123=="
+KEY = "FAKE+KEY/dummy-value=="
 
 
 # ── 가짜 API ────────────────────────────────────────────────────────────
