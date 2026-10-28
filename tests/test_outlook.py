@@ -320,7 +320,7 @@ def test_outlook_summary_row():
     D = "2026-06-10"
     owb = _owb(_days("2026-05-31", [5.0] * 10, [0.0] * 10))  # 6/9 끝 Dr 50
     ol = service_outlook(_ft(D), owb, 120.0, 60.0, 0.95, None, "저녁", TS(D) + pd.Timedelta(hours=17))
-    s = outlook_summary(ol, 60.0, kc_start=1.0)
+    s = outlook_summary(ol, 60.0, kc_start=1.0, kc_today=1.0)
     assert s["horizon_days"] == 3 and s["start_date"] == dt.date(2026, 6, 10)  # 저녁: 그날을 먼저 진행
     assert s["dr_start_mm"] == pytest.approx(54.0) and s["status_start"] == "caution"
     assert (s["need_center_in"], s["need_late_in"]) == (3, None) and s["need_early_in"] < 3
@@ -336,10 +336,68 @@ def test_outlook_summary_now_and_none():
     D = "2026-06-10"
     owb = _owb(_days("2026-05-25", [5.0] * 16, [0.0] * 16))  # 6/9 끝 Dr ≥ RAW
     ol = service_outlook(_ft(D), owb, 120.0, 60.0, 0.95, None, "아침", TS(D) + pd.Timedelta(hours=2))
-    s = outlook_summary(ol, 60.0, kc_start=1.0)
+    s = outlook_summary(ol, 60.0, kc_start=1.0, kc_today=1.0)
     assert s["need_center_in"] == 0 and s["status_start"] == "need" and s["start_date"] == dt.date(2026, 6, 9)
     owb = _owb(_days("2026-06-08", [0.5, 0.5], [0.0, 0.0]))  # 6/9 끝 Dr 1
     ol = service_outlook(_ft(D, etc=1.0), owb, 120.0, 60.0, 0.95, None, "아침", TS(D) + pd.Timedelta(hours=2))
-    s = outlook_summary(ol, 60.0, kc_start=0.0)
+    s = outlook_summary(ol, 60.0, kc_start=0.0, kc_today=0.0)
     assert (s["need_center_in"], s["need_early_in"], s["need_late_in"]) == (None, None, None)
     assert s["advice_net_mm"] is None and s["advice_gross_mm"] is None and s["status_start"] == "dormant"
+
+
+def test_outlook_summary_season_boundary_dormant_by_run_date():
+    """휴면기는 회차 발표 날짜(kc_today)로 판정하고, 부족한 물(Dr)·과습은 출발 날짜 값을 쓴다."""
+    from croplib_dp.core.outlook import outlook_summary
+
+    # 사과 CROP: 4/1 시작, 210일 (마지막 날 10/27, 10/28부터 Kc = 0)
+    owb_end = _owb(_days("2026-10-12", [5.0] * 16, [0.0] * 16))  # 10/26·10/27 끝 Dr ≥ RAW(60)
+    # 1) 10/28 아침 회차(출발 10/27, Dr ≥ RAW) → 발표 날짜가 작기 밖이므로 dormant
+    ol_1028 = service_outlook(
+        _ft("2026-10-28"), owb_end, 120.0, 60.0, 0.95, None, "아침", TS("2026-10-28 02:00")
+    )
+    s1 = outlook_summary(
+        ol_1028, 60.0, kc_start=CROP.kc(dt.date(2026, 10, 27)), kc_today=CROP.kc(dt.date(2026, 10, 28))
+    )
+    assert CROP.kc(dt.date(2026, 10, 27)) > 0 and CROP.kc(dt.date(2026, 10, 28)) == 0.0
+    assert s1["start_date"] == dt.date(2026, 10, 27) and s1["dr_start_mm"] >= 60.0
+    assert s1["status_start"] == "dormant"
+
+    # 2) 10/27 아침 회차(출발 10/26) → 지금처럼 Dr로 판정 (need)
+    ol_1027_am = service_outlook(
+        _ft("2026-10-27"), owb_end, 120.0, 60.0, 0.95, None, "아침", TS("2026-10-27 02:00")
+    )
+    s2 = outlook_summary(
+        ol_1027_am, 60.0, kc_start=CROP.kc(dt.date(2026, 10, 26)), kc_today=CROP.kc(dt.date(2026, 10, 27))
+    )
+    assert s2["start_date"] == dt.date(2026, 10, 26) and s2["status_start"] == "need"
+
+    # 3) 10/27 저녁 회차(출발 10/27) → Dr로 판정 (작기 안)
+    ol_1027_pm = service_outlook(
+        _ft("2026-10-27"), owb_end, 120.0, 60.0, 0.95, None, "저녁", TS("2026-10-27 17:00")
+    )
+    s3 = outlook_summary(
+        ol_1027_pm, 60.0, kc_start=CROP.kc(dt.date(2026, 10, 27)), kc_today=CROP.kc(dt.date(2026, 10, 27))
+    )
+    assert s3["start_date"] == dt.date(2026, 10, 27) and s3["status_start"] == "need"
+
+    # 4) 4/1 아침 회차(출발 3/31, Dr = 0) → normal (휴면기 아님, 과습 아님)
+    owb_spr = wb_frame(observed_water_balance(_days("2026-03-31", [4.0, 2.0], [0.0, 20.0]), CROP, SOIL))
+    ol_0401 = service_outlook(
+        _ft("2026-04-01"), owb_spr, 120.0, 60.0, 0.95, None, "아침", TS("2026-04-01 02:00")
+    )
+    s4 = outlook_summary(
+        ol_0401, 60.0, kc_start=CROP.kc(dt.date(2026, 3, 31)), kc_today=CROP.kc(dt.date(2026, 4, 1))
+    )
+    assert CROP.kc(dt.date(2026, 3, 31)) == 0.0 and CROP.kc(dt.date(2026, 4, 1)) > 0
+    assert s4["start_date"] == dt.date(2026, 3, 31) and s4["dr_start_mm"] == 0.0
+    assert s4["status_start"] == "normal"
+
+    # 5) 4/2 아침 회차(출발 4/1, 관측, Dr < 0.05) → wet (작기 안이면 과습 판정은 그대로)
+    ol_0402 = service_outlook(
+        _ft("2026-04-02"), owb_spr, 120.0, 60.0, 0.95, None, "아침", TS("2026-04-02 02:00")
+    )
+    s5 = outlook_summary(
+        ol_0402, 60.0, kc_start=CROP.kc(dt.date(2026, 4, 1)), kc_today=CROP.kc(dt.date(2026, 4, 2))
+    )
+    assert s5["start_date"] == dt.date(2026, 4, 1) and s5["dr_start_mm"] < 0.05
+    assert s5["status_start"] == "wet"

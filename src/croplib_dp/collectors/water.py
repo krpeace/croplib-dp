@@ -474,7 +474,7 @@ def run_station(
                             )
                         )
                     )
-                summ = outlook_summary(ol, soil.raw_mm, crop.kc(_start_day(ol)))
+                summ = outlook_summary(ol, soil.raw_mm, crop.kc(_start_day(ol)), crop.kc(D.date()))
                 result.water_outlook_summary.append(
                     _jsonable(
                         dict(

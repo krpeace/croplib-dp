@@ -1,6 +1,6 @@
 [project]
 name = "croplib-dp"
-version = "0.1.0"
+version = "0.1.1"
 description = "CropMon 데이터 파이프라인: 출처별 수집, 주제별 계산, 예약 실행 (crop library data pipeline)"
 readme = "README.md"
 requires-python = ">=3.11"
