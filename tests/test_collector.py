@@ -634,3 +634,15 @@ def test_write_outputs_also_writes_brief(tmp_path):
     r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=FakeApi(clock, ISSUES), clock=clock)
     d = W.write_outputs(r, tmp_path)
     assert (d / "brief.md").read_text(encoding="utf-8") == W.brief_text(r)
+
+
+def test_day_after_season_end_morning_summary_is_dormant():
+    """작기 마지막 날(10/27) 다음 날인 10/28 아침 회차는 출발이 10/27이라도 status_start가 dormant."""
+    issue = TS("2026-10-28 02:00")
+    issues = [TS("2026-10-27 02:00") + pd.Timedelta(hours=3 * k) for k in range(9)]
+    clock = FakeClock("2026-10-28 02:20")
+    api = FakeApi(clock, issues, asos_last=dt.date(2026, 10, 27))
+    r = W.run_slot("아침", issue, _dicts(), KEY, http=api, clock=clock, stations=["101"])
+    s = next(x for x in r.water_outlook_summary if x["scenario_id"] == "101-apple-main-k3-loam-2026")
+    assert s["start_date"] == "2026-10-27" and s["dr_start_mm"] > 0
+    assert s["status_start"] == "dormant"

@@ -27,7 +27,7 @@ import pandas as pd
 
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.fao56 import wb_step
-from croplib_dp.core.water_balance import soil_status
+from croplib_dp.core.water_balance import CAUTION_RATIO, WET_ZERO_MM, soil_status
 
 MAIN_DAYS = 3  # 서비스 주 지표: 처음 3개 대상일
 ERR_MIN_N = 15  # 오차표: 월 칸 표본이 이보다 적으면 전체 월 값을 씀
@@ -344,10 +344,31 @@ def outlook_rows(ol: dict, raw: float) -> list[dict]:
     return rows
 
 
-def outlook_summary(ol: dict, raw: float, kc_start: float | None) -> dict:
+def _start_status(
+    dr: float | None,
+    raw: float,
+    kc_start: float | None,
+    kc_today: float | None,
+    observed: bool,
+) -> str | None:
+    """전망 요약의 출발 상태(status_start).
+    휴면기는 회차 발표 날짜(kc_today), 과습은 관측 물수지 날이고 출발 날짜가 작기 안(kc_start > 0)일 때만."""
+    if _num(dr) is None:
+        return None
+    if _num(kc_today) is not None and kc_today <= 0:
+        return "dormant"
+    if observed and _num(kc_start) is not None and kc_start > 0 and dr < WET_ZERO_MM:
+        return "wet"
+    if dr >= raw:
+        return "need"
+    return "caution" if dr >= raw * CAUTION_RATIO else "normal"
+
+
+def outlook_summary(ol: dict, raw: float, kc_start: float | None, kc_today: float | None) -> dict:
     """서비스 전망 → `water_outlook_summary` 한 줄 (run_id, scenario_id는 쓰는 쪽이 붙인다).
-    서비스 엑셀 "관수 전망" 위쪽과 같다. kc_start: 출발 날짜의 Kc (휴면기·과습 판정용).
-    출발 날짜가 관측 물수지 날이면(먼저 진행한 날이 없으면) 과습도 판정한다."""
+    서비스 엑셀 "관수 전망" 위쪽과 같다.
+    kc_start: 출발 날짜의 Kc (과습 판정용 — 작기 안이고 관측 물수지 날일 때만 과습).
+    kc_today: 회차 발표 날짜(한국 날짜)의 Kc (휴면기 판정용)."""
     d = ol["days"]
     main = d[d["main"]]
     pre = ol["pre"]
@@ -358,7 +379,7 @@ def outlook_summary(ol: dict, raw: float, kc_start: float | None) -> dict:
         horizon_days=MAIN_DAYS,
         start_date=start_date,
         dr_start_mm=_num(ol["start"]),
-        status_start=soil_status(ol["start"], raw, kc_start, observed=not pre),
+        status_start=_start_status(ol["start"], raw, kc_start, kc_today, observed=not pre),
         need_center_in=ol["need"]["center"],
         need_early_in=ol["need"]["early"],
         need_late_in=ol["need"]["late"],
