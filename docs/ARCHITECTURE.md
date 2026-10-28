@@ -14,6 +14,7 @@
 | `core/fao56.py` | FAO-56 식: ETo(식6), 풍속 환산, 일사, Kc 곡선·기후보정, 하루 물수지(식84~88), 결측일 | `fao56_core.py` |
 | `core/daily_weather.py` | ASOS 하루 값 → 일 기상값·ETo, 빠진 날 채우기 (`weather_daily` 한 줄) | `cropwater_multi.compute_station` |
 | `core/water_balance.py` | 관측 물수지와 상태 판정, 계약 상태 코드, 빠진 날은 아침 D+0 예보로 채움 (`water_balance_daily` 한 줄) | `fcst_wb.observed_wb`, `soil_status` |
+| `core/soil_water.py` | 작물 공통(흙만 본 물 상태, 계약 v1.5): 고정 조건(Zr 0.5 m, Kc 1.0, p 0.40), 해마다 3/1 Dr = 0 재시작(12~2월 `winter`), 남은 물 비율(`aw_pct`), 상태 코드 6종(`winter`·`pool`·`ample`·`fair`·`dry`·`very_dry`), `days_to_dry` (`soil_water_daily` 한 줄) | `cropwater_multi` + 결정 0014 |
 | `core/kc.py` | Kc 기후보정: 생육 중기·후기 평균 풍속·최저습도 (10일 미만이면 기본값) | `cropwater_station` Kc 자동집계 |
 | `core/forecast_daily.py` | 단기예보 항목 → 대상일별 하루 입력, 받은 발표 확인, 직전 발표로 대신하기 | `fcst_archive`, `kma_fcst.check_issue` |
 | `core/solar.py` | 예보로 일사량 추정 (S1·S3·S4) | `rs_model` |
@@ -29,6 +30,7 @@
 3. 단기예보(서비스 발표 + 앞선 24시간 발표) → `ForecastArchive` → `service_table` → `forecast_table`
 4. `observed_water_balance(forecast_fill=fill_from_forecast(...), end=발표일 전날)` → 관측 물수지
 5. `service_outlook` → `outlook_rows` → 3일 전망
+6. (예보 지점) 토성 12종마다 `soil_water_rows` → 작물 공통 흙 물 상태 (`soil_water_daily`)
 
 계산 결과에는 `core.CALC_VERSION`(패키지 버전)을 붙인다. 수집기(물1-3)는 다음 PR에서 더한다.
 
@@ -50,20 +52,20 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 |---|---|
 | `io/kma.py` | 단기예보·ASOS 조회: 키 인코딩, 여러 쪽 이어 받기, 응답 해석(JSON·XML 오류), 결과 구분(ok·nodata·retry·fatal), 기록에서 키 감추기 |
 | `io/dictionaries.py` | Supabase에서 사전 자료 6개 표 읽기, 계산 입력(StationMeta·CropParams·Soil)으로 바꾸기 |
-| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 ~ 어제) → 계산 → DB 표 모양의 줄 |
+| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄 |
 
-- 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록을 남긴다. 예보가 없는 지점은 관측 물수지만 계산하고, ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다.
+- 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 예보가 없는 지점은 관측 물수지만 계산하고, ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다.
 - 서버는 받은 예보를 쌓아 두지 않는다. 그래서 하루 넘게 지난 관측 결측일은 예보로 채우지 못하고 앞 7일 평균이 된다. 물3에서 예보 원자료를 Storage에 쌓으면 현장 PC처럼 채운다.
-- 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--out out]`. 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표 4개(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
+- 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--soil-backfill] [--out out]`. 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
 - ASOS 조회가 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 세 번 더 시도한다. 시험 실행에서 공공데이터포털이 몇 분 동안 모든 요청에 응답하지 않은 적이 두 번 있었다.
 - 시험 실행: GitHub Actions → `collect-dryrun` → Run workflow. 손으로 누를 때만 돌고, 결과 파일은 그 실행의 Artifacts(7일 보관)에 올라간다. 요약과 오류는 실행의 알림(annotation)에도 남겨, API로 결과를 확인할 수 있다.
 
 ## DB에 올리기 (물3)
 | 모듈 | 하는 일 |
 |---|---|
-| `io/contract.py` | 올리기 전 계약 검사(v1.2): 열 이름, 빈 칸, 값 범위(ETo 0~15, 기온 −40~50, 습도 0~100, Ks 0~1, Dr 0~TAW, 선행일 0~4 등), 정해진 이름(상태 코드, 회차 결과), 키 중복 |
+| `io/contract.py` | 올리기 전 계약 검사(v1.5): 열 이름, 빈 칸, 값 범위(ETo 0~15, 기온 −40~50, 습도 0~100, Ks 0~1, Dr 0~TAW, 남은 물 0~100%, 선행일 0~4 등), 정해진 이름(상태 코드, 회차 결과), 키 중복 |
 | `io/supabase_write.py` | PostgREST 덮어쓰기(같은 키는 새 값으로, 500줄씩), Storage 올리기 |
-| `collectors/water.publish` | 계약 검사 → 원자료(Storage `raw`) → `weather_daily` → `water_balance_daily` → `forecast_runs`(번호 받기) → `water_outlook` → `water_outlook_summary` |
+| `collectors/water.publish` | 계약 검사 → 원자료(Storage `raw`) → `weather_daily` → `water_balance_daily` → `soil_water_daily` → `forecast_runs`(번호 받기) → `water_outlook` → `water_outlook_summary` |
 
 - 계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 "실패"와 이유(`error`)를 담아 올린다. 종료 코드 1.
 - 원자료는 예보 발표마다 한 파일(`fcst/<격자>/<연>/<월>/<발표>.json.gz`)이고, 다시 받으면 덮어쓴다. ASOS 응답은 언제든 다시 받을 수 있어 보관하지 않는다. 원자료 올리기가 실패하면 문제로 남기고 `raw_path`를 비운 채 계속한다.
@@ -89,7 +91,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 | `core/monitor.py` | 경고 규칙: 마지막 회차가 13시간 넘게 지남(오류), 마지막 회차 실패(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고) |
 | `io/github_issue.py` | "수집 경고" 이슈 열기·댓글·닫기. 새 경고가 생길 때만 댓글(같은 경고로 메일이 쌓이지 않게). 제목·라벨을 바꿔 쓸 수 있음(알림 연습) |
 | `collectors/monitor.py` | DB에서 최근 서버 회차 기록·지점별 관측 마지막 날·적산온도 마지막 날을 읽어 규칙을 돌리고 이슈에 반영 |
-| `collectors/heat_sun.py` | 하루 한 번(09:20, `heat-sun.yml`): 지점마다 ASOS 일자료 평년 기간(지난 10년)·올해를 해마다 나눠 받기(일시 오류 재시도) → `core/heat_sun` 한 해 표 → 계약 검사 → `heat_daily`·`sun_daily` 덮어쓰기. 기준온도는 `crops.t_base_c`, 일사를 재지 않는 지점은 `sun_daily` 없음. 받지 못한 지점은 빼고 실패로 남김 |
+| `collectors/heat_sun.py` | 하루 한 번(09:20, `heat-sun.yml`): 지점마다 ASOS 일자료 평년 기간(지난 10년)·올해를 해마다 나눠 받기(일시 오류 재시도) → `core/heat_sun` 한 해 표 → 계약 검사 → `heat_daily`·`sun_daily` 덮어쓰기. 기준온도는 `crops.t_base_c`(사과·배추 4℃, 작물 공통 `common` 5℃), 일사를 재지 않는 지점은 `sun_daily` 없음. 받지 못한 지점은 빼고 실패로 남김 |
 
 **알림 연습** (`monitor.yml` 수동 실행의 `drill` 선택, 결정 0011): `start` 는 가짜 실패 회차를 진짜 감시 규칙에 넣어 "[수집 경고] 알림 연습 (실제 문제 아님)" 이슈를 열고(메일이 감), `end` 는 "정상 회복" 댓글과 함께 닫는다. DB를 읽지 않고, 라벨이 달라 열려 있는 진짜 경고 이슈는 건드리지 않는다.
 

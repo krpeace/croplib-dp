@@ -1,4 +1,4 @@
-"""적산온도·적산일사 수집기 (CropMon 계약 v1.4 heat_daily·sun_daily, 온1).
+"""적산온도·적산일사 수집기 (CropMon 계약 v1.5 heat_daily·sun_daily, 온1·작물 공통).
 
 하루 한 번: 지점마다 ASOS 일자료를 평년 기간(지난 10년)과 올해(1월 1일 ~ 어제) 받아,
 core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Supabase 에 덮어쓴다.
@@ -194,7 +194,7 @@ def publish(r: HeatSunResult, writer) -> None:
         r.problems.append(f"DB 올리기 실패: {type(e).__name__}: {str(e)[:200]}")
 
 
-CROP_KO = {"apple": "사과", "kimchi_cabbage": "배추"}
+CROP_KO = {"common": "작물 공통", "apple": "사과", "kimchi_cabbage": "배추"}
 
 
 def brief_text(r: HeatSunResult) -> str:

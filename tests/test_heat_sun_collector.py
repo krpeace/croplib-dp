@@ -177,3 +177,15 @@ def test_publish_refuses_on_contract_problem():
 
     H.publish(r, W())
     assert not r.uploaded and r.failed and any("heat_daily" in p for p in r.problems)
+
+
+def test_common_crop_base_5c_included_in_heat_daily():
+    d = _dicts()
+    d.crops["common"] = dict(crop_id="common", name_ko="작물 공통", t_base_c=5, gdd_stages=[1000, 2000])
+    r = H.run(d, KEY, http=FakeAsos(), clock=FakeClock(TODAY))
+    common_rows = [x for x in r.heat_daily if x["stn_id"] == "101" and x["crop_id"] == "common"]
+    assert len(common_rows) == 365
+    assert common_rows[0]["date"] == "2026-01-01" and common_rows[-1]["date"] == "2026-12-31"
+    assert all(x["t_base_c"] == 5.0 for x in common_rows)
+    assert check_rows("heat_daily", r.heat_daily) == []
+    assert "작물 공통" in H.brief_text(r)

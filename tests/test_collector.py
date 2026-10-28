@@ -646,3 +646,41 @@ def test_day_after_season_end_morning_summary_is_dormant():
     s = next(x for x in r.water_outlook_summary if x["scenario_id"] == "101-apple-main-k3-loam-2026")
     assert s["start_date"] == "2026-10-27" and s["dr_start_mm"] > 0
     assert s["status_start"] == "dormant"
+
+
+def test_soil_water_daily_all_12_soils_including_3_estimated():
+    """시험 4: 추정 3종도 줄이 만들어짐(12토성 모두), 예보 지점(has_forecast)만 계산."""
+    d = _dicts()
+    soils_12 = [
+        ("sand", 0.12, 0.045, False),
+        ("loamy_sand", 0.15, 0.065, False),
+        ("sandy_loam", 0.23, 0.11, False),
+        ("sandy_clay_loam", 0.278, 0.177, True),
+        ("loam", 0.25, 0.12, False),
+        ("silt_loam", 0.29, 0.15, False),
+        ("silt", 0.32, 0.17, False),
+        ("clay_loam", 0.351, 0.213, True),
+        ("silty_clay_loam", 0.335, 0.205, False),
+        ("sandy_clay", 0.371, 0.260, True),
+        ("silty_clay", 0.36, 0.23, False),
+        ("clay", 0.36, 0.22, False),
+    ]
+    d.soils = {
+        code: dict(
+            soil_code=code, fc=fc, wp=wp, is_default=(code == "loam"), is_estimated=est, sort_order=i + 1
+        )
+        for i, (code, fc, wp, est) in enumerate(soils_12)
+    }
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+    r = W.run_slot("아침", ISSUE, d, KEY, http=api, clock=clock, soil_backfill=True)
+    assert {x["stn_id"] for x in r.soil_water_daily} == {"101"}  # has_forecast 지점만
+    assert {x["soil_code"] for x in r.soil_water_daily} == {c for c, _, _, _ in soils_12}
+    for est_code in ("sandy_clay_loam", "clay_loam", "sandy_clay"):
+        est_rows = [x for x in r.soil_water_daily if x["soil_code"] == est_code]
+        assert (
+            est_rows[0]["date"] == "2026-01-01"
+            and est_rows[0]["status"] == "winter"
+            and est_rows[-1]["date"] == "2026-06-09"
+        )
+    assert W.check_contract(r, W.taw_map(d)) == []

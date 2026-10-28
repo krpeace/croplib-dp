@@ -112,3 +112,24 @@ def test_year_table_missing_normal_day_counts_zero_and_no_obs():
     assert rows[0]["normal_day"] is None and rows[0]["normal_cum"] == 0.0
     assert all(r["cum"] is None for r in rows)
     assert rows[0]["date"] == D(2026, 1, 1)
+
+
+def test_common_crop_base_5c_boundary_and_milestones_1000_2000():
+    """작물 공통 적산온도(기준 5℃, 단계 1,000·2,000 ℃·일): 평균 5℃ 이하 날은 0, 도달일 계산."""
+    assert calc_gdd(5.0, 8.0, 2.0, t_base=5.0) == 0.0  # (8+2)/2 = 5.0 -> 0
+    assert calc_gdd(3.0, 6.0, 0.0, t_base=5.0) == 0.0  # 5℃ 미만 -> 0
+    assert calc_gdd(5.5, 8.0, 3.0, t_base=5.0) == pytest.approx(0.5)  # 5℃ 바로 위
+
+    # 하루 20 ℃·일씩(평균 25℃, 기준 5℃): 50일째 1,000 도달, 100일째 2,000 도달
+    start = dt.date(2026, 3, 1)
+    rows = []
+    for i in range(120):
+        d = start + dt.timedelta(days=i)
+        rows.append(
+            {"year": d.year, "month": d.month, "day": d.day, "avg_ta": 25.0, "max_ta": 30.0, "min_ta": 20.0}
+        )
+    reaching = gdd_reaching_dates(rows, t_base=5.0, milestones=[1000, 2000])
+    d1000 = start + dt.timedelta(days=49)
+    d2000 = start + dt.timedelta(days=99)
+    assert reaching[2026][1000] == f"{d1000.month}-{d1000.day}"
+    assert reaching[2026][2000] == f"{d2000.month}-{d2000.day}"

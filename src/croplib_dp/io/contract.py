@@ -1,4 +1,4 @@
-"""올리기 전 계약 검사 (데이터 계약 v1.4, CropMon `docs/DATA_CONTRACT.md`).
+"""올리기 전 계약 검사 (데이터 계약 v1.5, CropMon `docs/DATA_CONTRACT.md`).
 
 DB는 구조(키, 연결, 이름이 정해진 칸)만 막고, 값의 범위는 여기서 막는다(CropMon 결정 0004).
 한 줄이라도 어긋나면 그 회차의 계산 결과는 올리지 않고, 회차 기록에 '실패'와 이유를 남긴다.
@@ -9,8 +9,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-CONTRACT_VERSION = "v1.4"
+CONTRACT_VERSION = "v1.5"
 STATUS = ("need", "caution", "normal", "wet", "dormant")
+SOIL_WATER_STATUS = ("winter", "pool", "ample", "fair", "dry", "very_dry")
 
 
 @dataclass(frozen=True)
@@ -238,10 +239,45 @@ SPECS["sun_daily"] = TableSpec(
     },
     key=("stn_id", "date"),
 )
+SPECS["soil_water_daily"] = TableSpec(
+    columns=(
+        "stn_id",
+        "soil_code",
+        "date",
+        "eto_mm",
+        "rain_mm",
+        "eto_7d_mm",
+        "rain_7d_mm",
+        "dp_mm",
+        "dr_mm",
+        "taw_mm",
+        "raw_mm",
+        "aw_pct",
+        "status",
+        "days_to_dry",
+        "filled",
+        "calc_version",
+    ),
+    required=("stn_id", "soil_code", "date", "taw_mm", "raw_mm", "status", "filled", "calc_version"),
+    ranges={
+        "eto_mm": (0, 15),
+        "rain_mm": (0, 500),
+        "eto_7d_mm": (0, 105),
+        "rain_7d_mm": (0, 2000),
+        "dp_mm": (0, 1000),
+        "taw_mm": (1, 500),
+        "raw_mm": (0, 500),
+        "aw_pct": (0, 100),
+        "days_to_dry": (0, 366),
+    },
+    enums={"status": SOIL_WATER_STATUS},
+    key=("stn_id", "soil_code", "date"),
+)
 DR_COLUMNS = {
     "water_balance_daily": ("dr_prev_mm", "dr_mm"),
     "water_outlook": ("dr_center_mm", "dr_early_mm", "dr_late_mm"),
     "water_outlook_summary": ("dr_start_mm", "advice_net_mm"),
+    "soil_water_daily": ("dr_mm",),
 }
 
 
@@ -292,6 +328,8 @@ def check_rows(
             if _is_missing(v):
                 continue
             taw = (taw_by_scenario or {}).get(r.get("scenario_id"))
+            if taw is None and "taw_mm" in r and not _is_missing(r.get("taw_mm")):
+                taw = float(r["taw_mm"])
             hi = taw + 1e-6 if taw is not None else math.inf
             if not (-1e-6 <= v <= hi):
                 bad.append(f"{c}={v} (범위 0~{taw})")
