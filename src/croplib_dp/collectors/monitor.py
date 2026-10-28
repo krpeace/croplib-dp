@@ -1,7 +1,7 @@
 """수집 감시 (공3): DB의 회차 기록과 관측 마지막 날을 보고 경고를 GitHub 이슈로 알린다.
 
 `python -m croplib_dp.collectors.monitor` — 환경변수 SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-GITHUB_TOKEN, GITHUB_REPOSITORY. 예약 수집이 끝날 때와 2시간마다(monitor.yml) 돈다.
+GITHUB_TOKEN, GITHUB_REPOSITORY. 예약 수집이 끝날 때와 매시 40분(monitor.yml)에 돈다.
 `--drill start|end` 는 알림이 메일까지 가는지 보는 연습이다 (DB를 읽지 않고, 진짜 경고 이슈는 건드리지 않음).
 """
 
@@ -24,7 +24,7 @@ RUN_COLS = "run_at,run_name,stn_id,started_at,finished_at,result,on_time,error"
 
 
 def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
-    """최근 서버 회차 기록, 지점 이름, 지점별 관측 마지막 날, 지점별 적산온도 올해 값 마지막 날"""
+    """최근 서버 회차 기록, 수집하는 지점(has_forecast)의 이름·관측 마지막 날·적산온도 올해 값 마지막 날"""
     runs = read_table(
         base,
         key,
@@ -32,7 +32,11 @@ def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
         http,
         f"select={RUN_COLS}&collector=eq.{COLLECTOR}&order=run_at.desc&limit=20",
     )
-    stations = read_table(base, key, "stations", http, "select=stn_id,name_ko&order=sort_order")
+    # 수집하는 지점(has_forecast)만 본다. 수집하지 않는 지점은 관측이 없는 게 정상이다 (#33).
+    # 전 지점으로 넓힐 때(#28)는 has_forecast 만 켜면 감시가 따라간다.
+    stations = read_table(
+        base, key, "stations", http, "select=stn_id,name_ko&has_forecast=eq.true&order=sort_order"
+    )
     last: dict[str, dt.date | None] = {}
     heat: dict[str, dt.date | None] = {}
     for st in stations:

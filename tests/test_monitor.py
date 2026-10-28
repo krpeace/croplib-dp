@@ -249,3 +249,67 @@ def test_default_alert_sink_is_unchanged():
     gh = FakeGitHub()
     IssueAlerts("o/r", "tok", http=gh).sync(["error:failed:x"], "실패")
     assert gh.issues[0]["title"] == TITLE and gh.issues[0]["labels"] == [LABEL]
+
+
+# ── 수집하는 지점만 본다 (#33) ──────────────────────────────────────────
+STATIONS_105 = [
+    {"stn_id": "101", "name_ko": "춘천", "has_forecast": True},
+    {"stn_id": "216", "name_ko": "태백", "has_forecast": True},
+    {"stn_id": "108", "name_ko": "서울", "has_forecast": False},  # 수집하지 않는 지점
+]
+
+
+class FakeDb:
+    """가짜 Supabase REST. 요청 주소를 그대로 기록하고, stations 는 has_forecast 조건대로 걸러 준다
+    (조건이 없으면 수집하지 않는 지점까지 전부 돌려준다 — 조건을 빼면 시험이 깨지게)."""
+
+    def __init__(self, obs: dict[str, str]):
+        self.obs = obs  # 지점 → 관측·적산온도 마지막 날 (없으면 빈 응답)
+        self.urls: list[str] = []
+
+    def __call__(self, url, headers):
+        self.urls.append(url)
+        u = urllib.parse.urlparse(url)
+        table, q = u.path.split("/rest/v1/")[1], dict(urllib.parse.parse_qsl(u.query))
+        if table == "forecast_runs":
+            return 200, json.dumps([_run("2026-10-26 17:00")]).encode()
+        if table == "stations":
+            rows = STATIONS_105
+            if q.get("has_forecast") == "eq.true":
+                rows = [s for s in rows if s["has_forecast"] is True]
+            return 200, json.dumps([{"stn_id": s["stn_id"], "name_ko": s["name_ko"]} for s in rows]).encode()
+        stn = q["stn_id"].removeprefix("eq.")
+        rows = [{"date": self.obs[stn]}] if stn in self.obs else []
+        return 200, json.dumps(rows).encode()
+
+
+def test_read_state_asks_only_collected_stations():
+    db = FakeDb({"101": "2026-10-25", "216": "2026-10-25"})
+    M.read_state("https://x.supabase.co", "srv", db)
+    st_urls = [u for u in db.urls if "/rest/v1/stations" in u]
+    assert len(st_urls) == 1 and "has_forecast=eq.true" in st_urls[0]  # 요청 주소에 조건이 들어 있다
+    per_station = [u for u in db.urls if "/rest/v1/weather_daily" in u or "/rest/v1/heat_daily" in u]
+    assert not any("stn_id=eq.108" in u for u in per_station)  # 수집하지 않는 지점은 묻지도 않는다
+    assert len(per_station) == 4  # 2지점 × (관측, 적산온도)
+
+
+def test_uncollected_station_without_obs_gives_no_alert():
+    db = FakeDb({"101": "2026-10-25", "216": "2026-10-25"})  # 108 서울은 관측·적산온도가 없다
+    state = M.read_state("https://x.supabase.co", "srv", db)
+    assert set(state["weather_last"]) == {"101", "216"} and set(state["heat_last"]) == {"101", "216"}
+    text, action = M.run_monitor(state, None, now=TS("2026-10-26 18:30"))
+    assert "이상 없음" in text and "108" not in text and action == "dry"
+
+
+def test_collected_station_without_obs_still_alerts():
+    """감시 의미를 줄이지 않는다: 수집하는 지점(216)에 어제 관측·적산온도가 없으면 여전히 경고."""
+    db = FakeDb({"101": "2026-10-25"})
+    state = M.read_state("https://x.supabase.co", "srv", db)
+    alerts = check_health(
+        TS("2026-10-26 18:30"), state["runs"], state["weather_last"], state["names"], state["heat_last"]
+    )
+    codes = {(a.level, a.code) for a in alerts}
+    assert codes == {("warn", "asos"), ("warn", "heat")}
+    assert all(
+        "216 태백" in a.text and "108" not in a.text and "101" not in a.text.split("—")[1] for a in alerts
+    )
