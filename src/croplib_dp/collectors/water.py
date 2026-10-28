@@ -9,11 +9,11 @@
        - 서비스 발표를 발표 + 10분부터 0·5·10·15·20·30·45·60·80분에 다시 시도, 마감은 발표 + 90분
        - 첫 시도 뒤 앞선 24시간 발표 8개를 한 번씩 받음 (직전 발표 대체·관측 결측일 채우기용)
        - 인증·요청 오류(fatal)는 바로 멈춤. 마감 뒤에 실행하면 한 번만 시도(지연 수집)
-  3) 지점마다 ASOS 일자료(작기 시작 ~ 어제) 한 번 조회 → 일 기상값·ETo
+  3) 지점마다 ASOS 일자료(작기 시작 또는 3/1 ~ 어제) 한 번 조회 → 일 기상값·ETo
   4) 계산 조건마다 Kc 기후보정 → 관측 물수지(빠진 날은 아침 D+0 예보로) → (예보 지점) 3일 전망
-  5) DB 표와 같은 모양의 줄(forecast_runs, weather_daily, water_balance_daily, water_outlook)과 수집 기록
-
-DB에 쓰기는 물3에서 더한다. 지금은 결과를 파일로 남긴다(`python -m croplib_dp.collectors.water`).
+     예보 지점(has_forecast)은 토성 12종 작물 공통 물 상태(`soil_water_daily`)도 함께 계산한다.
+  5) DB 표와 같은 모양의 줄(forecast_runs, weather_daily, water_balance_daily, soil_water_daily,
+     water_outlook, water_outlook_summary)과 수집 기록
 """
 
 import argparse
@@ -51,6 +51,7 @@ from croplib_dp.core.outlook import (
     service_outlook,
     wb_frame,
 )
+from croplib_dp.core.soil_water import soil_water_rows
 from croplib_dp.core.water_balance import observed_water_balance
 from croplib_dp.io import kma
 from croplib_dp.io.coefficients import load_error_rows, load_s3_coef, load_s4_coef
@@ -73,6 +74,7 @@ DEADLINE_MIN = 90  # 마감 = 발표 + 90분 (03:30, 18:30). cropwater 2026-10-1
 RETRY_MIN = (0, 5, 10, 15, 20, 30, 45, 60, 80)  # 회차 시작(발표 + 10분)부터의 재시도 시각(분)
 CATCHUP_H = 24  # 함께 받는 앞선 발표 범위(시간)
 COLLECTOR = "actions"
+SOIL_UPLOAD_DAYS = 14  # 평소 회차에서 올리는 최근 일수 (--soil-backfill 이면 그해 3/1부터 전체)
 RESULTS = (
     "정시 성공",
     "백업: S3",
@@ -321,6 +323,21 @@ WB_COLS = (
     "filled",
     "calc_version",
 )
+SOIL_WATER_COLS = (
+    "eto_mm",
+    "rain_mm",
+    "eto_7d_mm",
+    "rain_7d_mm",
+    "dp_mm",
+    "dr_mm",
+    "taw_mm",
+    "raw_mm",
+    "aw_pct",
+    "status",
+    "days_to_dry",
+    "filled",
+    "calc_version",
+)
 WEATHER_COLS = (
     "tmax_c",
     "tmin_c",
@@ -344,6 +361,7 @@ class SlotResult:
     forecast_runs: list[dict] = field(default_factory=list)
     weather_daily: list[dict] = field(default_factory=list)
     water_balance_daily: list[dict] = field(default_factory=list)
+    soil_water_daily: list[dict] = field(default_factory=list)
     water_outlook: list[dict] = field(default_factory=list)
     water_outlook_summary: list[dict] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
@@ -378,6 +396,11 @@ def fetch_weather(key, stn_id, st, start, end, http, clock, log) -> tuple[list[d
     return daily_weather(items, station_meta(st)), res
 
 
+def _soil_season_start(day: dt.date, backfill: bool = False) -> dt.date:
+    """작물 공통 물 상태 계산 시작일: 소급(--soil-backfill)이나 1~2월은 그해 1/1, 평소 3~12월은 그해 3/1."""
+    return dt.date(day.year, 1, 1) if (backfill or day.month < 3) else dt.date(day.year, 3, 1)
+
+
 def run_station(
     name: str,
     issue: pd.Timestamp,
@@ -388,6 +411,7 @@ def run_station(
     collector: ForecastCollector | None,
     err_all: pd.DataFrame,
     result: SlotResult,
+    soil_backfill: bool = False,
 ) -> dict:
     """한 지점의 계산 조건 모두 → 결과 줄. 반환: 지점 요약"""
     st = d.stations[stn_id]
@@ -490,6 +514,28 @@ def run_station(
             except Exception as e:  # 계산 오류도 회차 실패로 남긴다(조용히 넘어가지 않음)
                 svc.update(ok=False, error=f"{type(e).__name__}: {e}"[:200])
         summary["scenarios"].append(info)
+    if st.get("has_forecast") and weather and d.soils:
+        soil_start = _soil_season_start(prev, backfill=soil_backfill)
+        soil_days = [w for w in weather if w["date"] >= soil_start]
+        cutoff = None if soil_backfill else (prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1))
+        soils_sorted = sorted(d.soils.values(), key=lambda x: (x.get("sort_order", 0), x["soil_code"]))
+        for soil_row in soils_sorted:
+            if soil_row.get("fc") is None or soil_row.get("wp") is None:
+                continue
+            s_rows = soil_water_rows(soil_days, float(soil_row["fc"]), float(soil_row["wp"]))
+            for r in s_rows:
+                if cutoff is not None and r["date"] < cutoff:
+                    continue
+                result.soil_water_daily.append(
+                    _jsonable(
+                        dict(
+                            stn_id=stn_id,
+                            soil_code=soil_row["soil_code"],
+                            date=r["date"],
+                            **{k: r[k] for k in SOIL_WATER_COLS},
+                        )
+                    )
+                )
     if forecast:
         svc["rs_method"] = "S3" if "S3" in methods else ("S4" if methods else None)
         on_time = bool(
@@ -539,6 +585,7 @@ def run_slot(
     clock: Clock | None = None,
     stations: list[str] | None = None,
     wait: bool = True,
+    soil_backfill: bool = False,
 ) -> SlotResult:
     """한 회차 전체. stations: 돌릴 지점(없으면 사전의 모든 지점)"""
     clock = clock or Clock()
@@ -558,7 +605,10 @@ def run_slot(
             collector = ForecastCollector(key, st["grid_nx"], st["grid_ny"], http, clock, result.log)
             col = collector.collect_service(issue, wait=wait)
             col["started_at"] = started
-        start = min((dt.date.fromisoformat(str(s["season_start"])[:10]) for s in scen), default=prev)
+        starts = [dt.date.fromisoformat(str(s["season_start"])[:10]) for s in scen]
+        if st.get("has_forecast") and d.soils:
+            starts.append(_soil_season_start(prev, backfill=soil_backfill))
+        start = min(starts, default=prev)
         weather, res = (
             fetch_weather(key, stn_id, st, start, prev, http, clock, result.log)
             if start <= prev
@@ -578,7 +628,9 @@ def run_slot(
                     )
                 )
             )
-        summary = run_station(name, issue, stn_id, d, weather, col, collector, err_all, result)
+        summary = run_station(
+            name, issue, stn_id, d, weather, col, collector, err_all, result, soil_backfill=soil_backfill
+        )
         if collector is not None:
             result.raw_files.update(collector.raw_files())
         summary["asos_ok"] = res.get("status") == "ok" if res else True
@@ -624,8 +676,8 @@ def summary_text(r: SlotResult) -> str:
         "",
         f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
-        f"water_balance_daily {len(r.water_balance_daily)}, water_outlook {len(r.water_outlook)}, "
-        f"water_outlook_summary {len(r.water_outlook_summary)}",
+        f"water_balance_daily {len(r.water_balance_daily)}, soil_water_daily {len(r.soil_water_daily)}, "
+        f"water_outlook {len(r.water_outlook)}, water_outlook_summary {len(r.water_outlook_summary)}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -671,6 +723,7 @@ def write_outputs(r: SlotResult, out_dir: Path) -> Path:
         "forecast_runs",
         "weather_daily",
         "water_balance_daily",
+        "soil_water_daily",
         "water_outlook",
         "water_outlook_summary",
     ):
@@ -695,11 +748,12 @@ RUN_KEY = ("run_at", "stn_id", "collector")  # water_outlook 줄에 run_id 대�
 
 
 def check_contract(r: SlotResult, taw_by_scenario: dict[str, float]) -> list[str]:
-    """네 표를 계약 v1.2로 검사. 어긋난 곳 설명 목록"""
+    """여섯 표를 계약 v1.5로 검사. 어긋난 곳 설명 목록"""
     return (
         check_rows("forecast_runs", r.forecast_runs)
         + check_rows("weather_daily", r.weather_daily)
         + check_rows("water_balance_daily", r.water_balance_daily, taw_by_scenario)
+        + check_rows("soil_water_daily", r.soil_water_daily)
         + check_rows("water_outlook", r.water_outlook, taw_by_scenario, ignore=("run_id",), extra=RUN_KEY)
         + check_rows(
             "water_outlook_summary",
@@ -716,8 +770,8 @@ def _run_key(row: dict) -> tuple:
 
 
 def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> SlotResult:
-    """계약 검사 → 원자료(Storage) → weather_daily → water_balance_daily → forecast_runs
-    → water_outlook(·요약).
+    """계약 검사 → 원자료(Storage) → weather_daily → water_balance_daily → soil_water_daily
+    → forecast_runs → water_outlook(·요약).
     계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 '실패'와 이유를 담아 올린다.
     원자료 올리기가 실패하면 기록에 남기고 raw_path를 비운 채 계속한다(계산 결과가 더 중요)."""
     problems = check_contract(r, taw_by_scenario)
@@ -738,6 +792,8 @@ def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> Sl
                     x["raw_path"] = None
     writer.upsert("weather_daily", r.weather_daily, SPECS["weather_daily"].key)
     writer.upsert("water_balance_daily", r.water_balance_daily, SPECS["water_balance_daily"].key)
+    if r.soil_water_daily:
+        writer.upsert("soil_water_daily", r.soil_water_daily, SPECS["soil_water_daily"].key)
     saved = writer.upsert("forecast_runs", r.forecast_runs, SPECS["forecast_runs"].key, returning=True)
     run_id = {_run_key(x): x["run_id"] for x in saved}
     for table in ("water_outlook", "water_outlook_summary"):
@@ -786,6 +842,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-wait", action="store_true", help="재시도 없이 지금 한 번만 받기 (시험 실행)")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase에 쓰기")
     p.add_argument(
+        "--soil-backfill",
+        action="store_true",
+        help="작물 공통 토양 물 상태(soil_water_daily)를 그해 3/1부터 전체 올리기",
+    )
+    p.add_argument(
         "--skip-if-done", action="store_true", help="이 회차가 이미 '정시 성공'이면 아무것도 하지 않고 끝내기"
     )
     a = p.parse_args(argv)
@@ -796,7 +857,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{name} {issue:%Y-%m-%d %H:%M} 회차는 이미 정시 성공으로 끝났습니다. 다시 하지 않습니다.")
         return 0
     stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
-    r = run_slot(name, issue, d, _env("DATA_GO_KR"), clock=clock, stations=stations, wait=not a.no_wait)
+    r = run_slot(
+        name,
+        issue,
+        d,
+        _env("DATA_GO_KR"),
+        clock=clock,
+        stations=stations,
+        wait=not a.no_wait,
+        soil_backfill=a.soil_backfill,
+    )
     if a.write:
         from croplib_dp.io.supabase_write import SupabaseWriter
 

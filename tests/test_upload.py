@@ -247,3 +247,17 @@ def test_contract_catches_bad_summary():
     s = dict(r.water_outlook_summary[0], need_center_in=-1, status_start="dry", dr_start_mm=999.0)
     p = check_rows("water_outlook_summary", [s], _taw(), ignore=("run_id",), extra=W.RUN_KEY)[0]
     assert "need_center_in=-1" in p and "status_start='dry'" in p and "dr_start_mm=999.0" in p
+
+
+def test_soil_water_daily_contract_and_publish():
+    r = _slot()
+    assert r.soil_water_daily
+    assert set(r.soil_water_daily[0]) == set(SPECS["soil_water_daily"].columns)
+    bad = dict(r.soil_water_daily[-1], aw_pct=105.0, dr_mm=999.0, status="need")
+    p = check_rows("soil_water_daily", [bad])[0]
+    assert "aw_pct=105.0" in p and "dr_mm=999.0" in p and "status='need'" in p
+    fake = FakeSupabase()
+    W.publish(r, SupabaseWriter("https://x.supabase.co", "srv", http=fake), _taw())
+    assert len(fake.tables["soil_water_daily"]) == len(r.soil_water_daily)
+    urls = {u for _, u, _, _ in fake.requests if "/rest/" in u}
+    assert "https://x.supabase.co/rest/v1/soil_water_daily?on_conflict=stn_id,soil_code,date" in urls

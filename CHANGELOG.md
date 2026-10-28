@@ -6,6 +6,7 @@
 - 기상청 ASOS 지점 목록 현행화 자료: API허브 지점정보(`stn_inf`)를 읽어 `docs/data/stations_kma_YYYYMMDD.csv`(폐지·휴지 지점은 `is_active=false`)와 시안 96곳·DB 사전 10곳 비교표 `docs/data/stations_diff.md`를 만든다. 읽기 전용, DB 쓰기 없음, 계산 결과·`CALC_VERSION` 변화 없음 (이슈 #27, 결정 0016, CropMon#38)
 
 ## 0.1.1 (2026-10-28)
+- 작물 공통 토양 물 상태 계산·올리기 (`soil_water_daily`, 데이터 계약 v1.5): 대표 10곳(`has_forecast`) × 토성 12종(추정 3종 포함), 고정 조건(Zr 0.5 m, Kc 1.0, p 0.40, 해마다 3/1 Dr = 0 재시작, 12~2월 `winter`), 상태 판정 6종(`winter`·`pool`·`ample`·`fair`·`dry`·`very_dry`), `days_to_dry`, 작물 공통 적산온도(`crop_id = 'common'`, 기준 5℃) (이슈 #24, 결정 0014, CropMon#35)
 - 3일 전망 요약(`water_outlook_summary.status_start`)의 휴면기는 회차 발표 날짜(한국 날짜)의 Kc로 판정하고, 과습은 관측 물수지 날이고 출발 날짜가 작기 안(Kc > 0)일 때만 판정 — 작기 경계(마지막 다음 날 아침·첫날 아침) 하루 어긋남 수정 (이슈 #26, 결정 0015, CropMon#37)
 
 ## 0.1.0 (예정, 2026-11-06 CropMon 공개와 함께)

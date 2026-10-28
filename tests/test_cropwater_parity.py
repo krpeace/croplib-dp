@@ -125,3 +125,20 @@ def test_kc_curve_water_balance_and_status_match_cropwater_fcst_wb():
         "wet",
         "dormant",
     }  # 다섯 상태가 모두 나오는 입력
+
+
+def test_soil_water_rows_loam_cropwater_values_match_multi_golden():
+    """시험 2: 양토를 cropwater 값(FC 0.22, WP 0.10)으로 두고 돌린 Dr이 기존 multi 골든과 같음."""
+    from croplib_dp.core.soil_water import soil_water_rows
+
+    weather = daily_weather(_asos_items(), StationMeta(lat=37.90262, elev_m=75.82, wind_height_m=10.0))
+    gold = GOLDEN["multi"]
+    # cropwater multi 조건(FC 0.22, WP 0.10, Zr 1.0, p 0.50 -> TAW 120, RAW 60)
+    rows_multi = soil_water_rows(weather, fc=0.22, wp=0.10, zr_m=1.0, p=0.50)
+    for r, g in zip(rows_multi, gold, strict=True):
+        assert r["dr_mm"] == pytest.approx(g["dr"], abs=5e-3), g["date"]
+        assert r["dp_mm"] == pytest.approx(g["dp"], abs=5e-3), g["date"]
+    # 작물 공통 고정 깊이·계수(Zr 0.5, p 0.40 -> TAW 60, RAW 24)에서도 RAW(24 mm) 안쪽 날은 같은 Dr
+    rows_common = soil_water_rows(weather, fc=0.22, wp=0.10)
+    for r, g in zip(rows_common[:10], gold[:10], strict=True):
+        assert r["dr_mm"] == pytest.approx(g["dr"], abs=5e-3), g["date"]
