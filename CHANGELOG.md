@@ -2,6 +2,9 @@
 
 형식: 버전, 날짜, 무엇이 바뀌었나. 보고서·논문에서 "v0.1.0 기준"으로 인용할 수 있게 남긴다.
 
+## 다음 버전 (미정)
+- 기상청 ASOS 지점 목록 현행화 자료: API허브 지점정보(`stn_inf`)를 읽어 `docs/data/stations_kma_YYYYMMDD.csv`(폐지·휴지 지점은 `is_active=false`)와 시안 96곳·DB 사전 10곳 비교표 `docs/data/stations_diff.md`를 만든다. 읽기 전용, DB 쓰기 없음, 계산 결과·`CALC_VERSION` 변화 없음 (이슈 #27, 결정 0016, CropMon#38)
+
 ## 0.1.1 (2026-10-28)
 - 3일 전망 요약(`water_outlook_summary.status_start`)의 휴면기는 회차 발표 날짜(한국 날짜)의 Kc로 판정하고, 과습은 관측 물수지 날이고 출발 날짜가 작기 안(Kc > 0)일 때만 판정 — 작기 경계(마지막 다음 날 아침·첫날 아침) 하루 어긋남 수정 (이슈 #26, 결정 0015, CropMon#37)
 
