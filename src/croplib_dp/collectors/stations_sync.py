@@ -8,7 +8,7 @@
 - 지금 운영 중인 목록 = 오늘 기준 조회.
 - 폐지·휴지 지점 = 지난 해마다 1월 1일 기준 목록에는 있고 지금은 없는 지점.
 - 한 번이라도 받지 못하거나 형식이 이상하면 파일을 쓰지 않고 실패(종료 코드 1)로 끝낸다.
-실행: python -m croplib_dp.collectors.stations_sync [--out docs/data] [--date 2026-10-28] [--since 2000]
+실행: python -m croplib_dp.collectors.stations_sync [--out docs/data] [--date 2026-10-28] [--since 1985]
 """
 
 import argparse
@@ -23,7 +23,7 @@ from croplib_dp.io import kma_hub
 from croplib_dp.io.kma import Http, http_get
 
 KST = dt.timezone(dt.timedelta(hours=9))
-SINCE_YEAR = 2000
+SINCE_YEAR = 1985
 
 
 def collect(
@@ -75,8 +75,8 @@ def main(
     csv_path.write_text(st.to_csv_text(rows), encoding="utf-8")
     md_path.write_text(st.diff_markdown(d, day.isoformat(), c), encoding="utf-8")
     print(
-        f"기상청 현행 {c['kma_active']}곳 (폐지·휴지 {c['kma_closed']}곳) / 시안 {c['draft']}곳 / "
-        f"기상청에만 {len(d['missing'])}곳 / 시안·DB에만 {len(d['gone'])}곳 / "
+        f"기상청 현행 {c['kma_active']}곳 (폐지·휴지 {c['kma_closed']}곳, 합 {len(rows)}곳) / "
+        f"시안 {c['draft']}곳 / 기상청에만 {len(d['missing'])}곳 / 시안·DB에만 {len(d['gone'])}곳 / "
         f"이름·번호 다름 {len(d['renamed'])}곳"
     )
     print(f"결과: {csv_path}, {md_path}")

@@ -53,12 +53,33 @@ def _header(lines: list[str]) -> tuple[int, list[str]]:
         toks = line.lstrip("#").split()
         if "STN_ID" in toks and "LON" in toks and "LAT" in toks:
             return i, toks
+        if "STN" in toks and "LON" in toks and "LAT" in toks and "STN_KO" in toks:
+            # 2줄 헤더(# STN ... STN STN_KO ... / # ID ... AD ...)를 열 이름으로 바꾼다
+            cols: list[str] = []
+            for j, tok in enumerate(toks):
+                if tok == "STN":
+                    cols.append("STN_ID" if j == 0 else "STN_AD")
+                else:
+                    cols.append(tok)
+            skip = 1 if i + 1 < len(lines) and lines[i + 1].lstrip().startswith("#") else 0
+            return i + skip, cols
     return -1, []
 
 
 def _split(toks: list[str], cols: list[str]) -> list[str] | None:
-    """한 줄의 값 → 열 수에 맞춘 값. 영문 이름에 띄어쓰기가 있으면 STN_EN 칸으로 모은다"""
+    """한 줄의 값 → 열 수에 맞춘 값. 영문 이름(STN_EN)·법정동주소(LAW_ADDR) 띄어쓰기를 모은다"""
     n = len(cols)
+    if cols and cols[-1] == "LAW_ADDR" and "BASIN" in cols and "STN_KO" in cols and "STN_EN" in cols:
+        k = cols.index("STN_KO")
+        if cols.index("BASIN") >= k + 4 and len(toks) >= k + 5:
+            for pos in range(k + 4, len(toks) + 1):
+                law = toks[pos - 2]
+                if (len(law) == 10 and law.isdigit()) or law in ("-", "----"):
+                    en = " ".join(toks[k + 1 : pos - 3])
+                    addr = " ".join(toks[pos:])
+                    if en:
+                        return toks[: k + 1] + [en, toks[pos - 3], law, toks[pos - 1], addr]
+        return None
     if len(toks) == n:
         return toks
     if len(toks) > n and "STN_KO" in cols and "STN_EN" in cols:

@@ -98,12 +98,12 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 ## 지점 목록 현행화 (이슈 #27, 결정 0016)
 | 모듈 | 하는 일 |
 |---|---|
-| `io/kma_hub.py` | 기상청 API허브 지점정보(`stn_inf`, 지상 SFC) 조회: 열 이름 줄로 글 표 읽기, EUC-KR 읽기, 비거나 형식이 다르면 실패, 키 감추기(`authKey=***`). 법정동코드가 없을 때만 좌표 → 시·도(OpenStreetMap) |
+| `io/kma_hub.py` | 기상청 API허브 지점정보(`stn_inf`, 지상 SFC) 조회: 열 이름 줄로 글 표 읽기, EUC-KR 읽기, 비거나 형식이 다르면 실패, 키 감추기(`authKey=***`). 법정동코드·주소가 없을 때만 좌표 → 시·도(OpenStreetMap) |
 | `core/stations.py` | 지점 줄 만들기(시·도 약칭, 결측은 빈 칸, 폐지·휴지는 `is_active=false`), 쓰기 전 검사, 시안 96곳·DB 사전 10곳과 비교(가·나·다), CSV·비교표 글 |
-| `collectors/stations_sync.py` | 오늘 기준 + 2000년부터 해마다 1월 1일 기준 목록 받기 → `stations_kma_YYYYMMDD.csv`, `stations_diff.md` |
+| `collectors/stations_sync.py` | 오늘 기준 + 1985년부터 해마다 1월 1일 기준 목록 받기 → `stations_kma_YYYYMMDD.csv`, `stations_diff.md` |
 
 - 읽기·파일 만들기만 한다. DB에 쓰지 않고, 결과는 `docs/data/`에 두어 CropMon#38이 마이그레이션으로 반영한다.
-- 실행: `python -m croplib_dp.collectors.stations_sync [--out docs/data] [--date 2026-10-28] [--since 2000]`. 환경변수 `KMA_HUB`. 하나라도 받지 못하면 파일을 쓰지 않고 종료 코드 1.
+- 실행: `python -m croplib_dp.collectors.stations_sync [--out docs/data] [--date 2026-10-28] [--since 1985]`. 환경변수 `KMA_HUB`. 하나라도 받지 못하면 파일을 쓰지 않고 종료 코드 1.
 - 예약 실행은 없다. 지점은 자주 바뀌지 않아 필요할 때 손으로 돌린다.
 
 ## 자동 검사 (`.github/workflows/ci.yml`)

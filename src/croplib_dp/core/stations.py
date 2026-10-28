@@ -8,6 +8,7 @@
 
 import csv
 import io
+import re
 from collections.abc import Callable, Iterable
 
 COLUMNS = (
@@ -140,9 +141,22 @@ def sido_from_law_id(law_id: str | None) -> str | None:
     return SIDO_BY_LAW.get(s[:2])
 
 
+def sido_from_addr(addr: str | None) -> str | None:
+    """법정동주소(LAW_ADDR) → 시·도 약칭. '(산지)' 말머리와 '전남광주통합특별시' 표기도 처리한다"""
+    toks = re.sub(r"^\([^)]*\)\s*", "", (addr or "").strip()).split()
+    if not toks:
+        return None
+    first = toks[0]
+    if first in _SIDO_FULL:
+        return _SIDO_FULL[first]
+    if first == "전남광주통합특별시":
+        return "광주" if len(toks) > 1 and toks[1].endswith("구") else "전남"
+    return None
+
+
 def _num(v: str | None) -> float | None:
     s = (v or "").strip()
-    if s in ("", "-", "--"):
+    if s in ("", "-", "--", "----"):
         return None
     x = float(s)
     return None if x < MISSING_BELOW else x
@@ -157,15 +171,19 @@ def _station(raw: dict, sido_lookup: Callable[[float, float], str] | None) -> di
     if sido:
         notes.append("시도: 법정동코드 앞 2자리")
     else:
-        if sido_lookup is None:
-            raise StationDataError(
-                f"{stn} {raw.get('STN_KO', '')}: 법정동코드가 없고 좌표로 찾을 방법도 없음"
-            )
-        try:
-            sido = sido_short(sido_lookup(lat, lon))
-        except Exception as e:  # 좌표로도 못 찾으면 멈춘다
-            raise StationDataError(f"{stn} {raw.get('STN_KO', '')}: 좌표로 시도를 찾지 못함 ({e})") from e
-        notes.append("시도: 좌표→행정구역(OpenStreetMap)")
+        sido = sido_from_addr(raw.get("LAW_ADDR"))
+        if sido:
+            notes.append("시도: 법정동주소(LAW_ADDR)")
+        else:
+            if sido_lookup is None:
+                raise StationDataError(
+                    f"{stn} {raw.get('STN_KO', '')}: 법정동코드가 없고 좌표로 찾을 방법도 없음"
+                )
+            try:
+                sido = sido_short(sido_lookup(lat, lon))
+            except Exception as e:  # 좌표로도 못 찾으면 멈춘다
+                raise StationDataError(f"{stn} {raw.get('STN_KO', '')}: 좌표로 시도를 찾지 못함 ({e})") from e
+            notes.append("시도: 좌표→행정구역(OpenStreetMap)")
     return dict(
         stn_id=stn,
         name_ko=(raw.get("STN_KO") or "").strip(),
@@ -333,8 +351,9 @@ def diff_markdown(d: dict, run_date: str, counts: dict) -> str:
         "만든 방법: `python -m croplib_dp.collectors.stations_sync` (이슈 #27, 결정 0016). "
         "기상청 API허브 지점정보(stn_inf, 지상 SFC)를 읽기만 했다.",
         "",
-        f"- 기상청 현행 지점: **{c['kma_active']}곳** (폐지·휴지로 확인된 지점 {c['kma_closed']}곳은 "
-        "CSV에 `is_active=false`로 따로 남김)",
+        f"- 기상청 전체 지점: **{c['kma_active'] + c['kma_closed']}곳** "
+        f"(현행 운영 **{c['kma_active']}곳** · 폐지·휴지 **{c['kma_closed']}곳**, "
+        "폐지·휴지 지점은 CSV에 `is_active=false`로 남김)",
         f"- 화면 시안: **{c['draft']}곳**, DB 지점 사전(CropMon `stations.ts`): **{c['db']}곳**",
         f"- (가) 기상청에만 있는 지점 {len(d['missing'])}곳 · "
         f"(나) 시안·DB에만 있는 지점 {len(d['gone'])}곳 · "

@@ -17,25 +17,27 @@ HEAD = """#START7777
 #  LON : 경도(degree), LAT : 위도(degree)
 #  HT_WD : 풍향/풍속계 지상높이(m)
 #--------------------------------------------------------------------------------
-#  STN_ID  LON  LAT  STN_SP  HT  HT_PA  HT_TA  HT_WD  HT_RN STN_AD STN_KO STN_EN FCT_ID LAW_ID BASIN
-#      -   degree  degree   -   m   m   m   m   m   -   -   -   -   -   -
+#  STN  LON  LAT  STN_SP  HT  HT_PA  HT_TA  HT_WD  HT_RN STN STN_KO STN_EN FCT_ID LAW_ID BASIN LAW_ADDR
+#   ID  degee degree ----  m  m  m  m  m  AD ---- ---- ---- ---- ---- ----
 """
 TAIL = "#7777END\n"
 
 NOW_ROWS = """\
-    90 128.56473  38.25085  0  18.06  19.6  1.5  10.0  0.6  0  속초  Sokcho  11D20401  5182000000  0
-   101 127.73570  37.90262  0  77.75  78.8  1.5  10.0  0.8  0  춘천  Chuncheon  11D10301  5111000000  0
-   102 124.63032  37.97396  0 144.86 145.9  1.5  10.0  0.7  0  백령도  Baengnyeongdo  11A00101  -  0
-   108 126.96580  37.57142  0  85.67  86.7  1.5  10.0  0.6  0  서울  Seoul  11B10101  1111000000  0
-   146 127.11905  35.84092  0  61.40  62.4  1.5  10.0  0.6  0  전주  Jeonju  11F10201  5211300000  0
-   184 126.52969  33.51411  0  20.45  21.5  1.5  -999  0.6  0  제주  Jeju  11G00201  5011000000  0
-   216 128.98929  37.17038  0 712.82 713.8  1.5  10.0  0.6  0  태백  Taebaek  11D10501  5119000000  0
+ 90 128.56473 38.25085 0 18.06 19.6 1.5 10.0 0.6 90 속초 Sokcho 11D20401 5182000000 ---- 강원특별자치도 고성군
+ 101 127.73570 37.90262 0 77.75 78.8 1.5 10.0 0.8 101 춘천 Chuncheon 11D10301 5111000000 ---- 강원특별자치도
+ 102 124.63032 37.97396 0 144.86 145.9 1.5 10.0 0.7 102 백령도 Baengnyeongdo 11A00101 ---- ---- ----
+ 108 126.96580 37.57142 0 85.67 86.7 1.5 10.0 0.6 108 서울 Seoul 11B10101 1111000000 ---- 서울특별시 종로구
+ 146 127.11905 35.84092 0 61.40 62.4 1.5 10.0 0.6 146 전주 Jeonju 11F10201 5211300000 ---- 전북특별자치도
+ 156 126.89156 35.17294 0 70.28 73.9 1.7 17.5 0.8 156 광주 Gwangju 11F 1230010900 ---- 전남광주통합특별시 북구
+ 165 126.38151 34.81732 0 44.70 39.2 1.5 14.5 1.0 165 목포 Mokpo 21F 1211010300 ---- 전남광주통합특별시 목포시
+ 184 126.52969 33.51411 0 20.45 21.5 1.5 -999 0.6 184 제주 Jeju 11G00201 5011000000 ---- 제주특별자치도 제주시
+ 216 128.98929 37.17038 0 712.82 713.8 1.5 10.0 0.6 216 태백 Taebaek 11D 5119000000 ---- (산지)강원특별자치도
 """
 
 PAST_ROWS = """\
-    90 128.56473  38.25085  0  18.06  19.6  1.5  10.0  0.6  0  속초  Sokcho  11D20401  4282000000  0
-   101 127.73570  37.90262  0  77.75  78.8  1.5  10.0  0.8  0  춘천  Chuncheon  11D10301  4211000000  0
-   103 128.10000  37.50000  0 300.00 301.0  1.5  10.0  0.6  0  옛지점  Old Station  11D10401  4273000000  0
+ 90 128.56473 38.25085 0 18.06 19.6 1.5 10.0 0.6 90 속초 Sokcho 11D20401 4282000000 ---- 강원도 고성군
+ 101 127.73570 37.90262 0 77.75 78.8 1.5 10.0 0.8 101 춘천 Chuncheon 11D10301 4211000000 ---- 강원도 춘천시
+ 103 128.10000 37.50000 0 300.00 301.0 1.5 10.0 0.6 103 옛지점 Old Station 11D10401 4273000000 ---- 강원도
 """
 
 NOW_TEXT = HEAD + NOW_ROWS + TAIL
@@ -148,11 +150,20 @@ def test_sido_from_law_id_old_and_new_codes():
     assert st.sido_from_law_id("") is None
 
 
+def test_sido_from_addr():
+    assert st.sido_from_addr("전남광주통합특별시 북구 운암동") == "광주"
+    assert st.sido_from_addr("전남광주통합특별시 목포시 연산동") == "전남"
+    assert st.sido_from_addr("(산지)강원특별자치도 평창군") == "강원"
+    assert st.sido_from_addr("----") is None
+
+
 def test_sido_all_short_and_method_noted():
     rows = by_id(build())
     assert {r["sido"] for r in rows.values()} <= set(st.SIDO_SHORT)
     assert rows[101]["sido"] == "강원" and rows[146]["sido"] == "전북" and rows[184]["sido"] == "제주"
+    assert rows[156]["sido"] == "광주" and rows[165]["sido"] == "전남"
     assert "법정동코드" in rows[101]["source_note"]
+    assert "법정동주소" in rows[156]["source_note"]
     # 기상청 자료에 행정구역이 없으면 좌표 → 행정구역으로 채우고 방법을 적는다
     assert rows[102]["sido"] == "인천"
     assert "좌표" in rows[102]["source_note"]
@@ -204,7 +215,7 @@ def test_reference_lists():
 def test_diff_three_groups():
     rows = build(db={101: ("춘천", True), 108: ("서을", None)})
     d = st.diff(rows, draft_ids=(90, 101, 103, 999), db_stations={101: ("춘천", True), 108: ("서을", None)})
-    assert [r["stn_id"] for r in d["missing"]] == [102, 146, 184, 216]  # 기상청에만 (108은 DB에 있음)
+    assert [r["stn_id"] for r in d["missing"]] == [102, 146, 156, 165, 184, 216]
     assert {r["stn_id"]: r["kma"] for r in d["gone"]} == {103: "closed", 999: "absent"}
     assert [(r["stn_id"], r["ref_name"], r["kma_name"]) for r in d["renamed"]] == [(108, "서을", "서울")]
     md = st.diff_markdown(d, run_date="2026-10-28", counts=st.counts(rows, (90, 101, 103, 999)))
@@ -232,7 +243,7 @@ def test_check_rows_finds_duplicates_and_bad_values():
         "<html><body>Service Unavailable</body></html>",
         '{"result":{"status":403,"message":"인증 실패"}}',
         "#START7777\n#  NAME  X  Y\n    90  1  2\n#7777END\n",  # 필요한 열이 없음
-        HEAD + "    90 abc 38.2 0 18 19 1.5 10 0.6 0 속초 Sokcho 11D 4282000000 0\n" + TAIL,  # 숫자 아님
+        HEAD + " 90 abc 38.2 0 18 19 1.5 10 0.6 90 속초 Sokcho 11D 4282000000 ---- 강원도\n" + TAIL,
         HEAD + "    90 128.5\n" + TAIL,  # 열이 모자람
     ],
 )
