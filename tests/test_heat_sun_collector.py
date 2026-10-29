@@ -10,6 +10,7 @@ import urllib.parse
 import pandas as pd
 
 from croplib_dp.collectors import heat_sun as H
+from croplib_dp.io.asos_cache import AsosCache
 from croplib_dp.io.contract import check_rows
 from croplib_dp.io.dictionaries import Dictionaries
 
@@ -31,8 +32,9 @@ def _item(d: dt.date, gsr=True) -> dict:
 
 
 class FakeAsos:
-    def __init__(self, missing=(), no_gsr=("216",), fail_stn=None):
+    def __init__(self, missing=(), no_gsr=("216",), fail_stn=None, nodata_years=()):
         self.missing, self.no_gsr, self.fail_stn = set(missing), set(no_gsr), fail_stn
+        self.nodata_years = set(nodata_years)  # 이 해는 관측이 없다 (nodata 응답)
         self.calls: list[tuple[str, str, str]] = []
 
     def __call__(self, url, timeout):
@@ -49,7 +51,7 @@ class FakeAsos:
         items = [
             _item(d0 + dt.timedelta(days=k), gsr=stn not in self.no_gsr)
             for k in range((d1 - d0).days + 1)
-            if d0 + dt.timedelta(days=k) not in self.missing
+            if d0 + dt.timedelta(days=k) not in self.missing and d0.year not in self.nodata_years
         ]
         page, rows = int(q["pageNo"]), int(q["numOfRows"])
         part = items[(page - 1) * rows : page * rows]
@@ -72,14 +74,16 @@ class FakeClock:
 
 
 def _dicts() -> Dictionaries:
-    st = lambda i, n: dict(stn_id=i, name_ko=n, lat=37.0, lon=127.0, elev_m=50, wind_height_m=10)  # noqa: E731
+    st = lambda i, n, act=True: dict(  # noqa: E731
+        stn_id=i, name_ko=n, lat=37.0, lon=127.0, elev_m=50, wind_height_m=10, is_active=act
+    )
     crops = [
         dict(crop_id="apple", name_ko="사과", t_base_c=4, gdd_stages=[500, 1000]),
         dict(crop_id="kimchi_cabbage", name_ko="배추", t_base_c=4, gdd_stages=[300]),
     ]
     return Dictionaries.from_rows(
         dict(
-            stations=[st("101", "춘천"), st("216", "태백")],
+            stations=[st("101", "춘천"), st("216", "태백"), st("999", "폐지지점", act=False)],
             crops=crops,
             crop_seasons=[],
             crop_kc_sets=[],
@@ -189,3 +193,120 @@ def test_common_crop_base_5c_included_in_heat_daily():
     assert all(x["t_base_c"] == 5.0 for x in common_rows)
     assert check_rows("heat_daily", r.heat_daily) == []
     assert "작물 공통" in H.brief_text(r)
+
+
+# ── 대상 지점: 운영(is_active) 지점만 ───────────────────────────────────
+def test_only_active_stations_run_and_closed_one_is_not_asked_nor_failed():
+    r, api, _ = _run()
+    assert {c[0] for c in api.calls} == {"101", "216"}  # 폐지 지점(999)은 묻지도 않는다
+    assert not r.failed and r.problems == []  # 실패로도 남기지 않는다
+    assert [s["stn_id"] for s in r.stations] == ["101", "216"]
+    assert "999" not in H.brief_text(r)
+
+
+def test_explicit_stations_override_the_default_target():
+    api = FakeAsos()
+    r = H.run(_dicts(), KEY, http=api, clock=FakeClock(TODAY), stations=["101"])
+    assert {c[0] for c in api.calls} == {"101"} and [s["stn_id"] for s in r.stations] == ["101"]
+
+
+def test_zero_active_stations_is_a_problem_not_silence():
+    d = _dicts()
+    for st in d.stations.values():
+        st["is_active"] = False
+    api = FakeAsos()
+    r = H.run(d, KEY, http=api, clock=FakeClock(TODAY))
+    assert api.calls == [] and r.failed and any("0곳" in p and "is_active" in p for p in r.problems)
+
+
+# ── 지난 해 캐시 ────────────────────────────────────────────────────────
+def _run_cached(cache_dir, **kw):
+    api = FakeAsos(**kw)
+    r = H.run(_dicts(), KEY, http=api, clock=FakeClock(TODAY), cache=AsosCache(cache_dir))
+    return r, api
+
+
+def test_empty_cache_fetches_all_eleven_years_and_saves_the_ten_past_ones(tmp_path):
+    r, api = _run_cached(tmp_path)
+    assert len([c for c in api.calls if c[0] == "101"]) == 11
+    files = sorted(p.name for p in (tmp_path / "asos" / "101").glob("*.json"))
+    assert files == [f"{y}.json" for y in range(2016, 2026)]  # 올해(2026)는 캐시하지 않는다
+    assert not r.failed
+
+
+def test_warm_cache_fetches_only_this_year(tmp_path):
+    _run_cached(tmp_path)
+    r, api = _run_cached(tmp_path)
+    assert sorted(api.calls) == [("101", "20260101", "20261024"), ("216", "20260101", "20261024")]
+    assert not r.failed
+
+
+def test_broken_cache_file_refetches_only_that_year(tmp_path):
+    _run_cached(tmp_path)
+    (tmp_path / "asos" / "101" / "2019.json").write_text("{깨진 JSON", encoding="utf-8")
+    r, api = _run_cached(tmp_path)
+    by101 = sorted(c for c in api.calls if c[0] == "101")
+    assert by101 == [("101", "20190101", "20191231"), ("101", "20260101", "20261024")]
+    assert not r.failed
+    assert json.loads((tmp_path / "asos" / "101" / "2019.json").read_text(encoding="utf-8"))  # 다시 채워짐
+
+
+def test_nodata_year_is_cached_and_not_asked_again(tmp_path):
+    _, api = _run_cached(tmp_path, nodata_years={2018})
+    assert json.loads((tmp_path / "asos" / "101" / "2018.json").read_text(encoding="utf-8")) == []
+    r, api = _run_cached(tmp_path, nodata_years={2018})
+    assert not any(c[1].startswith("2018") for c in api.calls)  # 빈 해도 다시 묻지 않는다
+    assert len(api.calls) == 2 and not r.failed
+
+
+def test_year_without_last_day_is_not_cached_until_complete(tmp_path):
+    """1/1 실행처럼 지난해 12/31 관측이 아직 안 올라왔으면 그해는 캐시하지 않고, 다음에 다시 받는다."""
+    _, api = _run_cached(tmp_path, missing={dt.date(2025, 12, 31)})
+    files = sorted(p.name for p in (tmp_path / "asos" / "101").glob("*.json"))
+    assert files == [f"{y}.json" for y in range(2016, 2025)]  # 2025 는 빠짐
+    r, api = _run_cached(tmp_path)  # 이번엔 12/31 이 올라와 있다
+    assert ("101", "20250101", "20251231") in api.calls and len(api.calls) == 4  # 2025 + 올해, 두 지점
+    assert (tmp_path / "asos" / "101" / "2025.json").is_file() and not r.failed
+
+
+def test_cache_keeps_only_calculation_fields(tmp_path):
+    _run_cached(tmp_path)
+    items = json.loads((tmp_path / "asos" / "101" / "2020.json").read_text(encoding="utf-8"))
+    assert items and all(set(it) <= {"tm", "avgTa", "maxTa", "minTa", "sumGsr"} for it in items)
+
+
+def test_failed_fetch_is_never_cached(tmp_path):
+    r, _ = _run_cached(tmp_path, fail_stn="216")
+    assert r.failed and not (tmp_path / "asos" / "216").exists()  # 실패는 캐시에 남기지 않는다
+    assert (tmp_path / "asos" / "101").is_dir()
+
+
+def test_cache_result_equals_full_fetch_result(tmp_path):
+    """캐시를 쓴 실행과 다 받은 실행의 heat_daily·sun_daily 는 똑같다."""
+    full = H.run(_dicts(), KEY, http=FakeAsos(), clock=FakeClock(TODAY))
+    _run_cached(tmp_path)  # 캐시 채우기
+    cached, api = _run_cached(tmp_path)
+    assert len(api.calls) == 2  # 정말 캐시에서 읽었다
+    assert cached.heat_daily == full.heat_daily and cached.sun_daily == full.sun_daily
+    assert cached.stations == full.stations
+
+
+def test_no_cache_by_default_fetches_everything():
+    _, api, _ = _run()
+    assert len([c for c in api.calls if c[0] == "101"]) == 11  # --cache-dir 이 없으면 지금처럼 다 받기
+
+
+def test_main_cache_dir_option(tmp_path, monkeypatch):
+    for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "DATA_GO_KR"):
+        monkeypatch.setenv(k, KEY if k == "DATA_GO_KR" else "x")
+    monkeypatch.setattr(H, "load_dictionaries", lambda *a, **k: _dicts())
+    api = FakeAsos()
+    real_run = H.run
+    monkeypatch.setattr(
+        H, "run", lambda *a, **k: real_run(*a, http=api, **k)
+    )  # 기본 http 는 정의 때 고정이라 끼워 넣는다
+    monkeypatch.setattr(H, "Clock", lambda: FakeClock(TODAY))
+    out = tmp_path / "out"
+    assert H.main(["--out", str(out), "--cache-dir", str(tmp_path / "c")]) == 0
+    assert (tmp_path / "c" / "asos" / "101" / "2025.json").is_file()
+    assert "ASOS 캐시" in (out / "heat_sun_2026" / "brief.md").read_text(encoding="utf-8")

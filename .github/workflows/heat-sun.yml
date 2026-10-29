@@ -4,6 +4,8 @@ name: heat-sun
 # 한 해 표를 만들고, 계약 검사(v1.4)를 통과하면 heat_daily·sun_daily 에 덮어쓴다.
 # 예약은 두 번 걸어 둔다(GitHub 예약 실행이 늦거나 건너뛰는 일이 있어서). 덮어쓰기라 두 번 돌아도 결과가 같다.
 # 사람이 Actions 화면에서 눌러 시험할 수도 있다 (write 를 끄면 DB 에 쓰지 않음).
+# 대상은 운영 지점(is_active) 전부. 지난 해 ASOS 일자료는 바뀌지 않아 actions/cache 로 남겨 두고(결정 0017),
+# 매일은 올해만 받는다. 캐시가 있으면 15분 이내가 목표, 캐시가 비었을 때(처음·키 만료)는 오래 걸려 120분까지 둔다.
 
 on:
   schedule:
@@ -11,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       stations:
-        description: "지점 번호 쉼표 목록 (예: 101). 비우면 전체"
+        description: "지점 번호 쉼표 목록 (예: 101). 비우면 운영 지점 전부"
         required: false
         default: ""
       write:
@@ -29,7 +31,7 @@ permissions:
 jobs:
   heat-sun:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -42,13 +44,21 @@ jobs:
           cache: pip
       - name: 설치
         run: pip install .
+      # 매번 새 키로 저장하고(run_id) 가장 최근 것을 복원한다. 해가 바뀌어도 겹치는 9년은 그대로 쓰고 새 해 1년치만 받는다.
+      # 저장은 실패해도 하도록 따로 둔다(처음 오래 걸린 실행이 중간에 실패해도 받은 해는 남기려고).
+      - name: 지난 해 ASOS 캐시 복원
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: asos-past-v1-${{ github.run_id }}
+          restore-keys: asos-past-v1-
       - name: 받기·계산·DB 쓰기 (실패하면 5분 뒤 한 번 더)
         env:
           STATIONS: ${{ inputs.stations }}
           # 예약 실행은 항상 쓰고, 사람이 누를 때는 write 입력을 따른다
           WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
         run: |
-          args=(--out out)
+          args=(--out out --cache-dir .cache)
           if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
           if [ "$WRITE" = "true" ]; then args+=(--write); fi
           set +e
@@ -60,6 +70,12 @@ jobs:
             [ $attempt = 1 ] && { echo "실패, 5분 뒤 다시"; sleep 300; }
           done
           exit $code
+      - name: 지난 해 ASOS 캐시 저장
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: asos-past-v1-${{ github.run_id }}
       - name: 요약을 실행 화면과 알림(annotation)에 표시
         if: always()
         run: |

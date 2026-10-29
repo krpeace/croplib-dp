@@ -61,7 +61,7 @@ class FakeSupabase:
 def _slot():
     clock = FakeClock("2026-06-10 02:20")
     api = FakeApi(clock, ISSUES)
-    return W.run_slot("아침", ISSUE, _dicts(), KEY, http=api, clock=clock)
+    return W.run_slot("아침", ISSUE, _dicts(), KEY, http=api, clock=clock, stations=["101", "216"])
 
 
 def _taw():

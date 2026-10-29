@@ -52,9 +52,10 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 |---|---|
 | `io/kma.py` | 단기예보·ASOS 조회: 키 인코딩, 여러 쪽 이어 받기, 응답 해석(JSON·XML 오류), 결과 구분(ok·nodata·retry·fatal), 기록에서 키 감추기 |
 | `io/dictionaries.py` | Supabase에서 사전 자료 6개 표 읽기, 계산 입력(StationMeta·CropParams·Soil)으로 바꾸기 |
-| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄 |
+| `io/asos_cache.py` | 지난 해 ASOS 일자료 파일 캐시(`<폴더>/asos/<지점>/<해>.json`). 계산에 쓰는 5칸만 저장, 12/31까지 다 받은 해(또는 관측 없는 해)만 남김. 깨진 파일은 없는 것으로 보고, 쓰기 실패는 넘어감 (결정 0017) |
+| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄. `--stations`가 없으면 **수집 지점(`has_forecast`)만** 돈다(결정 0017) |
 
-- 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 예보가 없는 지점은 관측 물수지만 계산하고, ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다.
+- 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 기본 대상이 `has_forecast` 지점뿐이라 예보 없는 지점은 `--stations`로 따로 지정했을 때만 돌고, 그때는 관측 물수지만 계산하며 ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다. 수집 지점이 0곳이면 회차를 실패로 남긴다.
 - 서버는 받은 예보를 쌓아 두지 않는다. 그래서 하루 넘게 지난 관측 결측일은 예보로 채우지 못하고 앞 7일 평균이 된다. 물3에서 예보 원자료를 Storage에 쌓으면 현장 PC처럼 채운다.
 - 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--soil-backfill] [--out out]`. 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
 - ASOS 조회가 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 세 번 더 시도한다. 시험 실행에서 공공데이터포털이 몇 분 동안 모든 요청에 응답하지 않은 적이 두 번 있었다.
@@ -88,10 +89,10 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 ## 수집 감시 (공3)
 | 모듈 | 하는 일 |
 |---|---|
-| `core/monitor.py` | 경고 규칙: 마지막 회차가 13시간 넘게 지남(오류), 마지막 회차 실패(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고) |
+| `core/monitor.py` | 경고 규칙: 마지막 회차가 13시간 넘게 지남(오류), 마지막 회차 실패(오류), 수집 지점 0곳(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고), 12시 뒤에도 어제 적산온도 없음(경고). 빠진 지점이 10곳을 넘으면 "N곳 — 앞 10곳 …"으로 줄임 |
 | `io/github_issue.py` | "수집 경고" 이슈 열기·댓글·닫기. 새 경고가 생길 때만 댓글(같은 경고로 메일이 쌓이지 않게). 제목·라벨을 바꿔 쓸 수 있음(알림 연습) |
-| `collectors/monitor.py` | DB에서 최근 서버 회차 기록과, 수집하는 지점(`stations.has_forecast = true`)의 관측 마지막 날·적산온도 마지막 날을 읽어 규칙을 돌리고 이슈에 반영. 수집하지 않는 지점은 보지 않는다(결정 0007 보충, #33) |
-| `collectors/heat_sun.py` | 하루 한 번(09:20, `heat-sun.yml`): 지점마다 ASOS 일자료 평년 기간(지난 10년)·올해를 해마다 나눠 받기(일시 오류 재시도) → `core/heat_sun` 한 해 표 → 계약 검사 → `heat_daily`·`sun_daily` 덮어쓰기. 기준온도는 `crops.t_base_c`(사과·배추 4℃, 작물 공통 `common` 5℃), 일사를 재지 않는 지점은 `sun_daily` 없음. 받지 못한 지점은 빼고 실패로 남김 |
+| `collectors/monitor.py` | DB에서 최근 서버 회차 기록, 수집 지점(`stations.has_forecast = true`)의 관측 마지막 날, 운영 지점(`is_active = true`)의 어제 적산온도 유무(`heat_daily` 한 번에 조회)를 읽어 규칙을 돌리고 이슈에 반영. 관측은 수집 지점만, 적산온도는 운영 지점 전부 본다(결정 0007 보충, 0017) |
+| `collectors/heat_sun.py` | 하루 한 번(09:20, `heat-sun.yml`): **운영 지점(`is_active`) 전부**(폐지·휴지는 안 돎)에 대해 ASOS 일자료 평년 기간(지난 10년)·올해를 해마다 나눠 받기(일시 오류 재시도) → `core/heat_sun` 한 해 표 → 계약 검사 → `heat_daily`·`sun_daily` 덮어쓰기. 지난 해 자료는 `--cache-dir` 파일 캐시(워크플로는 `actions/cache`)에서 읽고 올해만 새로 받음(목표 15분 이내). 기준온도는 `crops.t_base_c`(사과·배추 4℃, 작물 공통 `common` 5℃), 일사를 재지 않는 지점은 `sun_daily` 없음. 받지 못한 지점은 빼고 실패로 남김 (결정 0017) |
 
 **알림 연습** (`monitor.yml` 수동 실행의 `drill` 선택, 결정 0011): `start` 는 가짜 실패 회차를 진짜 감시 규칙에 넣어 "[수집 경고] 알림 연습 (실제 문제 아님)" 이슈를 열고(메일이 감), `end` 는 "정상 회복" 댓글과 함께 닫는다. DB를 읽지 않고, 라벨이 달라 열려 있는 진짜 경고 이슈는 건드리지 않는다.
 

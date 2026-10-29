@@ -23,8 +23,13 @@ DRILL_LABEL = "수집 경고 연습"
 RUN_COLS = "run_at,run_name,stn_id,started_at,finished_at,result,on_time,error"
 
 
-def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
-    """최근 서버 회차 기록, 수집하는 지점(has_forecast)의 이름·관측 마지막 날·적산온도 올해 값 마지막 날"""
+def read_state(base: str, key: str, http: RestGet = rest_get, now=None) -> dict[str, Any]:
+    """최근 서버 회차 기록, 지점 이름, 관측 마지막 날, 적산온도 어제 값 유무.
+    - 관측(weather_daily)은 수집하는 지점(has_forecast)만 지점마다 본다.
+    - 적산온도(heat_daily)는 운영 지점(is_active) 전부를 보되, 지점마다 묻지 않고 한 번에 묻는다
+      (어제·작물 공통 값이 있는 지점 목록 → 운영 지점과 비교). 지점이 늘어도 매시간 호출 수가 늘지 않는다."""
+    now = pd.Timestamp(now) if now is not None else kst_now()
+    yesterday = (now - pd.Timedelta(days=1)).date()
     runs = read_table(
         base,
         key,
@@ -34,27 +39,33 @@ def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
     )
     # 수집하는 지점(has_forecast)만 본다. 수집하지 않는 지점은 관측이 없는 게 정상이다 (#33).
     # 전 지점으로 넓힐 때(#28)는 has_forecast 만 켜면 감시가 따라간다.
-    stations = read_table(
+    collected = read_table(
         base, key, "stations", http, "select=stn_id,name_ko&has_forecast=eq.true&order=sort_order"
     )
+    active = read_table(
+        base, key, "stations", http, "select=stn_id,name_ko&is_active=eq.true&order=sort_order"
+    )
     last: dict[str, dt.date | None] = {}
-    heat: dict[str, dt.date | None] = {}
-    for st in stations:
+    for st in collected:
         rows = read_table(
             base, key, "weather_daily", http, f"select=date&stn_id=eq.{st['stn_id']}&order=date.desc&limit=1"
         )
         last[str(st["stn_id"])] = dt.date.fromisoformat(rows[0]["date"][:10]) if rows else None
-        rows = read_table(
+    have = {
+        str(r["stn_id"])
+        for r in read_table(
             base,
             key,
             "heat_daily",
             http,
-            f"select=date&stn_id=eq.{st['stn_id']}&gdd_cum=not.is.null&order=date.desc&limit=1",
+            f"select=stn_id&date=eq.{yesterday}&crop_id=eq.common&gdd_cum=not.is.null",
         )
-        heat[str(st["stn_id"])] = dt.date.fromisoformat(rows[0]["date"][:10]) if rows else None
+    }
+    # check_health 가 날짜로 비교하므로, 어제 값이 있는 지점은 어제 날짜, 없으면 None
+    heat = {str(s["stn_id"]): (yesterday if str(s["stn_id"]) in have else None) for s in active}
     return dict(
         runs=runs,
-        names={str(s["stn_id"]): s["name_ko"] for s in stations},
+        names={str(s["stn_id"]): s["name_ko"] for s in [*active, *collected]},
         weather_last=last,
         heat_last=heat,
     )
@@ -62,7 +73,14 @@ def read_state(base: str, key: str, http: RestGet = rest_get) -> dict[str, Any]:
 
 def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None) -> tuple[str, str]:
     now = now if now is not None else kst_now()
-    alerts = check_health(now, state["runs"], state["weather_last"], state["names"], state.get("heat_last"))
+    alerts = check_health(
+        now,
+        state["runs"],
+        state["weather_last"],
+        state["names"],
+        state.get("heat_last"),
+        collect_count=len(state["weather_last"]),
+    )
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"
     return text, action
@@ -107,9 +125,10 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
         print(f"이슈: {action}")
         return 0
-    state = read_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
+    now = kst_now()
+    state = read_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), now=now)
     sink = IssueAlerts(_env("GITHUB_REPOSITORY"), _env("GITHUB_TOKEN"))
-    text, action = run_monitor(state, sink)
+    text, action = run_monitor(state, sink, now=now)
     print(text)
     print(f"이슈: {action}")
     return 0
