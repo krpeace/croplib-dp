@@ -259,6 +259,22 @@ def test_nodata_year_is_cached_and_not_asked_again(tmp_path):
     assert len(api.calls) == 2 and not r.failed
 
 
+def test_year_without_last_day_is_not_cached_until_complete(tmp_path):
+    """1/1 실행처럼 지난해 12/31 관측이 아직 안 올라왔으면 그해는 캐시하지 않고, 다음에 다시 받는다."""
+    _, api = _run_cached(tmp_path, missing={dt.date(2025, 12, 31)})
+    files = sorted(p.name for p in (tmp_path / "asos" / "101").glob("*.json"))
+    assert files == [f"{y}.json" for y in range(2016, 2025)]  # 2025 는 빠짐
+    r, api = _run_cached(tmp_path)  # 이번엔 12/31 이 올라와 있다
+    assert ("101", "20250101", "20251231") in api.calls and len(api.calls) == 4  # 2025 + 올해, 두 지점
+    assert (tmp_path / "asos" / "101" / "2025.json").is_file() and not r.failed
+
+
+def test_cache_keeps_only_calculation_fields(tmp_path):
+    _run_cached(tmp_path)
+    items = json.loads((tmp_path / "asos" / "101" / "2020.json").read_text(encoding="utf-8"))
+    assert items and all(set(it) <= {"tm", "avgTa", "maxTa", "minTa", "sumGsr"} for it in items)
+
+
 def test_failed_fetch_is_never_cached(tmp_path):
     r, _ = _run_cached(tmp_path, fail_stn="216")
     assert r.failed and not (tmp_path / "asos" / "216").exists()  # 실패는 캐시에 남기지 않는다

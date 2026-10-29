@@ -23,7 +23,7 @@ from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.daily_weather import num
 from croplib_dp.core.heat_sun import calc_gdd, normals_by_day, year_table
 from croplib_dp.io import kma
-from croplib_dp.io.asos_cache import AsosCache
+from croplib_dp.io.asos_cache import AsosCache, is_complete
 from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries
 
@@ -186,7 +186,7 @@ def run(
                 r.cache_hit_years += 1
             else:
                 got = fetch_year(key, stn_id, s, e, http, clock, r.log)
-                if got is not None and past:
+                if got is not None and past and is_complete(got, y):  # 12/31 이 아직 없는 해는 남기지 않는다
                     cache.put(stn_id, y, got)
                     r.cache_fetched_years += 1
             if got is None:

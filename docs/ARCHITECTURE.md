@@ -52,7 +52,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 |---|---|
 | `io/kma.py` | 단기예보·ASOS 조회: 키 인코딩, 여러 쪽 이어 받기, 응답 해석(JSON·XML 오류), 결과 구분(ok·nodata·retry·fatal), 기록에서 키 감추기 |
 | `io/dictionaries.py` | Supabase에서 사전 자료 6개 표 읽기, 계산 입력(StationMeta·CropParams·Soil)으로 바꾸기 |
-| `io/asos_cache.py` | 지난 해 ASOS 일자료 파일 캐시(`<폴더>/asos/<지점>/<해>.json`). 깨진 파일은 없는 것으로 보고, 쓰기 실패는 넘어감 (결정 0017) |
+| `io/asos_cache.py` | 지난 해 ASOS 일자료 파일 캐시(`<폴더>/asos/<지점>/<해>.json`). 계산에 쓰는 5칸만 저장, 12/31까지 다 받은 해(또는 관측 없는 해)만 남김. 깨진 파일은 없는 것으로 보고, 쓰기 실패는 넘어감 (결정 0017) |
 | `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄. `--stations`가 없으면 **수집 지점(`has_forecast`)만** 돈다(결정 0017) |
 
 - 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 기본 대상이 `has_forecast` 지점뿐이라 예보 없는 지점은 `--stations`로 따로 지정했을 때만 돌고, 그때는 관측 물수지만 계산하며 ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다. 수집 지점이 0곳이면 회차를 실패로 남긴다.
