@@ -158,10 +158,12 @@ def test_read_state_and_run(monkeypatch):
             return 200, json.dumps(
                 [{"stn_id": "101", "name_ko": "춘천"}, {"stn_id": "216", "name_ko": "태백"}]
             ).encode()
+        if table == "heat_daily":  # 적산온도는 한 번에: 어제 값이 있는 지점 목록
+            return 200, json.dumps([{"stn_id": "101"}]).encode()
         rows = [{"date": "2026-10-25"}] if q["stn_id"] == "eq.101" else []
         return 200, json.dumps(rows).encode()
 
-    state = M.read_state("https://x.supabase.co", "srv", db)
+    state = M.read_state("https://x.supabase.co", "srv", db, now=TS("2026-10-26 18:30"))
     assert state["weather_last"] == {"101": dt.date(2026, 10, 25), "216": None}
     gh = FakeGitHub()
     text, action = M.run_monitor(state, IssueAlerts("o/r", "tok", http=gh), now=TS("2026-10-26 18:30"))
@@ -251,20 +253,31 @@ def test_default_alert_sink_is_unchanged():
     assert gh.issues[0]["title"] == TITLE and gh.issues[0]["labels"] == [LABEL]
 
 
-# ── 수집하는 지점만 본다 (#33) ──────────────────────────────────────────
+# ── 관측은 수집하는 지점만, 적산온도는 운영 지점 전부 (#33, 결정 0017) ──────
+NOW = TS("2026-10-26 18:30")
+YESTERDAY = "2026-10-25"
 STATIONS_105 = [
-    {"stn_id": "101", "name_ko": "춘천", "has_forecast": True},
-    {"stn_id": "216", "name_ko": "태백", "has_forecast": True},
-    {"stn_id": "108", "name_ko": "서울", "has_forecast": False},  # 수집하지 않는 지점
+    {"stn_id": "101", "name_ko": "춘천", "has_forecast": True, "is_active": True},
+    {"stn_id": "216", "name_ko": "태백", "has_forecast": True, "is_active": True},
+    {
+        "stn_id": "108",
+        "name_ko": "서울",
+        "has_forecast": False,
+        "is_active": True,
+    },  # 운영 중, 물은 수집 안 함
+    {"stn_id": "999", "name_ko": "폐지지점", "has_forecast": False, "is_active": False},  # 폐지·휴지
 ]
 
 
 class FakeDb:
-    """가짜 Supabase REST. 요청 주소를 그대로 기록하고, stations 는 has_forecast 조건대로 걸러 준다
-    (조건이 없으면 수집하지 않는 지점까지 전부 돌려준다 — 조건을 빼면 시험이 깨지게)."""
+    """가짜 Supabase REST. 요청 주소를 그대로 기록하고, stations 는 has_forecast·is_active 조건대로 걸러 준다
+    (조건이 없으면 전부 돌려준다 — 조건을 빼면 시험이 깨지게).
+    heat_daily 는 지점마다 묻지 않고 한 번에 묻는다: 어제 날짜·작물 공통 값이 있는 지점 목록을 돌려준다."""
 
-    def __init__(self, obs: dict[str, str]):
-        self.obs = obs  # 지점 → 관측·적산온도 마지막 날 (없으면 빈 응답)
+    def __init__(self, obs: dict[str, str], heat: set[str] | None = None, stations=None):
+        self.obs = obs  # 지점 → 관측 마지막 날 (없으면 빈 응답)
+        self.heat = heat if heat is not None else set()  # 어제 적산온도(common)가 있는 지점
+        self.stations = STATIONS_105 if stations is None else stations
         self.urls: list[str] = []
 
     def __call__(self, url, headers):
@@ -274,42 +287,127 @@ class FakeDb:
         if table == "forecast_runs":
             return 200, json.dumps([_run("2026-10-26 17:00")]).encode()
         if table == "stations":
-            rows = STATIONS_105
+            rows = self.stations
             if q.get("has_forecast") == "eq.true":
                 rows = [s for s in rows if s["has_forecast"] is True]
+            if q.get("is_active") == "eq.true":
+                rows = [s for s in rows if s["is_active"] is True]
             return 200, json.dumps([{"stn_id": s["stn_id"], "name_ko": s["name_ko"]} for s in rows]).encode()
+        if table == "heat_daily":
+            assert "stn_id" not in q or q["stn_id"] == ""  # 지점마다 묻지 않는다
+            assert q["date"] == f"eq.{YESTERDAY}" and q["crop_id"] == "eq.common"
+            assert q["gdd_cum"] == "not.is.null"
+            return 200, json.dumps([{"stn_id": s} for s in sorted(self.heat)]).encode()
         stn = q["stn_id"].removeprefix("eq.")
         rows = [{"date": self.obs[stn]}] if stn in self.obs else []
         return 200, json.dumps(rows).encode()
 
 
-def test_read_state_asks_only_collected_stations():
-    db = FakeDb({"101": "2026-10-25", "216": "2026-10-25"})
-    M.read_state("https://x.supabase.co", "srv", db)
+def _state(db):
+    return M.read_state("https://x.supabase.co", "srv", db, now=NOW)
+
+
+def test_read_state_asks_collected_for_obs_and_active_for_heat_in_few_calls():
+    db = FakeDb({"101": YESTERDAY, "216": YESTERDAY}, heat={"101", "216", "108"})
+    _state(db)
     st_urls = [u for u in db.urls if "/rest/v1/stations" in u]
-    assert len(st_urls) == 1 and "has_forecast=eq.true" in st_urls[0]  # 요청 주소에 조건이 들어 있다
-    per_station = [u for u in db.urls if "/rest/v1/weather_daily" in u or "/rest/v1/heat_daily" in u]
-    assert not any("stn_id=eq.108" in u for u in per_station)  # 수집하지 않는 지점은 묻지도 않는다
-    assert len(per_station) == 4  # 2지점 × (관측, 적산온도)
+    assert len(st_urls) == 2
+    assert sum("has_forecast=eq.true" in u for u in st_urls) == 1  # 요청 주소에 조건이 들어 있다
+    assert sum("is_active=eq.true" in u for u in st_urls) == 1
+    obs = [u for u in db.urls if "/rest/v1/weather_daily" in u]
+    assert len(obs) == 2 and not any("stn_id=eq.108" in u or "stn_id=eq.999" in u for u in obs)
+    heat = [u for u in db.urls if "/rest/v1/heat_daily" in u]
+    assert len(heat) == 1  # 적산온도는 지점 수와 상관없이 REST 한 번
+    assert "stn_id=eq" not in heat[0] and f"date=eq.{YESTERDAY}" in heat[0] and "crop_id=eq.common" in heat[0]
+    assert len(db.urls) == 1 + 2 + 2 + 1  # 회차, 지점 2번, 관측 2곳, 적산온도 1번
+
+
+def test_state_targets_obs_collected_and_heat_active():
+    db = FakeDb({"101": YESTERDAY, "216": YESTERDAY}, heat={"101", "216", "108"})
+    state = _state(db)
+    assert set(state["weather_last"]) == {"101", "216"}  # 관측: has_forecast 만
+    assert set(state["heat_last"]) == {"101", "216", "108"}  # 적산온도: 운영 지점 (폐지 999 는 없음)
+    assert state["names"]["108"] == "서울"
+    text, action = M.run_monitor(state, None, now=NOW)
+    assert "이상 없음" in text and "999" not in text and action == "dry"
 
 
 def test_uncollected_station_without_obs_gives_no_alert():
-    db = FakeDb({"101": "2026-10-25", "216": "2026-10-25"})  # 108 서울은 관측·적산온도가 없다
-    state = M.read_state("https://x.supabase.co", "srv", db)
-    assert set(state["weather_last"]) == {"101", "216"} and set(state["heat_last"]) == {"101", "216"}
-    text, action = M.run_monitor(state, None, now=TS("2026-10-26 18:30"))
-    assert "이상 없음" in text and "108" not in text and action == "dry"
+    """108 서울은 물을 수집하지 않아 관측이 없다 — 관측 경고는 없고(has_forecast 만 봄) 적산온도만 본다."""
+    db = FakeDb({"101": YESTERDAY, "216": YESTERDAY}, heat={"101", "216", "108"})
+    text, _ = M.run_monitor(_state(db), None, now=NOW)
+    assert "108" not in text and "이상 없음" in text
 
 
 def test_collected_station_without_obs_still_alerts():
-    """감시 의미를 줄이지 않는다: 수집하는 지점(216)에 어제 관측·적산온도가 없으면 여전히 경고."""
-    db = FakeDb({"101": "2026-10-25"})
-    state = M.read_state("https://x.supabase.co", "srv", db)
-    alerts = check_health(
-        TS("2026-10-26 18:30"), state["runs"], state["weather_last"], state["names"], state["heat_last"]
+    """감시 의미를 줄이지 않는다: 수집하는 지점(216)에 어제 관측이 없으면 여전히 경고."""
+    db = FakeDb({"101": YESTERDAY}, heat={"101", "216", "108"})
+    state = _state(db)
+    alerts = check_health(NOW, state["runs"], state["weather_last"], state["names"], state["heat_last"])
+    assert [(a.level, a.code) for a in alerts] == [("warn", "asos")]
+    assert "216 태백" in alerts[0].text and "101" not in alerts[0].text.split("—")[1]
+
+
+def test_only_active_stations_missing_yesterday_heat_are_warned():
+    """운영 지점 중 어제 적산온도가 빠진 곳만 경고. 폐지 지점(999)은 어제 값이 없어도 경고하지 않는다."""
+    db = FakeDb({"101": YESTERDAY, "216": YESTERDAY}, heat={"101"})
+    state = _state(db)
+    alerts = check_health(NOW, state["runs"], state["weather_last"], state["names"], state["heat_last"])
+    assert [(a.level, a.code) for a in alerts] == [("warn", "heat")]
+    t = alerts[0].text
+    assert "216 태백" in t and "108 서울" in t and "101" not in t.split("—")[1] and "999" not in t
+
+
+def test_zero_collect_stations_is_an_error_not_silence():
+    db = FakeDb({}, heat={"101"}, stations=[dict(s, has_forecast=False) for s in STATIONS_105])
+    state = _state(db)
+    assert state["weather_last"] == {}
+    text, _ = M.run_monitor(state, None, now=NOW)
+    assert "🔴 오류" in text and "수집 지점이 0곳 — 지점 사전 has_forecast 확인" in text
+    a = check_health(NOW, state["runs"], {}, state["names"], state["heat_last"], collect_count=0)
+    zero = next(x for x in a if "수집 지점이 0곳" in x.text)
+    assert (zero.level, zero.code) == ("error", "stale")
+
+
+def test_zero_active_stations_is_an_error_not_silence():
+    db = FakeDb(
+        {"101": YESTERDAY},
+        stations=[dict(s, is_active=False) for s in STATIONS_105],
     )
-    codes = {(a.level, a.code) for a in alerts}
-    assert codes == {("warn", "asos"), ("warn", "heat")}
-    assert all(
-        "216 태백" in a.text and "108" not in a.text and "101" not in a.text.split("—")[1] for a in alerts
+    text, _ = M.run_monitor(_state(db), None, now=NOW)
+    assert "🔴 오류" in text and "적산온도 대상 지점이 0곳 — 지점 사전 is_active 확인" in text
+
+
+def test_no_zero_station_error_when_not_asked():
+    """연습(--drill)처럼 지점 수를 알리지 않으면 0곳 오류를 만들지 않는다."""
+    a = check_health(NOW, [_run("2026-10-26 17:00")], {}, {"101": "춘천"})
+    assert a == []
+
+
+def test_many_missing_heat_stations_are_shortened():
+    names = {f"{i}": f"지점{i}" for i in range(100, 197)}  # 운영 97곳
+    heat = {k: None for k in names}  # 모두 빠짐
+    a = check_health(TS("2026-10-26 12:30"), [_run("2026-10-26 02:00")], OK_WEATHER, names, heat_last=heat)
+    t = a[0].text
+    assert "97곳" in t and "앞 10곳" in t and "지점100" in t and "지점109" in t and "지점110" not in t
+    assert len(t) < 300
+    few = {k: None for k in list(names)[:10]}
+    t10 = check_health(TS("2026-10-26 12:30"), [_run("2026-10-26 02:00")], OK_WEATHER, names, heat_last=few)[
+        0
+    ].text
+    assert "앞 10곳" not in t10 and "지점109" in t10  # 10곳까지는 다 적는다
+
+
+def test_shortened_alert_key_is_stable_when_missing_set_changes():
+    names = {f"{i}": f"지점{i}" for i in range(100, 197)}
+    a1 = check_health(
+        TS("2026-10-26 12:30"), [_run("2026-10-26 02:00")], OK_WEATHER, names, {k: None for k in names}
     )
+    a2 = check_health(
+        TS("2026-10-26 13:30"),
+        [_run("2026-10-26 02:00")],
+        OK_WEATHER,
+        names,
+        {k: None for k in list(names)[:50]},
+    )
+    assert [a.key for a in a1] == [a.key for a in a2]  # 빠진 지점 수가 달라도 같은 경고

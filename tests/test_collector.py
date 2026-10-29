@@ -230,12 +230,14 @@ ISSUES = [TS("2026-06-09 02:00") + pd.Timedelta(hours=3 * k) for k in range(9)] 
 
 
 ISSUE = TS("2026-06-10 02:00")
+# 216 은 예보 없는 지점(has_forecast=False)이라 기본 대상이 아니다. ASOS 만 받는 경로를 시험할 때는 명시한다.
+BOTH = ["101", "216"]
 
 
 def _run(start, issues=ISSUES, issue=ISSUE, name="아침", wait=True, **kw):
     clock = FakeClock(start)
     api = FakeApi(clock, issues, **kw)
-    r = W.run_slot(name, issue, _dicts(), KEY, http=api, clock=clock, wait=wait)
+    r = W.run_slot(name, issue, _dicts(), KEY, http=api, clock=clock, wait=wait, stations=BOTH)
     return r, api, clock
 
 
@@ -540,7 +542,7 @@ def test_asos_temporary_error_is_retried():
             return 502, b"bad gateway"
         return api(url, timeout)
 
-    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=flaky, clock=clock)
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=flaky, clock=clock, stations=BOTH)
     s = next(s for s in r.stations if s["stn_id"] == "216")
     assert s["asos_ok"] and not r.failed
     tries = [e for e in r.log.entries if e["kind"] == "asos" and e["target"].startswith("216")]
@@ -559,7 +561,7 @@ def test_asos_keeps_failing_marks_slot_failed():
     def down(url, timeout):
         return (503, b"") if "stnIds=216" in url else api(url, timeout)
 
-    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock)
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock, stations=BOTH)
     s = next(s for s in r.stations if s["stn_id"] == "216")
     assert not s["asos_ok"] and s["asos_status"] == "retry" and r.failed
     assert r.forecast_runs[0]["result"] == "정시 성공"  # 다른 지점(춘천)은 그대로 계산
@@ -572,7 +574,7 @@ def test_summary_shows_failed_response_line():
     def down(url, timeout):
         return (503, b"") if "stnIds=216" in url else api(url, timeout)
 
-    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock)
+    r = W.run_slot("아침", ISSUE, _dicts(), KEY, http=down, clock=clock, stations=BOTH)
     text = W.summary_text(r)
     assert "  ! asos 216 2026-04-01~2026-06-09 시도 4: retry HTTP 503" in text
 
@@ -684,3 +686,40 @@ def test_soil_water_daily_all_12_soils_including_3_estimated():
             and est_rows[-1]["date"] == "2026-06-09"
         )
     assert W.check_contract(r, W.taw_map(d)) == []
+
+
+# ── 기본 대상은 수집 지점(has_forecast)만 (결정 0017) ───────────────────
+def _default_run(d, **kw):
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+    r = W.run_slot("아침", ISSUE, d, KEY, http=api, clock=clock, **kw)
+    return r, api
+
+
+def test_default_targets_only_has_forecast_stations():
+    d = _dicts()
+    r, api = _default_run(d)
+    assert [s["stn_id"] for s in r.stations] == ["101"]  # 예보 없는 216 은 돌지 않는다
+    assert {w["stn_id"] for w in r.weather_daily} == {"101"}
+    assert not any("stnIds=216" in u for u in api.calls)  # ASOS 도 묻지 않는다
+    assert W.collect_stations(d) == ["101"]
+
+
+def test_default_targets_follow_has_forecast_flag():
+    """전 지점으로 넓힐 때(#28)는 has_forecast 만 켜면 수집이 따라간다."""
+    d = _dicts()
+    d.stations["216"]["has_forecast"] = True
+    assert W.collect_stations(d) == ["101", "216"]
+
+
+def test_explicit_stations_still_run_non_forecast_station():
+    r, _ = _default_run(_dicts(), stations=["216"])
+    assert [s["stn_id"] for s in r.stations] == ["216"] and r.weather_daily
+
+
+def test_zero_collect_stations_is_a_problem():
+    d = _dicts()
+    d.stations["101"]["has_forecast"] = False
+    r, api = _default_run(d)
+    assert r.stations == [] and r.failed
+    assert any("수집 지점이 0곳" in p and "has_forecast" in p for p in r.problems)

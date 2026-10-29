@@ -5,6 +5,10 @@ core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Sup
 - 기준온도는 작물 사전 crops.t_base_c (표준값 층). 비어 있으면 그 작물은 계산하지 않고 문제로 남긴다.
 - 일사를 재지 않는 지점(평년 기간에 sumGsr 가 하나도 없음)은 sun_daily 줄을 만들지 않는다.
 - 한 지점이 끝내 받지 못하면 그 지점만 빼고, 회차를 실패로 남긴다(조용히 넘어가지 않음).
+- 대상 지점은 운영 중인 지점(stations.is_active = true) 전부다. 폐지·휴지 지점은 올해 관측이 없어
+  돌지 않고 실패로도 남기지 않는다. `--stations` 를 주면 그 지점만 돈다.
+- `--cache-dir` 를 주면 지난 해(올해 이전) ASOS 일자료는 파일 캐시에서 읽고, 없는 해만 받는다.
+  올해는 늘 새로 받는다. 결과 계산은 같다 (결정 0017).
 """
 
 import argparse
@@ -19,6 +23,7 @@ from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.daily_weather import num
 from croplib_dp.core.heat_sun import calc_gdd, normals_by_day, year_table
 from croplib_dp.io import kma
+from croplib_dp.io.asos_cache import AsosCache
 from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries
 
@@ -38,6 +43,9 @@ class HeatSunResult:
     problems: list[str] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
     uploaded: bool = False
+    cache_used: bool = False  # --cache-dir 를 줬나
+    cache_hit_years: int = 0  # 캐시에서 읽은 (지점, 해) 수
+    cache_fetched_years: int = 0  # 캐시를 쓰는데 못 찾아 새로 받은 지난 해 수
 
     @property
     def failed(self) -> bool:
@@ -139,8 +147,18 @@ def build_station(stn_id: str, items: list[dict], crops: dict[str, float], year:
     return heat, sun, summary
 
 
+def active_stations(d: Dictionaries) -> list[str]:
+    """적산온도를 내는 지점: 운영 중(is_active)인 지점 전부. 폐지·휴지 지점은 올해 관측이 없다."""
+    return [k for k, st in d.stations.items() if st.get("is_active", True)]
+
+
 def run(
-    d: Dictionaries, key: str, http=kma.http_get, clock=None, stations: list[str] | None = None
+    d: Dictionaries,
+    key: str,
+    http=kma.http_get,
+    clock=None,
+    stations: list[str] | None = None,
+    cache: AsosCache | None = None,
 ) -> HeatSunResult:
     clock = clock or Clock()
     today = clock.now().date()
@@ -152,13 +170,25 @@ def run(
             r.problems.append(f"작물 {c['crop_id']}: 기준온도(crops.t_base_c)가 비어 있어 계산하지 않음")
         else:
             crops[c["crop_id"]] = float(c["t_base_c"])
-    for stn_id in stations or list(d.stations):
+    r.cache_used = cache is not None
+    targets = stations or active_stations(d)
+    if not targets:
+        r.problems.append("대상 지점이 0곳 — 지점 사전 is_active 확인")
+    for stn_id in targets:
         name = d.stations.get(stn_id, {}).get("name_ko", "")
         items: list[dict] = []
         ok = True
         for y in range(r.normal_from, year + 1):
             s, e = dt.date(y, 1, 1), (dt.date(y, 12, 31) if y < year else end)
-            got = fetch_year(key, stn_id, s, e, http, clock, r.log)
+            past = cache is not None and y < year  # 지난 해는 바뀌지 않아 캐시한다. 올해는 늘 새로 받는다
+            got = cache.get(stn_id, y) if past else None
+            if got is not None:
+                r.cache_hit_years += 1
+            else:
+                got = fetch_year(key, stn_id, s, e, http, clock, r.log)
+                if got is not None and past:
+                    cache.put(stn_id, y, got)
+                    r.cache_fetched_years += 1
             if got is None:
                 ok = False
                 r.problems.append(f"{stn_id} {name}: ASOS {s}~{e} 를 받지 못해 이 지점을 뺌")
@@ -201,6 +231,8 @@ def brief_text(r: HeatSunResult) -> str:
     """짧은 요약 (실행 화면 알림용): 지점마다 한 줄"""
     lines = [f"# 적산온도·적산일사 {r.year} (평년 {r.normal_from}–{r.normal_to}, 계산 {CALC_VERSION})"]
     lines += [f"! {p}"[:300] for p in r.problems[:5]]
+    if r.cache_used:
+        lines.append(f"ASOS 캐시: 읽음 {r.cache_hit_years}해 · 새로 받아 남김 {r.cache_fetched_years}해")
     for s in r.stations:
         if s.get("error"):
             lines.append(f"- {s['stn_id']} {s.get('name', '')}: {s['error']}")
@@ -242,12 +274,14 @@ def write_outputs(r: HeatSunResult, out_dir: Path) -> Path:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="적산온도·적산일사 수집기 (하루 한 번)")
     p.add_argument("--out", default="out", help="결과 폴더")
-    p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 전체)")
+    p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 운영 지점 전부)")
+    p.add_argument("--cache-dir", help="지난 해 ASOS 일자료를 남겨 두고 다시 쓰는 폴더 (없으면 매번 다 받기)")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase에 쓰기")
     a = p.parse_args(argv)
     d = load_dictionaries(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
     stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
-    r = run(d, _env("DATA_GO_KR"), stations=stations)
+    cache = AsosCache(a.cache_dir) if a.cache_dir else None
+    r = run(d, _env("DATA_GO_KR"), stations=stations, cache=cache)
     if a.write:
         from croplib_dp.io.supabase_write import SupabaseWriter
 

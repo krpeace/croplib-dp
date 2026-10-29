@@ -576,6 +576,15 @@ def _raw_path(collector: "ForecastCollector", issue: Any) -> str | None:
     return collector.raw_path(issue) if issue in collector.raw_pages else None
 
 
+def collect_stations(d: Dictionaries) -> list[str]:
+    """기본으로 도는 지점: 수집 지점(has_forecast). 전 지점으로 넓힐 때(#28)는 has_forecast 만 켜면
+    수집·감시·slot_done 이 함께 따라간다 (결정 0007 보충, 0017)."""
+    return sorted(
+        (k for k, st in d.stations.items() if st.get("has_forecast")),
+        key=lambda k: d.stations[k].get("sort_order", 0),
+    )
+
+
 def run_slot(
     name: str,
     issue: Any,
@@ -587,7 +596,7 @@ def run_slot(
     wait: bool = True,
     soil_backfill: bool = False,
 ) -> SlotResult:
-    """한 회차 전체. stations: 돌릴 지점(없으면 사전의 모든 지점)"""
+    """한 회차 전체. stations: 돌릴 지점(없으면 수집 지점 has_forecast. 감시·slot_done 과 같은 기준)"""
     clock = clock or Clock()
     issue = pd.Timestamp(issue)
     result = SlotResult(run_name=name, issue=issue)
@@ -595,7 +604,9 @@ def run_slot(
     prev = (D - pd.Timedelta(days=1)).date()
     fetched_at = _iso(clock.now())
     err_all = load_error_rows()
-    ids = stations or sorted(d.stations, key=lambda k: d.stations[k].get("sort_order", 0))
+    ids = stations or collect_stations(d)
+    if not ids:
+        result.problems.append("수집 지점이 0곳 — 지점 사전 has_forecast 확인")
     for stn_id in ids:
         st = d.stations[stn_id]
         scen = d.scenarios_for(stn_id, D.year)
@@ -816,7 +827,7 @@ def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -
     """이 회차가 이미 '정시 성공'으로 끝났나 (예보 지점 모두).
     예약을 여러 번 걸어 둔 실행이 같은 일을 다시 하지 않게 한다.
     정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다."""
-    stations = [k for k, st in d.stations.items() if st.get("has_forecast")]
+    stations = collect_stations(d)
     if not stations:
         return False
     run_at = urllib.parse.quote(_iso(issue), safe="")
@@ -838,7 +849,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="물 수집기 한 회차 (결과는 파일로, DB 쓰기는 물3)")
     p.add_argument("--slot", help="발표시각 '2026-10-24 02' (없으면 지금 회차)")
     p.add_argument("--out", default="out", help="결과 폴더")
-    p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 전체)")
+    p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 수집 지점 has_forecast)")
     p.add_argument("--no-wait", action="store_true", help="재시도 없이 지금 한 번만 받기 (시험 실행)")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase에 쓰기")
     p.add_argument(
