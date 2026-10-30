@@ -1,7 +1,8 @@
 """수집 감시 규칙 (공3): 회차 기록·관측 마지막 날로 경고를 정한다. DB·GitHub를 모르는 순수 함수.
 
 error (오류) — 바로 봐야 함
-  - stale   : 마지막 회차가 끝난 지 13시간 넘음 (02시·17시 두 번 중 한 번 넘게 빠짐)
+  - stale   : 마지막 회차가 끝난 지 17시간 넘음 (회차 하나가 빠짐. 02시→17시 간격이 15시간이라
+              13시간이면 매일 오후 가짜 오류, #37)
   - failed  : 마지막 회차 결과가 '실패'
   - stale   : 수집 지점(has_forecast)이 0곳 (지점 사전 문제 — 관측 경고가 조용히 사라지지 않게)
   - stale   : 적산온도 대상 지점(is_active)이 0곳 (같은 이유)
@@ -20,7 +21,9 @@ from typing import Any
 
 import pandas as pd
 
-STALE_H = 13  # 이보다 오래 갱신이 없으면 멈춤 (CropMon getFreshness 와 같은 기준)
+# 이보다 오래 갱신이 없으면 멈춤. 정상 최대 간격 약 16시간(02시 회차 → 17시 회차 마감 18:30) + 여유.
+# CropMon src/domain/freshness.ts STALE_AFTER_MS 와 같은 값이어야 함
+STALE_H = 17
 ASOS_CHECK_AFTER_H = 18  # 이 시각(KST) 뒤에는 어제 관측이 있어야 함 (17:20 회차 + 여유)
 BACKUP_RESULTS = ("지연 수집", "백업: 직전 발표", "백업: S3")
 HEAT_CHECK_AFTER_H = 12  # 적산온도는 09:20 에 한 번 수집 (재시도·늦은 시작 여유)
