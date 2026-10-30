@@ -71,7 +71,8 @@ def test_no_stale_alert_in_the_afternoon_gap_between_slots():
 
 
 def test_missing_slot_is_still_caught():
-    """17시 회차가 빠지면 02:25 + 17시간 = 19:25 쯤 오류, 02시 회차가 빠지면 17:25 + 17시간 = 다음 날 10:25 쯤 오류."""
+    """17시 회차가 빠지면 02:25 + 17시간 = 19:25 쯤 오류,
+    02시 회차가 빠지면 17:25 + 17시간 = 다음 날 10:25 쯤 오류."""
     morning = [_run("2026-10-29 02:00")]
     assert check_health(TS("2026-10-29 19:00"), morning, {}, NAMES) == []
     assert [x.code for x in check_health(TS("2026-10-29 19:40"), morning, {}, NAMES)] == ["stale"]
