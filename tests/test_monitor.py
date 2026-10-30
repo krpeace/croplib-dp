@@ -45,12 +45,40 @@ def test_all_good():
     assert "이상 없음" in report([], now)
 
 
-def test_stale_after_13_hours():
+def test_stale_after_17_hours():
     runs = [_run("2026-10-25 17:00")]  # 17:25에 끝남
-    assert check_health(TS("2026-10-26 06:00"), runs, OK_WEATHER, NAMES) == []  # 12.6시간
-    a = check_health(TS("2026-10-26 06:30"), runs, OK_WEATHER, NAMES)
+    assert check_health(TS("2026-10-26 10:00"), runs, OK_WEATHER, NAMES) == []  # 16.6시간
+    a = check_health(TS("2026-10-26 10:30"), runs, OK_WEATHER, NAMES)  # 17.1시간
     assert [(x.level, x.code) for x in a] == [("error", "stale")] and "101 춘천 갱신 멈춤" in a[0].text
-    assert STALE_H == 13
+    assert STALE_H == 17
+
+
+def test_stale_boundary_is_17_hours():
+    done = TS("2026-10-26 02:25")  # _run("2026-10-26 02:00") 이 끝나는 시각
+    runs = [_run("2026-10-26 02:00")]
+    ok = check_health(done + pd.Timedelta(hours=16.9), runs, {}, NAMES)
+    assert ok == []
+    a = check_health(done + pd.Timedelta(hours=17.1), runs, {}, NAMES)
+    assert [(x.level, x.code) for x in a] == [("error", "stale")]
+
+
+def test_no_stale_alert_in_the_afternoon_gap_between_slots():
+    """#35 재현: 02시 회차가 02:29에 끝나면 17시 회차가 끝나기 전 15:40(13.2시간)·17:00(14.5시간)은 정상이다.
+    13시간 기준일 때는 이 시각에 가짜 '갱신 멈춤' 오류가 났다."""
+    runs = [_run("2026-10-29 02:00", finished=TS("2026-10-29 02:29"))]
+    for now in ("2026-10-29 15:40", "2026-10-29 17:00"):
+        assert check_health(TS(now), runs, {}, NAMES) == [], now
+
+
+def test_missing_slot_is_still_caught():
+    """17시 회차가 빠지면 02:25 + 17시간 = 19:25 쯤 오류,
+    02시 회차가 빠지면 17:25 + 17시간 = 다음 날 10:25 쯤 오류."""
+    morning = [_run("2026-10-29 02:00")]
+    assert check_health(TS("2026-10-29 19:00"), morning, {}, NAMES) == []
+    assert [x.code for x in check_health(TS("2026-10-29 19:40"), morning, {}, NAMES)] == ["stale"]
+    evening = [_run("2026-10-29 17:00")]
+    assert check_health(TS("2026-10-30 10:00"), evening, {}, NAMES) == []
+    assert [x.code for x in check_health(TS("2026-10-30 10:40"), evening, {}, NAMES)] == ["stale"]
 
 
 def test_failed_and_backup():
@@ -79,9 +107,9 @@ def test_asos_checked_in_evening_only():
 
 def test_alert_keys_stable_for_same_problem():
     runs = [_run("2026-10-25 17:00")]
-    k1 = [a.key for a in check_health(TS("2026-10-26 07:00"), runs, OK_WEATHER, NAMES)]
-    k2 = [a.key for a in check_health(TS("2026-10-26 09:00"), runs, OK_WEATHER, NAMES)]
-    assert k1 == k2  # 시간이 지나도 같은 경고 → 댓글을 다시 달지 않음
+    k1 = [a.key for a in check_health(TS("2026-10-26 11:00"), runs, OK_WEATHER, NAMES)]
+    k2 = [a.key for a in check_health(TS("2026-10-26 13:00"), runs, OK_WEATHER, NAMES)]
+    assert k1 and k1 == k2  # 비어 있지 않아야 의미가 있다  # 시간이 지나도 같은 경고 → 댓글을 다시 달지 않음
 
 
 # ── GitHub 이슈 ─────────────────────────────────────────────────────────
