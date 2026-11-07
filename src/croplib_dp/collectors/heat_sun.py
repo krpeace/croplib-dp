@@ -2,6 +2,8 @@
 
 하루 한 번: 지점마다 ASOS 일자료를 평년 기간(지난 10년)과 올해(1월 1일 ~ 어제) 받아,
 core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Supabase 에 덮어쓴다.
+- 새해 1월 1~3일(PREV_YEAR_DAYS)에는 작년도 12/31 까지 다시 계산해 마감한다. 1/1 의 '어제'는 작년 12/31 이라
+  올해 구간이 거꾸로(시작 > 끝)라서 올해는 평년선만 만들고, 작년 12/31 값을 채운다 (이슈 #40, 결정 0018).
 - 기준온도는 작물 사전 crops.t_base_c (표준값 층). 비어 있으면 그 작물은 계산하지 않고 문제로 남긴다.
 - 일사를 재지 않는 지점(평년 기간에 sumGsr 가 하나도 없음)은 sun_daily 줄을 만들지 않는다.
 - 한 지점이 끝내 받지 못하면 그 지점만 빼고, 회차를 실패로 남긴다(조용히 넘어가지 않음).
@@ -28,24 +30,40 @@ from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries
 
 NORMAL_YEARS = 10
+PREV_YEAR_DAYS = 3  # 1월 1~3일은 작년도 다시 계산한다 (12/31 관측이 늦게 올라올 때를 위해)
 HEAT_KEY = SPECS["heat_daily"].key
 SUN_KEY = SPECS["sun_daily"].key
 
 
 @dataclass
-class HeatSunResult:
+class YearBlock:
+    """한 해 묶음: 그해 표를 만들 때 쓴 평년 기간과, 지점별 요약 (사람이 읽는 보고)"""
+
     year: int
     normal_from: int
     normal_to: int
-    heat_daily: list[dict] = field(default_factory=list)
+    stations: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class HeatSunResult:
+    year: int  # 올해. 아래 normal_from·normal_to 와 stations 도 올해 묶음 기준이다
+    normal_from: int
+    normal_to: int
+    heat_daily: list[dict] = field(default_factory=list)  # 계산한 모든 해(1/1~3 에는 작년+올해)
     sun_daily: list[dict] = field(default_factory=list)
-    stations: list[dict] = field(default_factory=list)  # 지점별 요약 (사람이 읽는 보고)
+    blocks: list[YearBlock] = field(default_factory=list)  # 해마다 한 묶음 (오래된 해 → 올해)
     problems: list[str] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
     uploaded: bool = False
     cache_used: bool = False  # --cache-dir 를 줬나
     cache_hit_years: int = 0  # 캐시에서 읽은 (지점, 해) 수
     cache_fetched_years: int = 0  # 캐시를 쓰는데 못 찾아 새로 받은 지난 해 수
+
+    @property
+    def stations(self) -> list[dict]:
+        """올해 묶음의 지점별 요약"""
+        return self.blocks[-1].stations if self.blocks else []
 
     @property
     def failed(self) -> bool:
@@ -60,7 +78,11 @@ def _date(it: dict) -> dt.date | None:
 
 
 def fetch_year(key, stn_id, start, end, http, clock, log) -> list[dict] | None:
-    """ASOS start~end (한 해 안). 일시 오류는 세 번 더 시도한다. 끝내 못 받으면 None."""
+    """ASOS start~end (한 해 안). 일시 오류는 세 번 더 시도한다. 끝내 못 받으면 None.
+    시작이 끝보다 늦으면(1/1 의 올해 구간) 묻지 않고 빈 목록을 돌려준다 (실패가 아니다)."""
+    if start > end:
+        log.add(clock, "asos", f"{stn_id} {start}~{end}", 0, {}, "skipped", note="역전 구간 — 호출 생략")
+        return []
     for attempt in range(1, len(ASOS_RETRY_S) + 2):
         res = kma.fetch_asos_days(key, stn_id, start, end, http)
         log.add(clock, "asos", f"{stn_id} {start}~{end}", attempt, res, res["status"])
@@ -163,7 +185,10 @@ def run(
     clock = clock or Clock()
     today = clock.now().date()
     year, end = today.year, today - dt.timedelta(days=1)
+    in_prev_window = today.month == 1 and today.day <= PREV_YEAR_DAYS
+    years = [year - 1, year] if in_prev_window else [year]  # 작년은 항상 12/31 까지, 올해는 어제까지
     r = HeatSunResult(year=year, normal_from=year - NORMAL_YEARS, normal_to=year - 1)
+    r.blocks = [YearBlock(y, y - NORMAL_YEARS, y - 1) for y in years]
     crops = {}
     for c in d.crops.values():
         if c.get("t_base_c") is None:
@@ -178,7 +203,7 @@ def run(
         name = d.stations.get(stn_id, {}).get("name_ko", "")
         items: list[dict] = []
         ok = True
-        for y in range(r.normal_from, year + 1):
+        for y in range(years[0] - NORMAL_YEARS, year + 1):  # 가장 오래된 해의 평년 첫 해 ~ 올해
             s, e = dt.date(y, 1, 1), (dt.date(y, 12, 31) if y < year else end)
             past = cache is not None and y < year  # 지난 해는 바뀌지 않아 캐시한다. 올해는 늘 새로 받는다
             got = cache.get(stn_id, y) if past else None
@@ -195,12 +220,14 @@ def run(
                 break
             items += got
         if not ok:
-            r.stations.append(dict(stn_id=stn_id, name=name, error="ASOS 실패"))
+            for b in r.blocks:
+                b.stations.append(dict(stn_id=stn_id, name=name, error="ASOS 실패"))
             continue
-        heat, sun, summary = build_station(stn_id, items, crops, year, r.normal_from, r.normal_to)
-        r.heat_daily += heat
-        r.sun_daily += sun
-        r.stations.append(dict(summary, name=name))
+        for b in r.blocks:  # 받은 자료 한 벌로 해마다 계산한다
+            heat, sun, summary = build_station(stn_id, items, crops, b.year, b.normal_from, b.normal_to)
+            r.heat_daily += heat
+            r.sun_daily += sun
+            b.stations.append(dict(summary, name=name))
     return r
 
 
@@ -227,13 +254,27 @@ def publish(r: HeatSunResult, writer) -> None:
 CROP_KO = {"common": "작물 공통", "apple": "사과", "kimchi_cabbage": "배추"}
 
 
+def _new_year_line(r: HeatSunResult) -> str:
+    """1/1~3 에만: 작년을 마감하는 실행에서 새해 줄이 몇 줄 만들어졌는지 한 줄로 (지점 줄은 늘리지 않는다)"""
+    b = r.blocks[-1]
+    heat = sum(1 for x in r.heat_daily if x["date"].startswith(f"{b.year}-"))
+    sun = sum(1 for x in r.sun_daily if x["date"].startswith(f"{b.year}-"))
+    seen = [s["last_obs"] for s in b.stations if s.get("last_obs")]
+    state = f"관측 ~{max(seen)[5:]}까지" if seen else "평년선만 생성"
+    return f"새해 {b.year}: {state} (heat {heat}줄 · sun {sun}줄)"
+
+
 def brief_text(r: HeatSunResult) -> str:
-    """짧은 요약 (실행 화면 알림용): 지점마다 한 줄"""
-    lines = [f"# 적산온도·적산일사 {r.year} (평년 {r.normal_from}–{r.normal_to}, 계산 {CALC_VERSION})"]
+    """짧은 요약 (실행 화면 알림용): 지점마다 한 줄.
+    1/1~3 에는 지점 줄을 작년 마감 기준으로 보여 주고, 새해는 한 줄만 덧붙인다."""
+    main = r.blocks[0] if r.blocks else YearBlock(r.year, r.normal_from, r.normal_to)
+    lines = [
+        f"# 적산온도·적산일사 {main.year} (평년 {main.normal_from}–{main.normal_to}, 계산 {CALC_VERSION})"
+    ]
     lines += [f"! {p}"[:300] for p in r.problems[:5]]
     if r.cache_used:
         lines.append(f"ASOS 캐시: 읽음 {r.cache_hit_years}해 · 새로 받아 남김 {r.cache_fetched_years}해")
-    for s in r.stations:
+    for s in main.stations:
         if s.get("error"):
             lines.append(f"- {s['stn_id']} {s.get('name', '')}: {s['error']}")
             continue
@@ -249,6 +290,8 @@ def brief_text(r: HeatSunResult) -> str:
                 parts.append(f"{CROP_KO.get(crop, crop)} {c['cum']:.0f}/{c['normal']:.0f}℃·일 {when}")
         parts.append(f"햇빛 {s.get('sun')}")
         lines.append(f"- {s['stn_id']} {s.get('name', '')}: " + " · ".join(parts))
+    if len(r.blocks) > 1:
+        lines.append(_new_year_line(r))
     lines.append(
         f"DB 올리기: {'완료' if r.uploaded else '안 함'} · "
         f"heat {len(r.heat_daily)}줄 · sun {len(r.sun_daily)}줄"

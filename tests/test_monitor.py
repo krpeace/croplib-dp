@@ -2,14 +2,21 @@
 
 import datetime as dt
 import json
+import sys
 import urllib.parse
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from croplib_dp.collectors import monitor as M
-from croplib_dp.core.monitor import STALE_H, check_health, kst, report
-from croplib_dp.io.github_issue import LABEL, TITLE, IssueAlerts
+sys.path.insert(0, str(Path(__file__).parent / "data"))
+
+from heat_sun_fakes import KEY, FakeAsos, FakeClock, dicts_with_common  # noqa: E402
+
+from croplib_dp.collectors import heat_sun as H  # noqa: E402
+from croplib_dp.collectors import monitor as M  # noqa: E402
+from croplib_dp.core.monitor import STALE_H, check_health, kst, report  # noqa: E402
+from croplib_dp.io.github_issue import LABEL, TITLE, IssueAlerts  # noqa: E402
 
 TS = pd.Timestamp
 NAMES = {"101": "춘천", "216": "태백"}
@@ -302,7 +309,10 @@ class FakeDb:
     (조건이 없으면 전부 돌려준다 — 조건을 빼면 시험이 깨지게).
     heat_daily 는 지점마다 묻지 않고 한 번에 묻는다: 어제 날짜·작물 공통 값이 있는 지점 목록을 돌려준다."""
 
-    def __init__(self, obs: dict[str, str], heat: set[str] | None = None, stations=None):
+    def __init__(
+        self, obs: dict[str, str], heat: set[str] | None = None, stations=None, heat_date: str = YESTERDAY
+    ):
+        self.heat_date = heat_date  # 감시가 적산온도를 묻는 날짜 (기본: 어제)
         self.obs = obs  # 지점 → 관측 마지막 날 (없으면 빈 응답)
         self.heat = heat if heat is not None else set()  # 어제 적산온도(common)가 있는 지점
         self.stations = STATIONS_105 if stations is None else stations
@@ -323,7 +333,7 @@ class FakeDb:
             return 200, json.dumps([{"stn_id": s["stn_id"], "name_ko": s["name_ko"]} for s in rows]).encode()
         if table == "heat_daily":
             assert "stn_id" not in q or q["stn_id"] == ""  # 지점마다 묻지 않는다
-            assert q["date"] == f"eq.{YESTERDAY}" and q["crop_id"] == "eq.common"
+            assert q["date"] == f"eq.{self.heat_date}" and q["crop_id"] == "eq.common"
             assert q["gdd_cum"] == "not.is.null"
             return 200, json.dumps([{"stn_id": s} for s in sorted(self.heat)]).encode()
         stn = q["stn_id"].removeprefix("eq.")
@@ -439,3 +449,22 @@ def test_shortened_alert_key_is_stable_when_missing_set_changes():
         {k: None for k in list(names)[:50]},
     )
     assert [a.key for a in a1] == [a.key for a in a2]  # 빠진 지점 수가 달라도 같은 경고
+
+
+# ── 새해 1월 1일: 수집 결과 → 감시 (이슈 #40) ───────────────────────────
+def test_new_year_collection_leaves_no_heat_alert_at_13h():
+    """1/1 09:20 수집 결과로 12/31 common 적산온도가 있는 지점을 골라 가짜 DB 에 넣고, 13시 감시를 돌린다.
+    heat_last 를 손으로 넣지 않는다: 수집이 12/31 을 못 채우면 이 시험이 깨진다."""
+    r = H.run(dicts_with_common(), KEY, http=FakeAsos(), clock=FakeClock("2027-01-01 09:20"))
+    have = {
+        x["stn_id"]
+        for x in r.heat_daily
+        if x["date"] == "2026-12-31" and x["crop_id"] == "common" and x["gdd_cum"] is not None
+    }
+    assert have == {"101", "216"}  # 수집 결과가 운영 지점 전부의 12/31 을 채웠다
+    stations = [s for s in STATIONS_105 if s["stn_id"] in have]
+    db = FakeDb({}, heat=have, stations=stations, heat_date="2026-12-31")
+    now = TS("2027-01-01 13:00")
+    state = M.read_state("https://x.supabase.co", "srv", db, now=now)  # 감시는 어제 = 2026-12-31 을 묻는다
+    alerts = check_health(now, state["runs"], state["weather_last"], state["names"], state["heat_last"])
+    assert [a for a in alerts if a.code == "heat"] == []
