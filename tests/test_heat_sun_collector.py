@@ -5,92 +5,22 @@
 
 import datetime as dt
 import json
-import urllib.parse
+import sys
+from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from croplib_dp.collectors import heat_sun as H
-from croplib_dp.io.asos_cache import AsosCache
-from croplib_dp.io.contract import check_rows
-from croplib_dp.io.dictionaries import Dictionaries
+sys.path.insert(0, str(Path(__file__).parent / "data"))
 
-KEY = "FAKE+KEY/dummy-value=="
+from heat_sun_fakes import KEY, FakeAsos, FakeClock, _dicts, dicts_with_common  # noqa: E402
+
+from croplib_dp.collectors import heat_sun as H  # noqa: E402
+from croplib_dp.collectors.water import RunLog  # noqa: E402
+from croplib_dp.io.asos_cache import AsosCache  # noqa: E402
+from croplib_dp.io.contract import check_rows  # noqa: E402
+
 TODAY = pd.Timestamp("2026-10-25 09:20")
-
-
-def _item(d: dt.date, gsr=True) -> dict:
-    doy = d.timetuple().tm_yday
-    warm = 12 + 12 * (1 - abs(doy - 200) / 200)  # 여름에 따뜻한 가짜 기온
-    bump = 1.0 if d.year == 2026 else 0.0  # 올해는 평년보다 1도 따뜻
-    return dict(
-        tm=d.isoformat(),
-        maxTa=f"{warm + 5 + bump:.1f}",
-        minTa=f"{warm - 5 + bump:.1f}",
-        avgTa=f"{warm + bump:.1f}",
-        sumGsr=(f"{10 + doy % 7}" if gsr else ""),
-    )
-
-
-class FakeAsos:
-    def __init__(self, missing=(), no_gsr=("216",), fail_stn=None, nodata_years=()):
-        self.missing, self.no_gsr, self.fail_stn = set(missing), set(no_gsr), fail_stn
-        self.nodata_years = set(nodata_years)  # 이 해는 관측이 없다 (nodata 응답)
-        self.calls: list[tuple[str, str, str]] = []
-
-    def __call__(self, url, timeout):
-        q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
-        assert q["serviceKey"] == KEY
-        stn, s, e = q["stnIds"], q["startDt"], q["endDt"]
-        self.calls.append((stn, s, e))
-        if stn == self.fail_stn:
-            return 500, b"server error"
-        d0, d1 = (
-            dt.date.fromisoformat(f"{s[:4]}-{s[4:6]}-{s[6:]}"),
-            dt.date.fromisoformat(f"{e[:4]}-{e[4:6]}-{e[6:]}"),
-        )
-        items = [
-            _item(d0 + dt.timedelta(days=k), gsr=stn not in self.no_gsr)
-            for k in range((d1 - d0).days + 1)
-            if d0 + dt.timedelta(days=k) not in self.missing and d0.year not in self.nodata_years
-        ]
-        page, rows = int(q["pageNo"]), int(q["numOfRows"])
-        part = items[(page - 1) * rows : page * rows]
-        body = {"items": {"item": part}, "totalCount": len(items)}
-        return 200, json.dumps(
-            {"response": {"header": {"resultCode": "00", "resultMsg": "OK"}, "body": body}}
-        ).encode()
-
-
-class FakeClock:
-    def __init__(self, t):
-        self.t = pd.Timestamp(t)
-        self.slept = 0.0
-
-    def now(self):
-        return self.t
-
-    def sleep(self, s):
-        self.slept += s
-
-
-def _dicts() -> Dictionaries:
-    st = lambda i, n, act=True: dict(  # noqa: E731
-        stn_id=i, name_ko=n, lat=37.0, lon=127.0, elev_m=50, wind_height_m=10, is_active=act
-    )
-    crops = [
-        dict(crop_id="apple", name_ko="사과", t_base_c=4, gdd_stages=[500, 1000]),
-        dict(crop_id="kimchi_cabbage", name_ko="배추", t_base_c=4, gdd_stages=[300]),
-    ]
-    return Dictionaries.from_rows(
-        dict(
-            stations=[st("101", "춘천"), st("216", "태백"), st("999", "폐지지점", act=False)],
-            crops=crops,
-            crop_seasons=[],
-            crop_kc_sets=[],
-            soil_types=[],
-            scenarios=[],
-        )
-    )
 
 
 def _run(**kw):
@@ -310,3 +240,110 @@ def test_main_cache_dir_option(tmp_path, monkeypatch):
     assert H.main(["--out", str(out), "--cache-dir", str(tmp_path / "c")]) == 0
     assert (tmp_path / "c" / "asos" / "101" / "2025.json").is_file()
     assert "ASOS 캐시" in (out / "heat_sun_2026" / "brief.md").read_text(encoding="utf-8")
+
+
+# ── 새해 1월 1~3일 (이슈 #40) ──────────────────────────────────────────
+NEW_YEAR = "2027-01-01 09:20"
+
+
+def _new_year(when=NEW_YEAR, cache=None, **kw):
+    api = FakeAsos(**kw)
+    r = H.run(dicts_with_common(), KEY, http=api, clock=FakeClock(when), cache=cache)
+    return r, api
+
+
+def _rows(table, year, **where):
+    return [x for x in table if x["date"].startswith(f"{year}-") and all(x[k] == v for k, v in where.items())]
+
+
+def test_new_year_day_closes_last_year_with_dec_31_values():
+    """1) 1/1 09:20: 작년 12/31 줄에 적산온도(3작물)·적산일사가 채워진다."""
+    r, _ = _new_year()
+    for stn in ("101", "216"):
+        for crop in ("common", "apple", "kimchi_cabbage"):
+            rows = _rows(r.heat_daily, 2026, stn_id=stn, crop_id=crop)
+            assert len(rows) == 365 and rows[-1]["date"] == "2026-12-31"
+            assert rows[-1]["gdd_cum"] is not None, (stn, crop)
+            assert (rows[-1]["normal_from"], rows[-1]["normal_to"]) == (2016, 2025)
+    sun_1231 = [x for x in r.sun_daily if x["date"] == "2026-12-31"]
+    assert [x["stn_id"] for x in sun_1231] == ["101"]  # 태백(216)은 일사를 재지 않는다
+    assert sun_1231[0]["rs_cum_mj"] is not None
+
+
+def test_new_year_day_makes_only_the_normal_line_for_the_new_year():
+    """2) 같은 실행: 새해 365줄은 평년선만 있고 올해 관측은 비어 있다. 역전 요청은 없다."""
+    r, api = _new_year()
+    assert not r.failed and r.problems == []
+    assert api.reversed_calls == []
+    assert r.year == 2027 and (r.normal_from, r.normal_to) == (2017, 2026)
+    for stn in ("101", "216"):
+        for crop in ("common", "apple", "kimchi_cabbage"):
+            rows = _rows(r.heat_daily, 2027, stn_id=stn, crop_id=crop)
+            assert len(rows) == 365
+            assert all(x["gdd_cum"] is None and x["gdd_day"] is None for x in rows)
+            assert all(x["gdd_normal_cum"] is not None for x in rows)
+            assert all((x["normal_from"], x["normal_to"]) == (2017, 2026) for x in rows)
+    sun = _rows(r.sun_daily, 2027, stn_id="101")
+    assert len(sun) == 365
+    assert all(x["rs_cum_mj"] is None and x["rs_normal_cum_mj"] is not None for x in sun)
+    assert check_rows("heat_daily", r.heat_daily) == [] and check_rows("sun_daily", r.sun_daily) == []
+
+
+def test_dec_31_missing_on_jan_1_stays_empty_and_is_not_cached_then_filled_on_jan_2(tmp_path):
+    """4) 1/1 에 12/31 관측이 아직 없으면 그날은 비워 두고(캐시도 안 함), 1/2 에 채운다."""
+    r, _ = _new_year(cache=AsosCache(tmp_path), missing={dt.date(2026, 12, 31)})
+    last = _rows(r.heat_daily, 2026, stn_id="101", crop_id="common")[-1]
+    assert last["date"] == "2026-12-31" and last["gdd_cum"] is None
+    assert not (tmp_path / "asos" / "101" / "2026.json").exists()
+    r2, _ = _new_year("2027-01-02 09:20", cache=AsosCache(tmp_path))
+    last2 = _rows(r2.heat_daily, 2026, stn_id="101", crop_id="common")[-1]
+    assert last2["date"] == "2026-12-31" and last2["gdd_cum"] is not None
+    assert (tmp_path / "asos" / "101" / "2026.json").is_file() and not r2.failed
+
+
+@pytest.mark.parametrize("when,last_obs", [("2027-01-02 09:20", "01-01"), ("2027-01-03 09:20", "01-02")])
+def test_jan_2_and_3_rewrite_last_year_and_fill_new_year_observations(when, last_obs):
+    """5) 1/2·1/3: 작년 줄을 다시 쓰고, 새해 관측은 어제까지 채워진다."""
+    r, api = _new_year(when)
+    assert not r.failed and api.reversed_calls == []
+    prev = _rows(r.heat_daily, 2026, stn_id="101", crop_id="common")
+    assert len(prev) == 365 and prev[-1]["gdd_cum"] is not None
+    new = _rows(r.heat_daily, 2027, stn_id="101", crop_id="common")
+    filled = [x["date"] for x in new if x["gdd_cum"] is not None]
+    assert filled[-1] == f"2027-{last_obs}" and len(filled) == int(last_obs[-2:])
+
+
+def test_jan_4_only_this_year():
+    """5) 1/4 부터는 올해만 (평소와 같다)."""
+    r, api = _new_year("2027-01-04 09:20")
+    assert not r.failed
+    assert _rows(r.heat_daily, 2026) == [] and _rows(r.sun_daily, 2026) == []
+    assert len(_rows(r.heat_daily, 2027, stn_id="101", crop_id="common")) == 365
+    assert (r.normal_from, r.normal_to) == (2017, 2026)
+
+
+def test_fetch_year_skips_reversed_range_without_calling():
+    """6) 시작일 > 종료일: 실패(None)가 아니라 빈 목록, 요청 0건, 로그 한 줄."""
+    api, log, clock = FakeAsos(), RunLog(), FakeClock(NEW_YEAR)
+    got = H.fetch_year(KEY, "101", dt.date(2027, 1, 1), dt.date(2026, 12, 31), api, clock, log)
+    assert got == [] and api.calls == []
+    assert len(log.entries) == 1 and "역전 구간 — 호출 생략" in log.entries[0]["note"]
+
+
+def test_new_year_with_warm_cache_asks_only_last_year(tmp_path):
+    """7) 지난 해 캐시가 따뜻한 1/1: 새로 묻는 것은 작년 한 해뿐이다 (역전 요청 없음)."""
+    _run_cached(tmp_path)  # 12월 평일처럼 평년 10년을 캐시에 채운다 (작년·올해는 아직 캐시 안 됨)
+    r, api = _new_year(cache=AsosCache(tmp_path))
+    assert sorted(api.calls) == [("101", "20260101", "20261231"), ("216", "20260101", "20261231")]
+    assert not r.failed
+
+
+def test_new_year_brief_keeps_station_lines_and_adds_one_new_year_line():
+    """지점 줄은 늘지 않는다(알림 4KB 제한). 작년 마감 기준 줄 + 새해 한 줄."""
+    r, _ = _new_year()
+    text = H.brief_text(r)
+    assert text.startswith("# 적산온도·적산일사 2026 (평년 2016–2025")
+    assert len([ln for ln in text.splitlines() if ln.startswith("- ")]) == 2  # 101, 216
+    assert "새해 2027: 평년선만 생성 (heat 2190줄 · sun 365줄)" in text
+    r2, _ = _new_year("2027-01-02 09:20")
+    assert "새해 2027: 관측 ~01-01까지 (heat 2190줄 · sun 365줄)" in H.brief_text(r2)
