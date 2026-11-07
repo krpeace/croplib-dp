@@ -350,3 +350,55 @@ def test_new_year_brief_keeps_station_lines_and_adds_one_new_year_line():
     assert "새해 2027: 평년선만 생성 (heat 2190줄 · sun 365줄)" in text
     r2, _ = _new_year("2027-01-02 09:20")
     assert "새해 2027: 관측 ~01-01까지 (heat 2190줄 · sun 365줄)" in H.brief_text(r2)
+
+
+# ── 일사 무효 처리 (이슈 #44, 결정 0020) ────────────────────────────────────
+def test_station_with_only_zero_radiation_overwrites_old_rows_with_empty_values():
+    """일사가 늘 0.0 인 지점: 평년선이 비어도 줄을 만들어, DB 의 옛 줄("100%")을 빈 값으로 덮어쓴다"""
+    r, _, _ = _run(zero_gsr=("101",))
+    rows = [x for x in r.sun_daily if x["stn_id"] == "101"]
+    assert len(rows) == 365 and rows[0]["date"] == "2026-01-01" and rows[-1]["date"] == "2026-12-31"
+    for x in rows:
+        assert x["rs_day_mj"] is None and x["rs_cum_mj"] is None
+        assert x["rs_normal_day_mj"] is None and x["rs_normal_cum_mj"] is None
+        assert x["filled"] is True and x["normal_from"] == 2016 and x["normal_to"] == 2025
+    assert check_rows("sun_daily", rows) == []
+    assert next(x for x in r.stations if x["stn_id"] == "101")["sun"] == "자료 없음"
+
+
+def test_station_that_never_reports_radiation_still_gets_no_rows():
+    """일사 칸이 한 번도 없던 지점은 지금처럼 줄을 만들지 않는다 (덮어쓸 옛 줄이 없다)"""
+    r, _, _ = _run(zero_gsr=("101",))  # 태백(216)은 no_gsr 기본값
+    assert not [x for x in r.sun_daily if x["stn_id"] == "216"]
+
+
+def test_empty_overwrite_rows_are_upserted_not_deleted():
+    r, _, _ = _run(zero_gsr=("101",))
+    calls = []
+
+    class W:
+        def upsert(self, table, rows, on_conflict):
+            calls.append((table, len(rows)))
+
+    H.publish(r, W())
+    assert r.uploaded and ("sun_daily", 365) in calls
+    assert not hasattr(W, "delete")
+
+
+def test_invalid_month_this_year_is_filled_with_normal_not_zero():
+    """올해 5월만 일사가 0.0 이면 그 달 날들은 무효 → 평년 값으로 채우고(filled), 0.0 을 쌓지 않는다"""
+    may = [dt.date(2026, 5, d) for d in range(1, 32)]
+    r, _, _ = _run(zero_days=may)
+    rows = {x["date"]: x for x in r.sun_daily if x["stn_id"] == "101"}
+    x = rows["2026-05-10"]
+    assert x["filled"] is True and x["rs_day_mj"] == x["rs_normal_day_mj"] and x["rs_day_mj"] > 0
+    ok = rows["2026-04-10"]
+    assert ok["filled"] is False and ok["rs_day_mj"] == 10 + dt.date(2026, 4, 10).timetuple().tm_yday % 7
+
+
+def test_healthy_station_sun_rows_are_unchanged_by_the_rule():
+    """정상 지점: 규칙이 닿지 않아 값이 지금과 같다 (일사 10~16 MJ 는 모든 날 하한 위)"""
+    r, _, _ = _run()
+    rows = [x for x in r.sun_daily if x["stn_id"] == "101" and x["date"] <= "2026-10-24"]
+    assert all(x["filled"] is False for x in rows)
+    assert all(x["rs_day_mj"] == 10 + dt.date.fromisoformat(x["date"]).timetuple().tm_yday % 7 for x in rows)

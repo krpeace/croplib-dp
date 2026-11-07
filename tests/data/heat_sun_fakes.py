@@ -16,7 +16,7 @@ from croplib_dp.io.dictionaries import Dictionaries
 KEY = "FAKE+KEY/dummy-value=="
 
 
-def _item(d: dt.date, gsr=True) -> dict:
+def _item(d: dt.date, gsr=True, zero_gsr=False) -> dict:
     doy = d.timetuple().tm_yday
     warm = 12 + 12 * (1 - abs(doy - 200) / 200)  # 여름에 따뜻한 가짜 기온
     bump = 1.0 if d.year == 2026 else 0.0  # 올해는 평년보다 1도 따뜻
@@ -25,13 +25,17 @@ def _item(d: dt.date, gsr=True) -> dict:
         maxTa=f"{warm + 5 + bump:.1f}",
         minTa=f"{warm - 5 + bump:.1f}",
         avgTa=f"{warm + bump:.1f}",
-        sumGsr=(f"{10 + doy % 7}" if gsr else ""),
+        sumGsr=("0.0" if zero_gsr else f"{10 + doy % 7}") if gsr else "",
     )
 
 
 class FakeAsos:
-    def __init__(self, missing=(), no_gsr=("216",), fail_stn=None, nodata_years=()):
+    def __init__(
+        self, missing=(), no_gsr=("216",), fail_stn=None, nodata_years=(), zero_gsr=(), zero_days=()
+    ):
         self.missing, self.no_gsr, self.fail_stn = set(missing), set(no_gsr), fail_stn
+        self.zero_gsr = set(zero_gsr)  # 이 지점은 일사가 늘 0.0 (센서 고장)
+        self.zero_days = set(zero_days)  # 모든 지점에서 이 날들만 일사가 0.0
         self.nodata_years = set(nodata_years)  # 이 해는 관측이 없다 (nodata 응답)
         self.calls: list[tuple[str, str, str]] = []  # 모든 요청 (지점, 시작, 끝)
 
@@ -58,7 +62,11 @@ class FakeAsos:
                 {"response": {"header": {"resultCode": "10", "resultMsg": "FAKE_REVERSED_RANGE"}}}
             ).encode()
         items = [
-            _item(d0 + dt.timedelta(days=k), gsr=stn not in self.no_gsr)
+            _item(
+                d0 + dt.timedelta(days=k),
+                gsr=stn not in self.no_gsr,
+                zero_gsr=stn in self.zero_gsr or d0 + dt.timedelta(days=k) in self.zero_days,
+            )
             for k in range((d1 - d0).days + 1)
             if d0 + dt.timedelta(days=k) not in self.missing and d0.year not in self.nodata_years
         ]
