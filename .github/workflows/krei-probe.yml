@@ -1,0 +1,19 @@
+name: krei-probe
+# KREI 농업관측 API가 GitHub Actions(해외 서버)에서 접속되는지 시험. 수동 실행 전용.
+on:
+  workflow_dispatch:
+    inputs:
+      yyyy: { description: "년도(비우면 이번 해)", required: false, default: "" }
+      mm:   { description: "월 2자리(비우면 이번 달)", required: false, default: "" }
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: 러너 위치
+        run: curl -s https://ipinfo.io/json || true
+      - name: KREI 접속 시험
+        run: python scripts/krei_probe.py --yyyy "${{ inputs.yyyy }}" --mm "${{ inputs.mm }}"
