@@ -25,12 +25,20 @@ def rest_get(url: str, headers: dict) -> tuple[int, bytes]:
 
 
 def read_table(
-    base_url: str, key: str, table: str, http: RestGet = rest_get, query: str = "select=*"
+    base_url: str,
+    key: str,
+    table: str,
+    http: RestGet = rest_get,
+    query: str = "select=*",
+    schema: str | None = None,
 ) -> list[dict]:
     """PostgREST로 표를 읽는다(query: PostgREST 조건, 기본은 전체).
     실패하면 오류를 낸다(조용히 넘어가지 않는다)."""
     url = f"{base_url.rstrip('/')}/rest/v1/{table}?{query}"
-    status, body = http(url, {"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"})
+    headers = {"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"}
+    if schema:
+        headers["Accept-Profile"] = schema
+    status, body = http(url, headers)
     if status != 200:
         text = (
             body.decode("utf-8", "replace")[:200] if isinstance(body, bytes | bytearray) else str(body)[:200]

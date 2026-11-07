@@ -39,13 +39,19 @@ class SupabaseWriter:
         rows: Iterable[Mapping[str, Any]],
         on_conflict: tuple[str, ...],
         returning: bool = False,
+        schema: str | None = None,
     ) -> list[dict]:
         """줄 목록을 덮어쓰기. returning=True면 저장된 줄(자동 번호 포함)을 돌려준다"""
         rows = list(rows)
         out: list[dict] = []
         url = f"{self.base}/rest/v1/{table}?on_conflict={','.join(on_conflict)}"
         prefer = "resolution=merge-duplicates," + ("return=representation" if returning else "return=minimal")
-        headers = self._headers(**{"Content-Type": "application/json", "Prefer": prefer})
+        extra = {"Content-Type": "application/json", "Prefer": prefer}
+        if schema:
+            extra["Content-Profile"] = schema
+            if returning:
+                extra["Accept-Profile"] = schema
+        headers = self._headers(**extra)
         for i in range(0, len(rows), self.batch):
             part = rows[i : i + self.batch]
             status, body = self.http(

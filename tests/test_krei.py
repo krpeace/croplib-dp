@@ -1,0 +1,583 @@
+"""KREI 농업관측 수집기 1단계 시험 (core/krei.py, io/krei.py, collectors/krei.py, core/monitor.py).
+
+네트워크 없이 실제 응답 fixture(tests/fixtures/krei/)와 작은 시험용 PDF·가짜 Supabase로 검증한다.
+"""
+
+import datetime as dt
+import gzip
+import json
+import urllib.parse
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from croplib_dp.collectors import krei as K
+from croplib_dp.collectors import monitor as M
+from croplib_dp.core.krei import (
+    build_pages_payload,
+    compress_pages_json,
+    default_months,
+    extract_file_id,
+    extract_first_page_meta,
+    months_between,
+    needs_refetch,
+    next_year_month,
+    parse_kst_timestamp,
+    parse_report_items,
+    parse_reports,
+    sync_items,
+)
+from croplib_dp.core.monitor import check_health, report
+from croplib_dp.io.contract import SPECS, check_rows
+from croplib_dp.io.krei import USER_AGENT, extract_pdf_bytes
+from croplib_dp.io.supabase_write import SupabaseWriter
+
+FIXTURES = Path(__file__).parent / "fixtures" / "krei"
+REPORT_ITEM_XML = (FIXTURES / "reportItem.xml").read_bytes()
+MONTHLY_11_XML = (FIXTURES / "montly_2026-11.xml").read_bytes()
+NEWS_11_XML = (FIXTURES / "news_2026-11.xml").read_bytes()
+TS = pd.Timestamp
+
+
+def make_test_pdf(words_on_page: list[str] | None = None) -> bytes:
+    """외부 글꼴 없이 pdfplumber 가 쪽 크기·단어 좌표·한국어 글자를 뽑을 수 있는 시험용 PDF 생성."""
+    words_on_page = words_on_page or ["통권", "제312호", "2026년", "11월", "3일", "발행", "과일"]
+    charset: list[str] = []
+    for w in words_on_page:
+        for ch in w:
+            if ch not in charset:
+                charset.append(ch)
+    code_of = {ch: i + 33 for i, ch in enumerate(charset)}
+    bfchar = [f"<{code:02X}> <{ch.encode('utf-16-be').hex().upper()}>" for ch, code in code_of.items()]
+    cmap = (
+        "/CIDInit /ProcSet findresource begin\n"
+        "12 dict begin\n"
+        "begincmap\n"
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        "/CMapName /Custom def\n"
+        "/CMapType 2 def\n"
+        "1 begincodespacerange\n"
+        "<00> <FF>\n"
+        "endcodespacerange\n"
+        f"{len(bfchar)} beginbfchar\n" + "\n".join(bfchar) + "\nendbfchar\n"
+        "endcmap\n"
+        "CMapName currentdict /CMap defineresource pop\n"
+        "end\n"
+        "end\n"
+    ).encode("ascii")
+
+    # 각 단어를 서로 떨어진 x 좌표에 배치해 pdfplumber extract_words() 가 단어별로 묶게 한다
+    ops = ["BT", "/F1 12 Tf"]
+    x = 50
+    for w in words_on_page:
+        hx = "".join(f"{code_of[ch]:02X}" for ch in w)
+        ops.append(f"1 0 0 1 {x} 750 Tm <{hx}> Tj")
+        x += 60
+    ops.append("ET")
+    content = "\n".join(ops).encode("ascii")
+
+    objs = [
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        (
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n"
+        ),
+        (
+            b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+            b"/FirstChar 32 /LastChar 255 /Widths ["
+            + b" ".join([b"600"] * 224)
+            + b"] /ToUnicode 6 0 R >>\nendobj\n"
+        ),
+        f"5 0 obj\n<< /Length {len(content)} >>\nstream\n".encode("ascii")
+        + content
+        + b"\nendstream\nendobj\n",
+        f"6 0 obj\n<< /Length {len(cmap)} >>\nstream\n".encode("ascii") + cmap + b"\nendstream\nendobj\n",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for o in objs:
+        offsets.append(len(out))
+        out.extend(o)
+    xref_pos = len(out)
+    out.extend(f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode("ascii"))
+    for off in offsets:
+        out.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+    out.extend(
+        f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode("ascii")
+    )
+    return bytes(out)
+
+
+class FakeClock:
+    def __init__(self, start: str = "2026-11-07 20:40:00"):
+        self.t = TS(start)
+        self.sleeps: list[float] = []
+
+    def now(self) -> pd.Timestamp:
+        return self.t
+
+    def sleep(self, sec: float) -> None:
+        self.sleeps.append(sec)
+        self.t = self.t + pd.Timedelta(seconds=sec)
+
+
+class FakeKreiHttp:
+    def __init__(self, pdf_bytes: bytes | None = None, fail_once_urls: set[str] | None = None):
+        self.pdf_bytes = pdf_bytes if pdf_bytes is not None else make_test_pdf()
+        self.fail_once: set[str] = set(fail_once_urls or ())
+        self.calls: list[tuple[str, int, dict[str, str]]] = []
+        self.monthly_xml: dict[str, bytes] = {
+            "2026-11": MONTHLY_11_XML,
+            "2026-12": b'<?xml version="1.0" encoding="UTF-8"?><channel></channel>',
+        }
+        self.news_xml: dict[str, bytes] = {
+            "2026-11": NEWS_11_XML,
+            "2026-12": b'<?xml version="1.0" encoding="UTF-8"?><channel></channel>',
+        }
+        self.item_xml: bytes = REPORT_ITEM_XML
+
+    def __call__(
+        self, url: str, timeout: int, headers: dict[str, str]
+    ) -> tuple[int | None, bytes, str | None]:
+        self.calls.append((url, timeout, headers))
+        if url in self.fail_once:
+            self.fail_once.remove(url)
+            return 503, b"Service Unavailable", "HTTP 503"
+        u = urllib.parse.urlparse(url)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        if u.path.endswith("/reportItem"):
+            return 200, self.item_xml, None
+        if u.path.endswith("/montlyReport"):
+            ym = f"{q.get('yyyy')}-{q.get('mm')}"
+            body = self.monthly_xml.get(ym, b'<?xml version="1.0" encoding="UTF-8"?><channel></channel>')
+            return 200, body, None
+        if u.path.endswith("/newsReport"):
+            ym = f"{q.get('yyyy')}-{q.get('mm')}"
+            body = self.news_xml.get(ym, b'<?xml version="1.0" encoding="UTF-8"?><channel></channel>')
+            return 200, body, None
+        if "/download/" in u.path:
+            return 200, self.pdf_bytes, None
+        return 404, b"Not Found", "HTTP 404"
+
+
+# ── 1. XML 파싱 (실제 응답 fixture) ─────────────────────────────────────────
+def test_parse_report_items_fixture_43_items_3_levels():
+    items = parse_report_items(REPORT_ITEM_XML)
+    assert len(items) == 43
+    levels = {it["level"] for it in items}
+    assert levels == {1, 2, 3}
+    by_code = {it["ovr_item_code"]: it for it in items}
+    # 최상위(level 1): 원예·축산·곡물, prt_ovr_item_code 는 None
+    assert by_code["OVR0000000093"]["item_name"] == "원예"
+    assert by_code["OVR0000000093"]["prt_ovr_item_code"] is None
+    assert by_code["OVR0000000093"]["level"] == 1
+    # 앞자리 0 이 있는 문자열 코드 유지 ('08', '05')
+    assert by_code["OVR0000000008"]["krei_item_code"] == "08"
+    assert by_code["OVR0000000005"]["krei_item_code"] == "05"
+    assert by_code["OVR0000000026"]["prt_krei_item_code"] == "08"
+    # 문서와 다른 실제 API 값 확인: 수입과일 OVR0000000019, 해외축산 OVR0000000094
+    assert by_code["OVR0000000019"]["item_name"] == "수입과일"
+    assert by_code["OVR0000000094"]["item_name"] == "해외축산"
+
+
+def test_parse_monthly_fixture_12_items_and_layers_two_distinct_rows():
+    reports, problems = parse_reports(MONTHLY_11_XML, "monthly")
+    assert problems == []
+    assert len(reports) == 12
+    # 산란계(OVR0000000018) 2건: 순보(8776)와 월보(8784)가 각각 다른 file_id 행이 된다
+    layers = [r for r in reports if r["ovr_item_code"] == "OVR0000000018"]
+    assert len(layers) == 2
+    by_type = {r["report_type"]: r for r in layers}
+    assert set(by_type) == {"순보", "월보"}
+    assert by_type["순보"]["file_id"] == 8776
+    assert by_type["월보"]["file_id"] == 8784
+    # 해외축산 분기보도 포함
+    overseas = next(r for r in reports if r["ovr_item_code"] == "OVR0000000094")
+    assert overseas["report_type"] == "분기보" and overseas["file_id"] == 8785
+    # reg_date 가 KST timestamptz 로 해석됨
+    fruit = next(r for r in reports if r["file_id"] == 8778)
+    assert fruit["item_name"] == "과일" and fruit["reg_at"] == "2026-11-03T15:10:04+09:00"
+    assert fruit["mod_at"] is None
+
+
+def test_parse_news_fixture_empty_is_not_an_error():
+    reports, problems = parse_reports(NEWS_11_XML, "news")
+    assert reports == [] and problems == []
+
+
+# ── 2. 파일번호 추출 및 부분 실패 처리 ───────────────────────────────────────
+def test_extract_file_id_valid_and_invalid():
+    url = "https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/download/8778/ORGTEXT_FILE"
+    assert extract_file_id(url) == 8778
+    assert extract_file_id("/main/uObserveMonth/OVR0000000031/download/8779/ORGTEXT_FILE") == 8779
+    assert extract_file_id("https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/view") is None
+    assert extract_file_id("") is None
+    assert extract_file_id(None) is None
+
+
+def test_parse_reports_skips_only_malformed_pdf_link_without_aborting():
+    xml = b"""<?xml version="1.0" encoding="UTF-8"?><channel>
+      <item>
+        <yyyy>2026</yyyy><mm>11</mm>
+        <ovr_item_code>OVR0000000013</ovr_item_code><item_name>\xea\xb3\xbc\xc0\xbc</item_name>
+        <title>\xec\x9b\x94\xeb\xb3\xb4</title>
+        <pdf_link>https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/download/8778/ORGTEXT_FILE</pdf_link>
+        <reg_date>20261103151004</reg_date><mod_date></mod_date>
+      </item>
+      <item>
+        <yyyy>2026</yyyy><mm>11</mm>
+        <ovr_item_code>OVR0000000031</ovr_item_code><item_name>\xea\xb3\xbc\xec\xb1\x84</item_name>
+        <title>\xec\x9b\x94\xeb\xb3\xb4</title>
+        <pdf_link>https://aglook.krei.re.kr/broken_link_without_id</pdf_link>
+        <reg_date>20261103155915</reg_date><mod_date></mod_date>
+      </item>
+    </channel>"""
+    # UTF-8 문자열로 안전하게 생성
+    xml_utf8 = """<?xml version="1.0" encoding="UTF-8"?><channel>
+      <item>
+        <yyyy>2026</yyyy><mm>11</mm>
+        <ovr_item_code>OVR0000000013</ovr_item_code><item_name>과일</item_name>
+        <title>월보</title>
+        <pdf_link>https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/download/8778/ORGTEXT_FILE</pdf_link>
+        <reg_date>20261103151004</reg_date><mod_date></mod_date>
+      </item>
+      <item>
+        <yyyy>2026</yyyy><mm>11</mm>
+        <ovr_item_code>OVR0000000031</ovr_item_code><item_name>과채</item_name>
+        <title>월보</title>
+        <pdf_link>https://aglook.krei.re.kr/broken_link_without_id</pdf_link>
+        <reg_date>20261103155915</reg_date><mod_date></mod_date>
+      </item>
+    </channel>""".encode()
+    del xml
+    reports, problems = parse_reports(xml_utf8, "monthly")
+    assert len(reports) == 1 and reports[0]["file_id"] == 8778
+    assert len(problems) == 1 and "broken_link_without_id" in problems[0]
+
+
+# ── 3. 다음 달 및 범위 계산 ────────────────────────────────────────────────
+def test_next_month_and_range_calculation():
+    assert next_year_month(2026, 11) == (2026, 12)
+    assert next_year_month(2026, 12) == (2027, 1)
+    assert default_months(dt.date(2026, 12, 15)) == [(2026, 12), (2027, 1)]
+    assert months_between("2026-10", "2027-02") == [
+        (2026, 10),
+        (2026, 11),
+        (2026, 12),
+        (2027, 1),
+        (2027, 2),
+    ]
+
+
+# ── 4. 품목(item) 동기화: 빠진 코드는 is_listed=false, 삭제하지 않음 ─────────
+def test_sync_items_marks_missing_codes_unlisted_without_deleting():
+    fetched = parse_report_items(REPORT_ITEM_XML)
+    existing = [
+        dict(
+            ovr_item_code="OVR0000000999",
+            prt_ovr_item_code="OVR0000000093",
+            krei_item_code="99",
+            prt_krei_item_code="0",
+            item_name="쪽파(구코드)",
+            prt_item_name="원예",
+            level=3,
+            order_num=99,
+            img_link=None,
+            is_listed=True,
+            updated_at="2026-10-01T00:00:00+09:00",
+        )
+    ]
+    merged = sync_items(fetched, existing, "2026-11-07T20:40:00+09:00")
+    assert len(merged) == 44
+    by_code = {r["ovr_item_code"]: r for r in merged}
+    assert by_code["OVR0000000999"]["is_listed"] is False
+    assert by_code["OVR0000000999"]["item_name"] == "쪽파(구코드)"
+    assert by_code["OVR0000000005"]["is_listed"] is True
+    assert check_rows("krei.item", merged) == []
+
+
+# ── 5. 글자 좌표(pages.json.gz) 및 1쪽 통권·발행일 추출 ──────────────────────
+def test_extract_pdf_bytes_and_first_page_meta():
+    pdf_bytes = make_test_pdf(["통권", "제312호", "2026년", "11월", "3일", "발행", "과일"])
+    ext = extract_pdf_bytes(pdf_bytes)
+    assert ext["pdf_bytes"] == len(pdf_bytes)
+    assert len(ext["pdf_sha256"]) == 64
+    assert ext["pages"] == 1
+    assert ext["issue_no"] == 312
+    assert ext["pub_date"] == "2026-11-03"
+
+    # gzip 압축을 풀었을 때 pages.json.gz 구조 확인: [{"w", "h", "words": [[x0, top, x1, bottom, text], ...]}]
+    decompressed = json.loads(gzip.decompress(ext["gz_bytes"]).decode("utf-8"))
+    assert isinstance(decompressed, list) and len(decompressed) == 1
+    page0 = decompressed[0]
+    assert set(page0.keys()) == {"w", "h", "words"}
+    assert page0["w"] == 595.3 and page0["h"] == 841.9
+    assert len(page0["words"]) >= 1
+    w0 = page0["words"][0]
+    assert len(w0) == 5
+    assert all(isinstance(v, float) for v in w0[:4]) and isinstance(w0[4], str)
+
+
+def test_extract_first_page_meta_returns_none_when_absent():
+    pdf_bytes = make_test_pdf(["딸기", "관측속보", "생육", "동향"])
+    ext = extract_pdf_bytes(pdf_bytes)
+    assert ext["issue_no"] is None and ext["pub_date"] is None
+    assert extract_first_page_meta("아무 내용 없음") == (None, None)
+
+
+def test_build_pages_payload_rounds_to_1_decimal():
+    pages = build_pages_payload(
+        [
+            {
+                "w": 595.27559,
+                "h": 841.88976,
+                "words": [{"x0": 72.14, "top": 100.56, "x1": 120.89, "bottom": 112.54, "text": "사과"}],
+            }
+        ]
+    )
+    assert pages == [{"w": 595.3, "h": 841.9, "words": [[72.1, 100.6, 120.9, 112.5, "사과"]]}]
+    raw = json.loads(gzip.decompress(compress_pages_json(pages)))
+    assert raw == pages
+
+
+# ── 6. 재실행(멱등) 및 mod_date 변경 감지 ────────────────────────────────────
+def test_rerun_skips_already_fetched_and_refetches_only_when_mod_date_changes():
+    clock = FakeClock("2026-11-07 20:40:00")
+    http1 = FakeKreiHttp()
+    r1 = K.run(months=[(2026, 11)], http=http1, clock=clock)
+    assert not r1.failed
+    assert len(r1.fetched) == 12 and r1.skipped_count == 0
+    assert K.check(r1) == []
+
+    # 2차 실행: 같은 목록으로 다시 돌리면 PDF 다운로드 건수 0개 (모두 skipped)
+    prev_reports = {row["file_id"]: row for row in r1.reports}
+    http2 = FakeKreiHttp()
+    r2 = K.run(
+        months=[(2026, 11)],
+        existing_items=r1.items,
+        existing_reports=prev_reports,
+        http=http2,
+        clock=clock,
+    )
+    assert len(r2.fetched) == 0 and r2.skipped_count == 12
+    pdf_calls_2 = [u for u, _, _ in http2.calls if "/download/" in u]
+    assert pdf_calls_2 == []
+
+    # 3차 실행: 8778(과일) 한 건만 mod_date 가 새로 채워지면 그 1건만 다시 받는다
+    modified_xml = MONTHLY_11_XML.decode("utf-8").replace(
+        "<reg_date>20261103151004</reg_date>\t\t<mod_date></mod_date>",
+        "<reg_date>20261103151004</reg_date>\t\t<mod_date>20261105100000</mod_date>",
+        1,
+    )
+    http3 = FakeKreiHttp()
+    http3.monthly_xml["2026-11"] = modified_xml.encode("utf-8")
+    r3 = K.run(
+        months=[(2026, 11)],
+        existing_items=r2.items,
+        existing_reports={row["file_id"]: row for row in r2.reports},
+        http=http3,
+        clock=clock,
+    )
+    assert [f["file_id"] for f in r3.fetched] == [8778]
+    assert r3.skipped_count == 11
+    fruit_row = next(row for row in r3.reports if row["file_id"] == 8778)
+    assert fruit_row["mod_at"] == parse_kst_timestamp("20261105100000")
+
+
+def test_needs_refetch_handles_utc_returned_by_supabase():
+    existing = {"file_id": 8778, "fetch_status": "fetched", "mod_at": "2026-11-05T01:00:00+00:00"}
+    same_in_kst = {"file_id": 8778, "mod_at": "2026-11-05T10:00:00+09:00"}
+    changed_in_kst = {"file_id": 8778, "mod_at": "2026-11-05T11:00:00+09:00"}
+    assert needs_refetch(same_in_kst, existing) is False
+    assert needs_refetch(changed_in_kst, existing) is True
+
+
+# ── 7. 요청 예절(1초 쉼·User-Agent·타임아웃·5초 뒤 1회 재시도) 및 DB/Storage 쓰기 ─
+def test_politeness_retry_and_publish():
+    fail_url = "https://aglook.krei.re.kr/main/api/reportItem"
+    clock = FakeClock("2026-11-07 20:40:00")
+    http = FakeKreiHttp(fail_once_urls={fail_url})
+    r = K.run(months=[(2026, 11)], http=http, clock=clock)
+    assert not r.failed
+    # 첫 요청 실패 뒤 5초 대기 재시도 + 이후 요청마다 1초 대기
+    assert 5.0 in clock.sleeps and 1.0 in clock.sleeps
+    for url, timeout, headers in http.calls:
+        assert headers["User-Agent"] == USER_AGENT
+        assert timeout == (120 if "/download/" in url else 60)
+
+    # 가짜 Supabase 에 publish: Content-Profile: krei 와 Storage krei-raw 경로 확인
+    requests_log: list[tuple[str, str, dict, bytes]] = []
+
+    def fake_sb(method, url, headers, body):
+        requests_log.append((method, url, headers, body))
+        return 201, b""
+
+    writer = SupabaseWriter("https://x.supabase.co", "srv", http=fake_sb)
+    K.publish(r, writer)
+    assert r.uploaded and not r.failed
+
+    storage_paths = [
+        urllib.parse.urlparse(u).path.removeprefix("/storage/v1/object/")
+        for _, u, _, _ in requests_log
+        if "/storage/v1/object/" in u
+    ]
+    assert "krei-raw/list/monthly/2026-11.xml" in storage_paths
+    assert "krei-raw/list/news/2026-11.xml" in storage_paths
+    assert "krei-raw/text/OVR0000000013/2026/11/8778.pages.json.gz" in storage_paths
+
+    rest_calls = [(u, h) for _, u, h, _ in requests_log if "/rest/v1/" in u]
+    assert len(rest_calls) == 2
+    assert rest_calls[0][0].endswith("/rest/v1/item?on_conflict=ovr_item_code")
+    assert rest_calls[0][1]["Content-Profile"] == "krei"
+    assert rest_calls[1][0].endswith("/rest/v1/report?on_conflict=file_id")
+    assert rest_calls[1][1]["Content-Profile"] == "krei"
+
+
+# ── 8. 감시 규칙 (core/monitor.py & collectors/monitor.py) ───────────────────
+def _ok_run(now_str: str) -> list[dict]:
+    t = TS(now_str) - pd.Timedelta(hours=1)
+    return [
+        dict(
+            run_at=t.tz_localize("Asia/Seoul").isoformat(),
+            run_name="저녁",
+            stn_id="101",
+            started_at=None,
+            finished_at=(t + pd.Timedelta(minutes=15)).tz_localize("Asia/Seoul").isoformat(),
+            result="정시 성공",
+            on_time=True,
+            error=None,
+        )
+    ]
+
+
+def _hort_reports(codes: list[str], yyyy: int = 2026, mm: int = 11) -> list[dict]:
+    names = {
+        "OVR0000000013": "과일",
+        "OVR0000000031": "과채",
+        "OVR0000000008": "엽근채소",
+        "OVR0000000036": "양념채소",
+    }
+    return [
+        dict(
+            file_id=8700 + i,
+            yyyy=yyyy,
+            mm=mm,
+            ovr_item_code=c,
+            item_name=names.get(c, c),
+            report_type="월보",
+            fetch_status="fetched",
+            fetch_error=None,
+        )
+        for i, c in enumerate(codes)
+    ]
+
+
+def test_monitor_krei_9th_missing_hort_warns_7th_does_not_and_grain_ignored():
+    # 과일·과채만 있고 엽근채소·양념채소가 없는 상태
+    partial = _hort_reports(["OVR0000000013", "OVR0000000031"])
+
+    # 7일이면 아직 마감(8일 23:59) 전이라 경고 없음
+    now_7th = TS("2026-11-07 21:00")
+    alerts_7 = check_health(now_7th, _ok_run("2026-11-07 21:00"), {}, {"101": "춘천"}, krei_reports=partial)
+    assert [a for a in alerts_7 if a.code == "krei"] == []
+
+    # 8일 23:59 도 아직 마감 안이라 경고 없음
+    now_8th = TS("2026-11-08 23:59")
+    alerts_8 = check_health(now_8th, _ok_run("2026-11-08 23:59"), {}, {"101": "춘천"}, krei_reports=partial)
+    assert [a for a in alerts_8 if a.code == "krei"] == []
+
+    # 9일인데 엽근채소·양념채소 월보가 없으면 경고
+    now_9th = TS("2026-11-09 09:40")
+    alerts_9 = check_health(now_9th, _ok_run("2026-11-09 09:40"), {}, {"101": "춘천"}, krei_reports=partial)
+    krei_alerts = [a for a in alerts_9 if a.code == "krei"]
+    assert len(krei_alerts) == 1
+    assert krei_alerts[0].level == "warn"
+    assert krei_alerts[0].text == "KREI 11월 월보 미수집 — 엽근채소, 양념채소"
+    assert "🟡 경고: KREI 11월 월보 미수집 — 엽근채소, 양념채소" in report(alerts_9, now_9th)
+
+    # 원예 4부류가 모두 fetched 이면 곡물(쌀·콩 등)이나 축산이 없어도 경고 없음
+    all_hort = _hort_reports(["OVR0000000013", "OVR0000000031", "OVR0000000008", "OVR0000000036"])
+    alerts_ok = check_health(now_9th, _ok_run("2026-11-09 09:40"), {}, {"101": "춘천"}, krei_reports=all_hort)
+    assert [a for a in alerts_ok if a.code == "krei"] == []
+
+
+def test_monitor_krei_failed_report_warns_immediately_even_before_9th():
+    now_5th = TS("2026-11-05 10:00")
+    failed_rows = [
+        dict(
+            file_id=8780,
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000036",
+            item_name="양념채소",
+            report_type="월보",
+            fetch_status="failed",
+            fetch_error="PDF 다운로드 실패: HTTP 500\n상세 스택...",
+        )
+    ]
+    alerts = check_health(now_5th, _ok_run("2026-11-05 10:00"), {}, {"101": "춘천"}, krei_reports=failed_rows)
+    assert len(alerts) == 1
+    assert alerts[0].level == "warn" and alerts[0].code == "krei"
+    assert alerts[0].text == "KREI 수집 실패 (양념채소 #8780) — PDF 다운로드 실패: HTTP 500"
+
+
+def test_monitor_read_krei_reports_sends_accept_profile_krei():
+    seen: list[tuple[str, dict]] = []
+
+    def fake_get(url: str, headers: dict) -> tuple[int, bytes]:
+        seen.append((url, headers))
+        return 200, b"[]"
+
+    rows = M.read_krei_reports("https://x.supabase.co", "srv", http=fake_get, now=TS("2026-11-09 10:00"))
+    assert rows == []
+    assert len(seen) == 1
+    url, headers = seen[0]
+    assert "/rest/v1/report?" in url
+    assert "yyyy.eq.2026,mm.eq.11" in url and "fetch_status.eq.failed" in url
+    assert headers["Accept-Profile"] == "krei"
+
+
+# ── 9. 마이그레이션 SQL 구조 검증 ────────────────────────────────────────────
+def test_krei_migration_sql_contains_schemas_rls_view_and_bucket():
+    sql_path = Path(__file__).parent.parent / "supabase" / "migrations" / "20261108000000_krei_schema.sql"
+    sql = sql_path.read_text(encoding="utf-8").lower()
+    assert "create schema if not exists krei;" in sql
+    assert "create table if not exists krei.item" in sql
+    assert "create table if not exists krei.report" in sql
+    assert "alter table krei.item enable row level security;" in sql
+    assert "alter table krei.report enable row level security;" in sql
+    assert "grant select on krei.item to anon, authenticated;" in sql
+    assert "grant select on krei.report to anon, authenticated;" in sql
+    assert "create schema if not exists krei_api;" in sql
+    assert "create or replace view krei_api.reports" in sql
+    assert "security_invoker = true" in sql
+    assert "where r.fetch_status = 'fetched'" in sql
+    assert "values ('krei-raw', 'krei-raw', false)" in sql
+    assert set(SPECS["krei.item"].columns) <= {
+        "ovr_item_code",
+        "prt_ovr_item_code",
+        "krei_item_code",
+        "prt_krei_item_code",
+        "item_name",
+        "prt_item_name",
+        "level",
+        "order_num",
+        "img_link",
+        "is_listed",
+        "updated_at",
+    }
+
+
+def test_resolve_months_cli_validation():
+    clock = FakeClock("2026-12-05 20:40:00")
+    assert K.resolve_months(clock) == [(2026, 12), (2027, 1)]
+    assert K.resolve_months(clock, yyyy="2026", mm="11") == [(2026, 11)]
+    assert K.resolve_months(clock, from_ym="2026-01", to_ym="2026-03") == [
+        (2026, 1),
+        (2026, 2),
+        (2026, 3),
+    ]
+    with pytest.raises(ValueError, match="함께 지정"):
+        K.resolve_months(clock, yyyy="2026")

@@ -1,0 +1,87 @@
+name: krei
+
+# KREI 농업관측 수집기 (1단계): 매일 1회 20:40 KST.
+# - 품목분류(reportItem)와 이번 달·다음 달 월보(montlyReport)·속보(newsReport) 목록을 조회하고,
+#   새로 나온 발행물(또는 mod_date가 바뀐 건)의 PDF에서 글자 좌표(pages.json.gz)를 뽑아
+#   Storage(krei-raw)와 DB(krei.item, krei.report)에 올린다.
+# - 원예 월보가 13~18시에 등록되므로 당일 저녁(20:40 KST)에 잡히며, 기존 수집 회차(물 02·17시, 적산온도 09:20)와 겹치지 않는다.
+# - 사람이 Actions 화면에서 from·to(YYYY-MM) 범위를 넣어 소급하거나, write=false 로 저장 없이 확인할 수 있다.
+
+on:
+  schedule:
+    - cron: "40 11 * * *" # 매일 20:40 KST
+  workflow_dispatch:
+    inputs:
+      from:
+        description: "조회 시작 연-월 (예: 2026-01, 비우면 이번 달·다음 달)"
+        required: false
+        default: ""
+      to:
+        description: "조회 끝 연-월 (예: 2026-12, 비우면 이번 달·다음 달)"
+        required: false
+        default: ""
+      write:
+        description: "계약 검사를 통과하면 Supabase DB·Storage에 쓰기"
+        type: boolean
+        default: false
+
+concurrency:
+  group: krei
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  krei:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: KREI 목록·글자 좌표 수집 (실패하면 5분 뒤 한 번 더)
+        env:
+          FROM_YM: ${{ inputs.from }}
+          TO_YM: ${{ inputs.to }}
+          # 예약 실행은 항상 쓰고, 사람이 누를 때는 write 입력을 따른다
+          WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+        run: |
+          args=(--out out)
+          if [ -n "$FROM_YM" ]; then args+=(--from "$FROM_YM"); fi
+          if [ -n "$TO_YM" ]; then args+=(--to "$TO_YM"); fi
+          if [ "$WRITE" = "true" ]; then args+=(--write); fi
+          set +e
+          for attempt in 1 2; do
+            python -m croplib_dp.collectors.krei "${args[@]}" 2> err.txt
+            code=$?
+            cat err.txt >&2
+            [ $code = 0 ] && break
+            [ $attempt = 1 ] && { echo "실패, 5분 뒤 다시"; sleep 300; }
+          done
+          exit $code
+      - name: 요약을 실행 화면과 알림(annotation)에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -s err.txt ]; then echo "::error title=KREI 수집기 오류::$(tail -n 40 err.txt | esc)"; fi
+          for f in out/*/brief.md; do
+            [ -f "$f" ] || continue
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=KREI 농업관측 수집 요약::$(cat "$f" | esc)"
+          done
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: krei
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
