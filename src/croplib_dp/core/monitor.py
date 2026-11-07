@@ -11,6 +11,8 @@ warn (경고) — 서비스는 되지만 기록해 둘 것
   - asos    : 오후 회차(17시 발표 + 1시간) 뒤에도 어제 ASOS 관측이 DB에 없음 (수집 지점 has_forecast 만)
   - heat    : 낮 12시 뒤에도 적산온도(heat_daily)에 어제 값이 없음 (하루 한 번 09:20 수집, 온1).
               대상은 운영 지점(is_active) 전부 — 물 수집 지점보다 넓다 (결정 0017)
+  - krei    : 매달 8일 23:59 KST 뒤(9일 00:00~)에도 원예 4부류(과일·과채·엽근채소·양념채소)의 이번 달 월보가
+              fetched 가 아니거나, fetch_status = 'failed' 인 건이 있음 (결정 0019)
 빠진 지점이 많으면(MAX_NAMED 곳 넘음) "N곳 — 앞 10곳 …" 으로 줄인다 (이슈·메일 가독성).
 """
 
@@ -21,19 +23,22 @@ from typing import Any
 
 import pandas as pd
 
+from croplib_dp.core.krei import HORT_MONTH_ITEMS
+
 # 이보다 오래 갱신이 없으면 멈춤. 정상 최대 간격 약 16시간(02시 회차 → 17시 회차 마감 18:30) + 여유.
 # CropMon src/domain/freshness.ts STALE_AFTER_MS 와 같은 값이어야 함
 STALE_H = 17
 ASOS_CHECK_AFTER_H = 18  # 이 시각(KST) 뒤에는 어제 관측이 있어야 함 (17:20 회차 + 여유)
 BACKUP_RESULTS = ("지연 수집", "백업: 직전 발표", "백업: S3")
 HEAT_CHECK_AFTER_H = 12  # 적산온도는 09:20 에 한 번 수집 (재시도·늦은 시작 여유)
+KREI_CHECK_AFTER_DAY = 8  # 매달 8일 23:59 KST까지 여유, 9일(now.day > 8)부터 이번 달 원예 4부류 월보 확인
 MAX_NAMED = 10  # 경고 문구에 이름을 다 적는 지점 수의 한도
 
 
 @dataclass(frozen=True)
 class Alert:
     level: str  # "error" | "warn"
-    code: str  # stale | failed | late | asos
+    code: str  # stale | failed | late | asos | heat | krei
     text: str
 
     @property
@@ -58,6 +63,44 @@ def named(missing: list[str], names: Mapping[str, str]) -> str:
     return f"{len(missing)}곳 — 앞 {MAX_NAMED}곳 {ns} …"
 
 
+def _check_krei(now: pd.Timestamp, krei_reports: Iterable[Mapping[str, Any]]) -> list[Alert]:
+    rows = list(krei_reports)
+    out: list[Alert] = []
+    if now.day > KREI_CHECK_AFTER_DAY:
+        fetched_hort = {
+            str(r.get("ovr_item_code"))
+            for r in rows
+            if int(r.get("yyyy") or 0) == now.year
+            and int(r.get("mm") or 0) == now.month
+            and r.get("report_type") == "월보"
+            and r.get("fetch_status") == "fetched"
+        }
+        missing_hort = [name for code, name in HORT_MONTH_ITEMS.items() if code not in fetched_hort]
+        if missing_hort:
+            out.append(
+                Alert(
+                    "warn",
+                    "krei",
+                    f"KREI {now.month}월 월보 미수집 — {', '.join(missing_hort)}",
+                )
+            )
+    failed = sorted(
+        (r for r in rows if r.get("fetch_status") == "failed"),
+        key=lambda r: int(r.get("file_id") or 0),
+    )
+    for r in failed:
+        item_name = (
+            r.get("item_name")
+            or HORT_MONTH_ITEMS.get(str(r.get("ovr_item_code")), "")
+            or str(r.get("ovr_item_code") or "미상")
+        )
+        fid = r.get("file_id")
+        raw_err = str(r.get("fetch_error") or "이유 없음").strip()
+        first_line = (raw_err.splitlines() or ["이유 없음"])[0]
+        out.append(Alert("warn", "krei", f"KREI 수집 실패 ({item_name} #{fid}) — {first_line}"))
+    return out
+
+
 def check_health(
     now: pd.Timestamp,
     runs: Iterable[Mapping[str, Any]],
@@ -65,11 +108,13 @@ def check_health(
     station_names: Mapping[str, str] | None = None,
     heat_last: Mapping[str, dt.date | None] | None = None,
     collect_count: int | None = None,
+    krei_reports: Iterable[Mapping[str, Any]] | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
     heat_last: 적산온도 대상 지점(is_active)별 날짜 (어제 값이 있으면 그 날짜, 없으면 None).
-    collect_count: 수집 지점 수. 0 이면 오류 (넘기지 않으면 보지 않는다 — 알림 연습 등)."""
+    collect_count: 수집 지점 수. 0 이면 오류 (넘기지 않으면 보지 않는다 — 알림 연습 등).
+    krei_reports: krei.report 행 목록 (이번 달 행 + failed 행). 넘기지 않으면 보지 않는다."""
     names = station_names or {}
     now = pd.Timestamp(now)
     alerts: list[Alert] = []
@@ -119,6 +164,8 @@ def check_health(
             alerts.append(
                 Alert("warn", "heat", f"어제({yesterday:%m/%d}) 적산온도 없음 — {named(missing, names)}")
             )
+    if krei_reports is not None:
+        alerts.extend(_check_krei(now, krei_reports))
     return alerts
 
 

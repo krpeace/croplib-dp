@@ -21,10 +21,20 @@ from croplib_dp.io.github_issue import IssueAlerts, Request, http_request
 DRILL_TITLE = "[수집 경고] 알림 연습 (실제 문제 아님)"
 DRILL_LABEL = "수집 경고 연습"
 RUN_COLS = "run_at,run_name,stn_id,started_at,finished_at,result,on_time,error"
+KREI_COLS = "file_id,yyyy,mm,ovr_item_code,item_name,report_type,fetch_status,fetch_error"
 
 
-def read_state(base: str, key: str, http: RestGet = rest_get, now=None) -> dict[str, Any]:
-    """최근 서버 회차 기록, 지점 이름, 관측 마지막 날, 적산온도 어제 값 유무.
+def read_krei_reports(base: str, key: str, http: RestGet = rest_get, now=None) -> list[dict]:
+    """이번 달 KREI 발행물 목록과 실패 건(fetch_status = 'failed')을 한 번에 읽는다."""
+    now = pd.Timestamp(now) if now is not None else kst_now()
+    query = f"select={KREI_COLS}&or=(and(yyyy.eq.{now.year},mm.eq.{now.month}),fetch_status.eq.failed)"
+    return read_table(base, key, "report", http, query, schema="krei")
+
+
+def read_state(
+    base: str, key: str, http: RestGet = rest_get, now=None, include_krei: bool = False
+) -> dict[str, Any]:
+    """최근 서버 회차 기록, 지점 이름, 관측 마지막 날, 적산온도 어제 값 유무(, 선택 시 KREI 발행물 상태).
     - 관측(weather_daily)은 수집하는 지점(has_forecast)만 지점마다 본다.
     - 적산온도(heat_daily)는 운영 지점(is_active) 전부를 보되, 지점마다 묻지 않고 한 번에 묻는다
       (어제·작물 공통 값이 있는 지점 목록 → 운영 지점과 비교). 지점이 늘어도 매시간 호출 수가 늘지 않는다."""
@@ -63,12 +73,15 @@ def read_state(base: str, key: str, http: RestGet = rest_get, now=None) -> dict[
     }
     # check_health 가 날짜로 비교하므로, 어제 값이 있는 지점은 어제 날짜, 없으면 None
     heat = {str(s["stn_id"]): (yesterday if str(s["stn_id"]) in have else None) for s in active}
-    return dict(
+    out: dict[str, Any] = dict(
         runs=runs,
         names={str(s["stn_id"]): s["name_ko"] for s in [*active, *collected]},
         weather_last=last,
         heat_last=heat,
     )
+    if include_krei:
+        out["krei_reports"] = read_krei_reports(base, key, http, now=now)
+    return out
 
 
 def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None) -> tuple[str, str]:
@@ -80,6 +93,7 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         state["names"],
         state.get("heat_last"),
         collect_count=len(state["weather_last"]),
+        krei_reports=state.get("krei_reports"),
     )
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"
@@ -126,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"이슈: {action}")
         return 0
     now = kst_now()
-    state = read_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), now=now)
+    state = read_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), now=now, include_krei=True)
     sink = IssueAlerts(_env("GITHUB_REPOSITORY"), _env("GITHUB_TOKEN"))
     text, action = run_monitor(state, sink, now=now)
     print(text)
