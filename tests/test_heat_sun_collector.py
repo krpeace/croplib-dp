@@ -343,7 +343,10 @@ def test_new_year_brief_keeps_station_lines_and_adds_one_new_year_line():
     r, _ = _new_year()
     text = H.brief_text(r)
     assert text.startswith("# 적산온도·적산일사 2026 (평년 2016–2025")
-    assert len([ln for ln in text.splitlines() if ln.startswith("- ")]) == 2  # 101, 216
+    station_lines = [ln for ln in text.splitlines() if ln.startswith("- ")]
+    weekday, _ = _new_year("2027-01-04 09:20")
+    weekday_lines = [ln for ln in H.brief_text(weekday).splitlines() if ln.startswith("- ")]
+    assert len(station_lines) == len(weekday_lines) == 2  # 지점 줄 수는 평일과 같다 (101, 216)
     assert "새해 2027: 평년선만 생성 (heat 2190줄 · sun 365줄)" in text
     r2, _ = _new_year("2027-01-02 09:20")
     assert "새해 2027: 관측 ~01-01까지 (heat 2190줄 · sun 365줄)" in H.brief_text(r2)
