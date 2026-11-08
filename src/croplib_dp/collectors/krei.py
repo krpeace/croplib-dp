@@ -88,6 +88,8 @@ class KreiResult:
     uploaded: bool = False
     issue_action: str | None = None
     _persisted_incrementally: bool = False
+    new_file_ids: set[int] = field(default_factory=set)
+    _has_known_existing: bool = False
     parsed: list[dict[str, Any]] = field(default_factory=list)
     needs_review: list[dict[str, Any]] = field(default_factory=list)
     table_counts_by_type: dict[str, int] = field(default_factory=dict)
@@ -112,17 +114,23 @@ def read_existing(
     return items, by_id
 
 
-def read_storage_bytes(base_url: str, key: str, bucket: str, path: str, http: RestGet = rest_get) -> bytes:
+def read_storage_bytes(base_url: str, key: str, bucket: str, path: str, http: Any = rest_get) -> bytes:
     """Supabase Storage 에서 객체 바이트를 읽는다."""
     url = f"{base_url.rstrip('/')}/storage/v1/object/{bucket}/{path.lstrip('/')}"
     headers = {"apikey": key, "Authorization": f"Bearer {key}"}
-    status, body = http(url, headers)
+    res = http(url, headers)
+    if isinstance(res, tuple) and len(res) == 3:
+        status, body, _ = res
+    elif isinstance(res, tuple) and len(res) == 2:
+        status, body = res
+    else:
+        raise ValueError(f"예상치 못한 http 반환값: {res!r}")
     if status != 200:
         text = (
             body.decode("utf-8", "replace")[:200] if isinstance(body, bytes | bytearray) else str(body)[:200]
         )
         raise RuntimeError(f"Storage {bucket}/{path} 읽기 실패: HTTP {status} {text}")
-    return body
+    return bytes(body)
 
 
 def resolve_months(
@@ -215,8 +223,12 @@ def _persist_one_report(
     writer: Any,
     rep: dict[str, Any],
     gz_bytes: bytes | None = None,
+    *,
+    is_new: bool = True,
 ) -> None:
-    """PDF 1건 처리 직후 글자 좌표 업로드와 krei.report 1행 upsert를 바로 끝낸다."""
+    """PDF 1건 처리 직후 글자 좌표 업로드와 krei.report 1행 upsert를 바로 끝낸다.
+    새 행(is_new=True)일 때만 parse_status·parser_version·parsed_at을 포함하고,
+    기존 행 수정(수집 재실행·backfill)일 때는 세 열을 빼서 파싱 결과를 덮어쓰지 않는다."""
     probs = check_rows("krei.report", [rep])
     if probs:
         r.problems += probs
@@ -244,7 +256,12 @@ def _persist_one_report(
             )
             r.fetched = [f for f in r.fetched if f.get("file_id") != rep["file_id"]]
     try:
-        writer.upsert("report", [rep], on_conflict=REPORT_KEY, schema=KREI_SCHEMA)
+        row_to_save = dict(rep)
+        if not is_new:
+            row_to_save.pop("parse_status", None)
+            row_to_save.pop("parser_version", None)
+            row_to_save.pop("parsed_at", None)
+        writer.upsert("report", [row_to_save], on_conflict=REPORT_KEY, schema=KREI_SCHEMA)
         r.uploaded = True
     except Exception as e:
         r.problems.append(f"#{rep['file_id']} DB 올리기 실패: {type(e).__name__}: {str(e)[:200]}")
@@ -464,6 +481,7 @@ def run(
     out_dir: Path | None = None,
     base_url: str | None = None,
     key: str | None = None,
+    storage_http: RestGet = rest_get,
 ) -> KreiResult:
     """KREI 목록·원문 수집 1회 실행.
     - `write=False`(시험 실행)이면 목록은 모두 조회하되 PDF 는 최대 1건(표본)만 받는다.
@@ -479,6 +497,7 @@ def run(
     target_months = months if months is not None else default_months(started_at.date())
     existing_by_id = dict(existing_reports or {})
     r = KreiResult(months=list(target_months))
+    r._has_known_existing = True
     client = KreiClient(http=http, clock=clock, log=r.log)
     now_iso = _iso(started_at) or ""
 
@@ -518,6 +537,7 @@ def run(
                 listed_by_id[int(row["file_id"])] = row
 
     r.listed_count = len(listed_by_id)
+    r.new_file_ids = {int(fid) for fid in listed_by_id if int(fid) not in existing_by_id}
     _ensure_report_items_exist(r.items, listed_by_id.values(), now_iso)
 
     if writer is not None:
@@ -586,6 +606,7 @@ def run(
 
         prev = existing_by_id.get(file_id)
         first_seen = (prev.get("first_seen_at") if prev else None) or now_iso
+        is_new = file_id not in existing_by_id
         ok_pdf, pdf_bytes, pdf_err = client.fetch_pdf(item["pdf_link"], file_id)
         updated_at = _iso(clock.now()) or now_iso
         if not ok_pdf:
@@ -624,14 +645,14 @@ def run(
                 text_status=None,
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
-                parse_status="pending",
-                parser_version=None,
-                parsed_at=None,
+                parse_status=(prev.get("parse_status") if prev else None) or "pending",
+                parser_version=prev.get("parser_version") if prev else None,
+                parsed_at=prev.get("parsed_at") if prev else None,
                 updated_at=updated_at,
             )
             r.reports.append(rep_row)
             if writer is not None:
-                _persist_one_report(r, writer, rep_row)
+                _persist_one_report(r, writer, rep_row, is_new=is_new)
             if out_dir is not None:
                 write_outputs(r, out_dir)
             continue
@@ -674,14 +695,14 @@ def run(
                 text_status=None,
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
-                parse_status="pending",
-                parser_version=None,
-                parsed_at=None,
+                parse_status=(prev.get("parse_status") if prev else None) or "pending",
+                parser_version=prev.get("parser_version") if prev else None,
+                parsed_at=prev.get("parsed_at") if prev else None,
                 updated_at=updated_at,
             )
             r.reports.append(rep_row)
             if writer is not None:
-                _persist_one_report(r, writer, rep_row)
+                _persist_one_report(r, writer, rep_row, is_new=is_new)
             if out_dir is not None:
                 write_outputs(r, out_dir)
             continue
@@ -738,14 +759,14 @@ def run(
             text_status=text_status,
             fetch_status="fetched",
             fetch_error=None,
-            parse_status="pending",
-            parser_version=None,
-            parsed_at=None,
+            parse_status=(prev.get("parse_status") if prev else None) or "pending",
+            parser_version=prev.get("parser_version") if prev else None,
+            parsed_at=prev.get("parsed_at") if prev else None,
             updated_at=updated_at,
         )
         r.reports.append(rep_row)
         if writer is not None:
-            _persist_one_report(r, writer, rep_row, gz_bytes=gz_bytes)
+            _persist_one_report(r, writer, rep_row, gz_bytes=gz_bytes, is_new=is_new)
         if out_dir is not None:
             write_outputs(r, out_dir)
 
@@ -787,6 +808,18 @@ def run(
                         )
                     except Exception:
                         pass
+            r.parsed.append(
+                dict(
+                    file_id=fid,
+                    item_name=rep.get("item_name"),
+                    report_type=rep.get("report_type"),
+                    parse_status="skipped",
+                    tables=0,
+                    observations=0,
+                    survey_dists=0,
+                    sections=0,
+                )
+            )
             continue
 
         if reparse or p_status == "pending":
@@ -802,7 +835,7 @@ def run(
         gz_bytes = r.text_files.get(t_path) if t_path else None
         if gz_bytes is None and t_path and b_url and b_key:
             try:
-                gz_bytes = read_storage_bytes(b_url, b_key, STORAGE_BUCKET, str(t_path), http=http)
+                gz_bytes = read_storage_bytes(b_url, b_key, STORAGE_BUCKET, str(t_path), http=storage_http)
             except Exception as e:
                 r.problems.append(f"#{fid} Storage 읽기 실패: {e}")
                 continue
@@ -913,7 +946,7 @@ def backfill_text_status(
         )
         if writer is not None:
             r._persisted_incrementally = True
-            _persist_one_report(r, writer, rep)
+            _persist_one_report(r, writer, rep, is_new=False)
         if out_dir is not None:
             write_outputs(r, out_dir)
 
@@ -969,7 +1002,19 @@ def publish(r: KreiResult, writer: Any) -> KreiResult:
         if r.items:
             writer.upsert("item", r.items, on_conflict=ITEM_KEY, schema=KREI_SCHEMA)
         if r.reports:
-            writer.upsert("report", r.reports, on_conflict=REPORT_KEY, schema=KREI_SCHEMA)
+            save_reports = []
+            for rep in r.reports:
+                fid = int(rep["file_id"]) if rep.get("file_id") is not None else None
+                is_new = (fid in r.new_file_ids) if r.new_file_ids else (not r._has_known_existing)
+                if is_new:
+                    save_reports.append(rep)
+                else:
+                    cp = dict(rep)
+                    cp.pop("parse_status", None)
+                    cp.pop("parser_version", None)
+                    cp.pop("parsed_at", None)
+                    save_reports.append(cp)
+            writer.upsert("report", save_reports, on_conflict=REPORT_KEY, schema=KREI_SCHEMA)
         r.uploaded = True
     except Exception as e:
         r.problems.append(f"DB 올리기 실패: {type(e).__name__}: {str(e)[:200]}")
@@ -1061,7 +1106,12 @@ def brief_text(r: KreiResult) -> str:
             err_summary = "; ".join(str(e.get("error") or e) for e in errs[:2])
             lines.append(f"- #{fid} {title}: {err_summary}")
     if r.problems:
-        lines.append("\n## 문제")
+        prob_header = (
+            f"\n## 문제 {len(r.problems)}건(앞 10건)"
+            if len(r.problems) > 10
+            else f"\n## 문제 {len(r.problems)}건"
+        )
+        lines.append(prob_header)
         for p in r.problems[:10]:
             lines.append(f"- ! {p}"[:300])
     lines.append(

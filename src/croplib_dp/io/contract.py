@@ -505,10 +505,12 @@ def check_rows(
             hi = taw + 1e-6 if taw is not None else math.inf
             if not (-1e-6 <= v <= hi):
                 bad.append(f"{c}={v} (범위 0~{taw})")
-        k = tuple(r.get(c) for c in spec.key if c not in ignore) + tuple(r.get(c) for c in extra)
-        if spec.key and k in seen:
+        k_cols = [c for c in spec.key if c not in ignore] + list(extra)
+        k = tuple(r.get(c) for c in k_cols)
+        if k_cols and k in seen:
             bad.append(f"같은 키가 두 번 {k}")
-        seen.add(k)
+        if k_cols:
+            seen.add(k)
         if bad:
             n_bad += 1
             if len(problems) < max_report:
