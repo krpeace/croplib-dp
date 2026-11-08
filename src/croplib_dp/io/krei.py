@@ -17,7 +17,7 @@ from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.krei import (
     build_pages_payload,
     compress_pages_json,
-    compute_text_stats,
+    compute_page_text_stats,
     extract_first_page_meta,
     resolve_pdf_url,
 )
@@ -74,7 +74,7 @@ def extract_pdf_bytes(pdf_bytes: bytes) -> dict[str, Any]:
                         first_page_texts.append(" ".join(str(w.get("text", "")) for w in words))
     pages_data = build_pages_payload(raw_pages)
     gz_bytes = compress_pages_json(pages_data)
-    text_chars, text_status = compute_text_stats(pages_data)
+    text_chars, no_text_pages, text_status = compute_page_text_stats(pages_data)
     issue_no, pub_date = extract_first_page_meta("\n".join(first_page_texts))
     return dict(
         pdf_sha256=sha256,
@@ -83,6 +83,7 @@ def extract_pdf_bytes(pdf_bytes: bytes) -> dict[str, Any]:
         issue_no=issue_no,
         pub_date=pub_date,
         text_chars=text_chars,
+        no_text_pages=no_text_pages,
         text_status=text_status,
         gz_bytes=gz_bytes,
         pages_data=pages_data,

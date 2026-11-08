@@ -9,12 +9,14 @@ r"""KREI 농업관측 수집기 1단계: 품목분류·발행물 목록·글자 
      - `write=false`(시험 실행)이면 PDF 는 표본 1건만 받고 끝낸다.
      - 시간 예산(기본 25분, `--budget-minutes` 또는 `KREI_BUDGET_MINUTES`)이 지나면 새 PDF 를 시작하지 않고
        정상 종료하며, 요약에 `"남은 N건, 다음 실행에서 이어 받음"`을 남긴다.
-     - 추출한 글자 수(`text_chars`)가 쪽당 50자 미만이면 `text_status = 'no_text'`(그림·윤곽선 PDF),
-       50자 이상이면 `'ok'`로 기록하되 `fetch_status`는 `'fetched'`로 둔다.
+     - 쪽당 글자 200자 미만인 쪽을 `no_text_pages`로 세어 전부면 `text_status = 'no_text'`,
+       절반 이상이면 `'partial'`, 나머지는 `'ok'`로 기록하되 `fetch_status`는 `'fetched'`로 둔다.
      - PDF 1건을 처리할 때마다 바로 글자 좌표(`pages.json.gz`) 업로드와 `krei.report` 행 upsert,
        그리고 `out/` 요약 파일 갱신을 끝내 중간에 취소돼도 이미 받은 건이 남게 한다.
+     - 범위 안 부류(원예 4부류 + 쌀·콩·감자)에서 `no_text`·`partial`을 새로 받으면
+       `"[krei] 판독 불가 월보 목록(그림 PDF)"` 이슈에 댓글로 자동 추가한다(닫혀 있으면 다시 열지 않음).
   4. `--backfill-text-status` 옵션을 주면 PDF 를 다시 받지 않고 Storage 의 `pages.json.gz` 만 읽어
-     기존 `fetched` 행의 `text_chars`·`text_status` 를 채운다.
+     기존 `fetched` 행의 `text_chars`·`no_text_pages`·`text_status` 를 채운다.
 """
 
 import argparse
@@ -29,9 +31,12 @@ from typing import Any
 from croplib_dp.collectors.water import Clock, RunLog, _env, _iso
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.krei import (
-    compute_text_stats,
+    UNREADABLE_ISSUE_TITLE,
+    compute_page_text_stats,
     decompress_pages_json,
     default_months,
+    format_unreadable_comment,
+    is_unreadable_in_scope,
     list_storage_path,
     months_between,
     needs_refetch,
@@ -42,6 +47,7 @@ from croplib_dp.core.krei import (
 )
 from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
+from croplib_dp.io.github_issue import IssueAlerts
 from croplib_dp.io.krei import (
     STORAGE_BUCKET,
     KreiClient,
@@ -74,6 +80,7 @@ class KreiResult:
     problems: list[str] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
     uploaded: bool = False
+    issue_action: str | None = None
     _persisted_incrementally: bool = False
 
     @property
@@ -210,6 +217,7 @@ def _persist_one_report(
             rep["fetch_error"] = err
             rep["text_path"] = None
             rep["text_chars"] = None
+            rep["no_text_pages"] = None
             rep["text_status"] = None
             r.problems.append(f"#{rep['file_id']} {rep['item_name']}: {err}")
             r.failed_reports.append(
@@ -228,6 +236,27 @@ def _persist_one_report(
         r.problems.append(f"#{rep['file_id']} DB 올리기 실패: {type(e).__name__}: {str(e)[:200]}")
 
 
+def notify_unreadable_issue(r: KreiResult, issue_sink: Any | None) -> str:
+    """새로 수집된 범위 안 판독 불가(no_text·partial) 월보가 있으면 목록 이슈에 댓글로 추가한다.
+    이슈가 닫혀 있어도 다시 열지 않고 댓글만 추가한다."""
+    if issue_sink is None:
+        return "dry"
+    unreadable = [
+        f for f in r.fetched if is_unreadable_in_scope(f.get("ovr_item_code"), f.get("text_status"))
+    ]
+    if not unreadable:
+        return "none"
+    comment = format_unreadable_comment(unreadable)
+    try:
+        action = issue_sink.append_comment(comment, title=UNREADABLE_ISSUE_TITLE)
+        r.issue_action = action
+        return str(action)
+    except Exception as e:
+        r.problems.append(f"판독 불가 목록 이슈 댓글 등록 실패: {type(e).__name__}: {str(e)[:200]}")
+        r.issue_action = "error"
+        return "error"
+
+
 def run(
     months: list[tuple[int, int]] | None = None,
     existing_items: Iterable[Mapping[str, Any]] = (),
@@ -238,6 +267,7 @@ def run(
     *,
     write: bool = True,
     writer: Any | None = None,
+    issue_sink: Any | None = None,
     budget_minutes: float | None = DEFAULT_BUDGET_MINUTES,
     max_pdfs: int | None = None,
     out_dir: Path | None = None,
@@ -245,6 +275,7 @@ def run(
     """KREI 목록·원문 수집 1회 실행.
     - `write=False`(시험 실행)이면 목록은 모두 조회하되 PDF 는 최대 1건(표본)만 받는다.
     - `writer`가 주어지면 PDF 1건을 처리할 때마다 즉시 Storage·DB에 반영한다.
+    - `issue_sink`가 주어지면(`write=True`일 때) 범위 안 `no_text`·`partial` 신규 수집분을 이슈 댓글로 알린다.
     - `budget_minutes`(기본 25분)가 지나면 새 PDF 를 시작하지 않고 남은 건수를 기록해 정상 종료한다.
     - `out_dir`이 주어지면 목록 조회 직후와 PDF 1건 처리마다 요약 파일을 갱신한다."""
     clock = clock or Clock()
@@ -334,6 +365,7 @@ def run(
                     pub_date=prev.get("pub_date"),
                     text_path=prev.get("text_path"),
                     text_chars=prev.get("text_chars"),
+                    no_text_pages=prev.get("no_text_pages"),
                     text_status=prev.get("text_status"),
                     fetch_status="fetched",
                     fetch_error=None,
@@ -393,6 +425,7 @@ def run(
                 pub_date=None,
                 text_path=None,
                 text_chars=None,
+                no_text_pages=None,
                 text_status=None,
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
@@ -440,6 +473,7 @@ def run(
                 pub_date=None,
                 text_path=None,
                 text_chars=None,
+                no_text_pages=None,
                 text_status=None,
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
@@ -456,9 +490,10 @@ def run(
         t_path = text_storage_path(item["ovr_item_code"], item["yyyy"], item["mm"], file_id)
         gz_bytes = ext["gz_bytes"]
         text_chars = ext.get("text_chars")
+        no_text_pages = ext.get("no_text_pages")
         text_status = ext.get("text_status")
-        if text_chars is None or text_status is None:
-            text_chars, text_status = compute_text_stats(ext.get("pages_data") or ())
+        if text_chars is None or no_text_pages is None or text_status is None:
+            text_chars, no_text_pages, text_status = compute_page_text_stats(ext.get("pages_data") or ())
         r.text_files[t_path] = gz_bytes
         r.fetched.append(
             dict(
@@ -468,12 +503,14 @@ def run(
                 ovr_item_code=item["ovr_item_code"],
                 item_name=item["item_name"],
                 report_type=item["report_type"],
+                pdf_link=item["pdf_link"],
                 pages=ext["pages"],
                 pdf_bytes=ext["pdf_bytes"],
                 gz_bytes=len(gz_bytes),
                 issue_no=ext["issue_no"],
                 pub_date=ext["pub_date"],
                 text_chars=text_chars,
+                no_text_pages=no_text_pages,
                 text_status=text_status,
             )
         )
@@ -498,6 +535,7 @@ def run(
             pub_date=ext["pub_date"],
             text_path=t_path,
             text_chars=text_chars,
+            no_text_pages=no_text_pages,
             text_status=text_status,
             fetch_status="fetched",
             fetch_error=None,
@@ -510,6 +548,8 @@ def run(
         if out_dir is not None:
             write_outputs(r, out_dir)
 
+    if write and issue_sink is not None:
+        notify_unreadable_issue(r, issue_sink)
     if out_dir is not None:
         write_outputs(r, out_dir)
     return r
@@ -525,8 +565,8 @@ def backfill_text_status(
     force: bool = False,
     out_dir: Path | None = None,
 ) -> KreiResult:
-    """이미 fetched 인 보고서들의 Storage pages.json.gz 를 읽어 text_chars·text_status 를 채운다.
-    원본 PDF 를 다시 받지 않는다."""
+    """이미 fetched 인 보고서들의 Storage pages.json.gz 를 읽어
+    text_chars·no_text_pages·text_status 를 채운다. 원본 PDF 를 다시 받지 않는다."""
     clock = clock or Clock()
     now_iso = _iso(clock.now()) or ""
     existing_items, existing_reports = read_existing(base_url, key, http=http)
@@ -535,18 +575,26 @@ def backfill_text_status(
 
     for file_id in sorted(existing_reports):
         rep = dict(existing_reports[file_id])
+        rep.setdefault("text_chars", None)
+        rep.setdefault("no_text_pages", None)
+        rep.setdefault("text_status", None)
         if rep.get("fetch_status") != "fetched" or not rep.get("text_path"):
             r.skipped_count += 1
             r.reports.append(rep)
             continue
-        if not force and rep.get("text_status") in ("ok", "no_text") and rep.get("text_chars") is not None:
+        if (
+            not force
+            and rep.get("text_status") in ("ok", "partial", "no_text")
+            and rep.get("text_chars") is not None
+            and rep.get("no_text_pages") is not None
+        ):
             r.skipped_count += 1
             r.reports.append(rep)
             continue
         try:
             gz_bytes = read_storage_bytes(base_url, key, STORAGE_BUCKET, str(rep["text_path"]), http=http)
             pages_data = decompress_pages_json(gz_bytes)
-            text_chars, text_status = compute_text_stats(pages_data)
+            text_chars, no_text_pages, text_status = compute_page_text_stats(pages_data)
         except Exception as e:
             err = f"pages.json.gz 읽기·해석 실패: {type(e).__name__}: {str(e)[:200]}"
             r.problems.append(f"#{file_id} {rep.get('item_name')}: {err}")
@@ -562,6 +610,7 @@ def backfill_text_status(
             continue
 
         rep["text_chars"] = text_chars
+        rep["no_text_pages"] = no_text_pages
         rep["text_status"] = text_status
         if rep.get("pages") is None and pages_data:
             rep["pages"] = len(pages_data)
@@ -575,12 +624,14 @@ def backfill_text_status(
                 ovr_item_code=str(rep["ovr_item_code"]),
                 item_name=str(rep["item_name"]),
                 report_type=str(rep["report_type"]),
+                pdf_link=str(rep.get("pdf_link") or ""),
                 pages=rep.get("pages") or len(pages_data),
                 pdf_bytes=int(rep.get("pdf_bytes") or 0),
                 gz_bytes=len(gz_bytes),
                 issue_no=rep.get("issue_no"),
                 pub_date=rep.get("pub_date"),
                 text_chars=text_chars,
+                no_text_pages=no_text_pages,
                 text_status=text_status,
             )
         )
@@ -626,6 +677,7 @@ def publish(r: KreiResult, writer: Any) -> KreiResult:
             rep["fetch_error"] = err
             rep["text_path"] = None
             rep["text_chars"] = None
+            rep["no_text_pages"] = None
             rep["text_status"] = None
             r.problems.append(f"#{rep['file_id']} {rep['item_name']}: {err}")
             r.failed_reports.append(
@@ -652,8 +704,8 @@ def brief_text(r: KreiResult) -> str:
     """실행 요약: 조회한 달, 목록·새로 받은 건, 글자 없음(그림 PDF), 남은 건, 실패 건."""
     ym_str = ", ".join(f"{y:04d}-{m:02d}" for y, m in r.months) or "전체"
     total_listed = r.listed_count if r.listed_count else len(r.reports)
-    no_text_fetched = [f for f in r.fetched if f.get("text_status") == "no_text"]
-    no_text_note = f", 글자 없음(그림 PDF) {len(no_text_fetched)}건" if no_text_fetched else ""
+    unreadable_fetched = [f for f in r.fetched if f.get("text_status") in ("no_text", "partial")]
+    no_text_note = f", 글자 없음(그림 PDF) {len(unreadable_fetched)}건" if unreadable_fetched else ""
     lines = [
         f"# KREI 농업관측 수집 ({ym_str}, 계산 {CALC_VERSION})",
         f"- 조회한 달: {ym_str}",
@@ -674,11 +726,14 @@ def brief_text(r: KreiResult) -> str:
             kb = f["gz_bytes"] / 1024
             mb = f["pdf_bytes"] / 1e6
             chars = f.get("text_chars")
+            no_txt = f.get("no_text_pages")
             status = f.get("text_status")
             char_str = ""
             if chars is not None:
                 if status == "no_text":
                     char_str = f" · 글자 {chars}자 [글자 없음(그림 PDF)]"
+                elif status == "partial":
+                    char_str = f" · 글자 {chars:,}자 (글자 없는 쪽 {no_txt}/{f['pages']}쪽) [일부 그림 PDF]"
                 else:
                     char_str = f" · 글자 {chars:,}자"
             meta = ""
@@ -688,12 +743,16 @@ def brief_text(r: KreiResult) -> str:
                 f"- {f['yyyy']:04d}-{f['mm']:02d} {f['item_name']} · {f['report_type']} · "
                 f"#{f['file_id']} · {f['pages']}쪽 · PDF {mb:.2f}MB → 좌표 {kb:.1f}KB{char_str}{meta}"
             )
-    if no_text_fetched:
+    if unreadable_fetched:
         lines.append("\n## 글자 없음(그림 PDF)")
-        for f in no_text_fetched:
+        for f in unreadable_fetched:
+            no_txt = f.get("no_text_pages")
+            page_detail = f"{no_txt}/{f['pages']}쪽 글자 없음" if no_txt is not None else f"{f['pages']}쪽"
+            status_str = f.get("text_status")
+            chars_val = f.get("text_chars") or 0
             lines.append(
                 f"- {f['yyyy']:04d}-{f['mm']:02d} {f['item_name']} · {f['report_type']} · "
-                f"#{f['file_id']} · {f['pages']}쪽 · 글자 {f.get('text_chars') or 0}자"
+                f"#{f['file_id']} · {page_detail} ({status_str}) · 글자 {chars_val}자"
             )
     if r.failed_reports:
         lines.append("\n## 실패 건")
@@ -757,7 +816,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--backfill-text-status",
         action="store_true",
-        help="PDF를 다시 받지 않고 Storage의 pages.json.gz를 읽어 text_chars·text_status를 채움",
+        help="Storage의 pages.json.gz를 읽어 text_chars·no_text_pages·text_status를 채움",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="--backfill-text-status 실행 시 이미 값이 채워진 행도 전체 다시 계산",
     )
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase DB·Storage에 쓰기")
@@ -774,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
             from croplib_dp.io.supabase_write import SupabaseWriter
 
             writer = SupabaseWriter(sb_url, sb_key)
-        r = backfill_text_status(sb_url, sb_key, writer=writer, clock=clock, out_dir=out_path)
+        r = backfill_text_status(sb_url, sb_key, writer=writer, clock=clock, force=a.force, out_dir=out_path)
         if not a.write:
             r.problems += check(r)
         out = write_outputs(r, out_path)
@@ -801,10 +865,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"참고: 기존 DB 조회 생략 ({e})")
 
     writer = None
+    issue_sink = None
     if a.write:
         from croplib_dp.io.supabase_write import SupabaseWriter
 
         writer = SupabaseWriter(sb_url, sb_key)
+        gh_repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+        gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
+        if gh_repo and gh_token:
+            issue_sink = IssueAlerts(gh_repo, gh_token, title=UNREADABLE_ISSUE_TITLE, label="krei")
 
     r = run(
         months=months,
@@ -813,6 +882,7 @@ def main(argv: list[str] | None = None) -> int:
         clock=clock,
         write=a.write,
         writer=writer,
+        issue_sink=issue_sink,
         budget_minutes=budget_minutes,
         out_dir=out_path,
     )

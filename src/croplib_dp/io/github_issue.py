@@ -64,6 +64,23 @@ class IssueAlerts:
         issues = [i for i in issues if "pull_request" not in i]
         return issues[0] if issues else None
 
+    def find_by_title(self, title: str | None = None) -> dict | None:
+        """열려 있거나 닫혀 있는 이슈 중 제목이 정확히 일치하는 이슈를 찾는다."""
+        target = title or self.title
+        issues = self._call("GET", "/issues?state=all&per_page=100")
+        if not isinstance(issues, list):
+            return None
+        matches = [i for i in issues if "pull_request" not in i and i.get("title") == target]
+        return matches[0] if matches else None
+
+    def append_comment(self, comment_body: str, title: str | None = None) -> str:
+        """제목이 일치하는 이슈에 댓글만 추가한다. 이슈가 닫혀 있어도 다시 열지 않는다."""
+        issue = self.find_by_title(title)
+        if issue is None:
+            return "not_found"
+        self._call("POST", f"/issues/{issue['number']}/comments", {"body": comment_body})
+        return "commented"
+
     @staticmethod
     def _keys(body: str | None) -> set[str]:
         m = MARK.search(body or "")
