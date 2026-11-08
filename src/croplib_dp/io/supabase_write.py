@@ -7,6 +7,8 @@
 실패하면 오류를 낸다(조용히 넘어가지 않는다). 오류 문구에 키는 들어가지 않는다.
 """
 
+# ruff: noqa: E501  (한글 문장이 많아 ruff 가 전각 문자를 2칸으로 세어 110을 넘는 줄이 많다)
+
 import json
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
@@ -79,3 +81,25 @@ class SupabaseWriter:
         if status not in (200, 201):
             text = body.decode("utf-8", "replace")[:300] if isinstance(body, bytes | bytearray) else str(body)
             raise RuntimeError(f"Storage {bucket}/{path} 올리기 실패: HTTP {status} {text}")
+
+    def _write_with_filter(self, method: str, table: str, query: str, select: str, body: bytes) -> list[dict]:
+        if not query or "=" not in query:  # 조건 없는 삭제·수정은 막는다 (표 전체를 건드리지 않게)
+            raise ValueError(f"{table} {method}: 조건(query)이 비어 있습니다 — 표 전체를 건드리지 않습니다")
+        url = f"{self.base}/rest/v1/{table}?{query}&select={select}"
+        headers = self._headers(**{"Content-Type": "application/json", "Prefer": "return=representation"})
+        status, resp = self.http(method, url, headers, body)
+        self.calls += 1
+        if status not in (200, 204):
+            text = resp.decode("utf-8", "replace")[:300] if isinstance(resp, bytes | bytearray) else str(resp)
+            raise RuntimeError(f"Supabase {table} {method} 실패: HTTP {status} {text}")
+        return json.loads(resp) if resp else []
+
+    def delete(self, table: str, query: str, select: str) -> list[dict]:
+        """조건(query)에 맞는 줄을 지우고 지운 줄의 `select` 열을 돌려준다. 조건이 비면 거부한다."""
+        return self._write_with_filter("DELETE", table, query, select, b"")
+
+    def patch(self, table: str, query: str, values: Mapping[str, Any], select: str) -> list[dict]:
+        """조건(query)에 맞는 줄의 값을 고치고(줄은 그대로) 고친 줄의 `select` 열을 돌려준다."""
+        return self._write_with_filter(
+            "PATCH", table, query, select, json.dumps(values, ensure_ascii=False).encode()
+        )
