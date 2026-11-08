@@ -502,7 +502,34 @@ def test_collector_has_no_database_write_path():
 
 
 def test_main_reads_key_only_from_environment(monkeypatch, tmp_path):
-    for k in ("DATA_GO_KR", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"):
+    for k in ("DATA_GO_KR", "SUPABASE_URL", "SUPABASE_READ_KEY", "SUPABASE_SERVICE_ROLE_KEY"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("SUPABASE_READ_KEY", raising=False)
     with pytest.raises(SystemExit):  # 키가 없으면 조용히 넘어가지 않고 멈춘다
         RA.main(["--out", str(tmp_path)])
+
+
+def test_audit_collector_reads_the_stations_table_with_a_read_only_key_only(monkeypatch, tmp_path):
+    """지점 목록만 읽으므로 서버 키가 아니라 읽기 전용 키(SUPABASE_READ_KEY)로 지점 표 하나만 읽는다"""
+    src = inspect.getsource(RA)
+    assert "SERVICE_ROLE" not in src and "SUPABASE_READ_KEY" in src
+    asked = []
+
+    def fake_read_table(base, key, table, *a, **k):
+        asked.append((base, key, table))
+        return list(_dicts().stations.values())
+
+    monkeypatch.setenv("SUPABASE_URL", "https://example.invalid")
+    monkeypatch.setenv("SUPABASE_READ_KEY", "read-only-key")
+    monkeypatch.setenv("DATA_GO_KR", KEY)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(RA, "read_table", fake_read_table)
+    monkeypatch.setattr(
+        RA,
+        "run",
+        lambda d, key, **kw: RA.AuditResult(start=dt.date(2026, 1, 1), end=dt.date(2026, 1, 2), days=2),
+    )
+    RA.main(["--out", str(tmp_path)])
+    assert asked == [
+        ("https://example.invalid", "read-only-key", "stations")
+    ]  # 다른 표(작물·시나리오 등)는 읽지 않는다

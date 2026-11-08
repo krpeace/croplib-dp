@@ -1,7 +1,8 @@
 """일사 점검 수집기 (이슈 #48, #28 S0-b PR-A). **DB에 쓰지 않는다.** 결과는 파일로만 남긴다.
 
 운영 지점(stations.is_active)마다 지난 365일 ASOS 일자료를 받아(해가 바뀌면 해마다 한 번씩 = 지점당 2번),
-core/radiation_audit 으로 분류·실측 kRs·ETo 오차·의심 일조를 구한다. 지점 목록은 DB 에서 읽기만 한다.
+core/radiation_audit 으로 분류·실측 kRs·ETo 오차·의심 일조를 구한다. 지점 목록은 DB 에서 읽기만 한다:
+**서버 키(service role)가 아니라 읽기 전용 키(`SUPABASE_READ_KEY`)로 `stations` 표 하나만** 읽는다.
 - 사람이 Actions 에서 눌러 실행한다(`radiation-audit.yml`, 예약 없음).
 - 한 지점이 끝내 받지 못하면 그 지점만 빼고 실패로 남긴다(조용히 넘어가지 않음).
 - 해안선 거리·섬 여부는 여기서 구하지 않는다(PR-B, 원본 해안선 자료는 저장소에 넣지 않음).
@@ -20,7 +21,7 @@ from croplib_dp.collectors.water import Clock, RunLog, _env
 from croplib_dp.core.daily_weather import StationMeta
 from croplib_dp.core.radiation_audit import CLASSES, KRS_HIGH, KRS_LOW, audit_station
 from croplib_dp.io import kma
-from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries
+from croplib_dp.io.dictionaries import TABLES, Dictionaries, read_table
 
 DEFAULT_DAYS = 365
 OUT_NAME = "radiation_audit"
@@ -179,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--days", type=int, default=DEFAULT_DAYS, help="조회 일수(어제까지, 기본 365)")
     p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 운영 지점 전부)")
     a = p.parse_args(argv)
-    d = load_dictionaries(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
+    url, read_key = _env("SUPABASE_URL"), _env("SUPABASE_READ_KEY")
+    d = Dictionaries.from_rows({**{t: [] for t in TABLES}, "stations": read_table(url, read_key, "stations")})
     stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
     r = run(d, _env("DATA_GO_KR"), stations=stations, days=a.days)
     out = write_outputs(r, Path(a.out))

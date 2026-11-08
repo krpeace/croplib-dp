@@ -12,6 +12,7 @@ from typing import Any
 
 from croplib_dp.core.daily_weather import StationMeta
 from croplib_dp.core.water_balance import CropParams, Soil
+from croplib_dp.io.coastal import coastal_krs
 
 TABLES = ("stations", "crops", "crop_seasons", "crop_kc_sets", "soil_types", "scenarios")
 RestGet = Callable[[str, dict], tuple[int, bytes]]
@@ -84,8 +85,12 @@ def _date(v: Any) -> dt.date:
 
 
 def station_meta(st: dict) -> StationMeta:
+    """지점 행 → 계산 입력. krs(식50, 결측일 대체용)는 해안 목록에서 읽는다(10 km 이하 0.19, 그 밖 0.16)."""
     return StationMeta(
-        lat=float(st["lat"]), elev_m=float(st["elev_m"]), wind_height_m=float(st["wind_height_m"])
+        lat=float(st["lat"]),
+        elev_m=float(st["elev_m"]),
+        wind_height_m=float(st["wind_height_m"]),
+        krs=coastal_krs(st.get("stn_id")),
     )
 
 
