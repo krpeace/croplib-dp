@@ -4,9 +4,9 @@
 ETo가 크게 줄어든다. 값 범위 검사(0~40)로는 걸러지지 않는다.
 
 규칙
-  1. 일 단위: 일사가 0.02 × Ra(천문일사)보다 작으면 결측으로 본다. 이 규칙의 목적은 물리적으로
+  1. 일 단위: 일사가 0.01 × Ra(천문일사)보다 작으면 결측으로 본다. 이 규칙의 목적은 물리적으로
      불가능한 값(0.0 등)만 거르는 것이다. 센서 고장은 아래 월 단위 규칙이 잡는다.
-     (0.05 × Ra 는 흐린 날의 진짜 낮은 일사까지 버려서 쓰지 않는다. 결정 0020)
+     (0.05·0.02 × Ra 는 호우 날의 진짜 낮은 일사까지 버려서 쓰지 않는다. 결정 0020)
   2. 달력 월 단위: 한 지점의 한 달에 자료가 10일 이상이고 그중 무효가 90% 이상이면
      그 달 일사를 전부 무효로 본다.
      자료가 10일 미만인 달은 일 단위 규칙만 쓴다. 달마다 따로 판단해서, 센서를 고친 다음 달부터는 다시 쓴다.
@@ -22,7 +22,7 @@ from croplib_dp.core.fao56 import extra_radiation, rs_from_sunshine
 from croplib_dp.core.solar import KRS_FAO, ra_rso, rs_s1
 
 KRS_INLAND = KRS_FAO  # 식50 kRs 기본값(내륙). 해안 값(0.19)은 지점별로 StationMeta.krs 에 넣는다 (S0-b)
-MIN_RS_RATIO = 0.02  # 일사 하한 = 0.02 × Ra (결정 0020: 정상 지점에서 무효가 되는 날 0.03%)
+MIN_RS_RATIO = 0.01  # 일사 하한 = 0.01 × Ra (결정 0020: 정상 지점에서 무효가 되는 날 0.01%)
 MONTH_MIN_DAYS = 10  # 이 일수 이상 자료가 있는 달만 월 단위로 판단한다
 MONTH_INVALID_RATIO = 0.9  # 자료 중 무효가 이 비율 이상이면 그 달 전체 무효
 MAX_FILL_DAYS = 7  # 앞 7일 평균으로 채우는 연속 일수 한도
@@ -32,7 +32,7 @@ OBSERVED, SUNSHINE, TEMP_RANGE = "observed", "sunshine", "temp_range"
 
 
 def rs_floor(lat: float, day: dt.date) -> float:
-    """그날 일사 하한 [MJ/m²/d] = 0.02 × Ra"""
+    """그날 일사 하한 [MJ/m²/d] = 0.01 × Ra"""
     return MIN_RS_RATIO * extra_radiation(lat, day.timetuple().tm_yday)
 
 

@@ -3,7 +3,7 @@
 규칙은 cropwater `cropwater_multi.compute_station`과 `compute_water_balance`(결측 채우기)를 그대로 따른다.
   - 실제 수증기압 ea: 증기압(avgPv) → 이슬점(avgTd) → 평균습도(avgRhm) 순으로 있는 값을 쓴다
   - 일사 Rs: 유효한 관측 일사(sumGsr) → 일조시간(sumSsHr, FAO-56 식35) → 기온차(식50) → 없음.
-    `0.0`처럼 하한(0.02×Ra)보다 작은 값과, 한 달 대부분이 무효인 달의 값은 관측으로 쓰지 않는다
+    `0.0`처럼 하한(0.01×Ra)보다 작은 값과, 한 달 대부분이 무효인 달의 값은 관측으로 쓰지 않는다
     (core/radiation.py, 결정 0020)
   - 기압: 관측 현지기압(avgPa), 없으면 고도로 추정
   - 강수: ASOS는 비가 오지 않은 날 일강수 칸이 비어 있으므로 0. 행 자체가 없는 날은 비워 둔다(None)

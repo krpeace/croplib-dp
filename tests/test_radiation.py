@@ -2,7 +2,7 @@
 
 입력은 모두 가짜 값이다. 지점 이름·번호는 실제 관측소를 닮았지만 값은 시험용이다.
 규칙:
-  1. 일 단위: 일사가 0.02 × Ra 보다 작으면 결측으로 본다 (물리적으로 불가능한 값만 거른다)
+  1. 일 단위: 일사가 0.01 × Ra 보다 작으면 결측으로 본다 (물리적으로 불가능한 값만 거른다)
   2. 달력 월 단위: 자료가 10일 이상이고 그중 무효가 90% 이상이면 그 달 일사를 전부 무효로 본다
   3. 대체 순서: 유효한 일사 → 일조시간(식35) → 기온차(식50, kRs는 지점별) → 비움
   4. 앞 7일 평균으로 채운 날이 연속 7일을 넘으면 8일째부터 ETo를 비운다(filled = True)
@@ -63,7 +63,7 @@ MAY1 = dt.date(2026, 5, 1)
 
 # ── 1. 일 단위 규칙 ───────────────────────────────────────────────────────
 def test_floor_is_five_percent_of_extraterrestrial_radiation():
-    assert rs_floor(LAT, MAY1) == pytest.approx(0.02 * extra_radiation(LAT, _doy(MAY1)))
+    assert rs_floor(LAT, MAY1) == pytest.approx(0.01 * extra_radiation(LAT, _doy(MAY1)))
 
 
 def test_zero_radiation_with_sunshine_equals_sunshine_only():
@@ -102,17 +102,18 @@ def test_temperature_range_krs_is_per_station_and_default_is_inland():
 
 
 def test_tiny_radiation_below_floor_is_invalid_in_august():
-    """8월 하한(0.02×Ra, 약 0.8 MJ)보다 작은 0.5 MJ 는 물리적으로 불가능 → 무효, 일조시간으로 대체"""
+    """8월 하한(0.01×Ra, 약 0.4 MJ)보다 작은 0.2 MJ 는 물리적으로 불가능 → 무효, 일조시간으로 대체"""
     day = dt.date(2026, 8, 4)
-    assert 0.5 < rs_floor(LAT, day) < 1.0
-    r = daily_weather([_item("2026-08-04", sumGsr="0.5")], STN)[0]
+    assert 0.2 < rs_floor(LAT, day) < 1.0
+    r = daily_weather([_item("2026-08-04", sumGsr="0.2")], STN)[0]
     assert r["rs_source"] == "sunshine"
 
 
 def test_heavily_overcast_day_is_kept_as_observed():
-    """흐리고 비 오는 날의 진짜 낮은 일사(Ra의 3% 안팎)는 버리지 않는다 (0.05×Ra 하한은 이것까지 버렸다)"""
+    """호우 날의 진짜 낮은 일사(Ra의 1.5%: 제주 2/24 0.39 MJ·비 55 mm 같은 날)는 버리지 않는다.
+    0.05·0.02×Ra 하한은 이것까지 버렸다"""
     day = dt.date(2026, 5, 1)
-    low = 0.03 * extra_radiation(LAT, _doy(day))
+    low = 0.015 * extra_radiation(LAT, _doy(day))
     assert low > rs_floor(LAT, day)
     r = daily_weather([_item("2026-05-01", sumGsr=f"{low:.2f}", sumRn="30.0")], STN)[0]
     assert r["rs_source"] == "observed" and r["rs_mj"] == pytest.approx(round(low, 2))
