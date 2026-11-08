@@ -402,3 +402,35 @@ def test_healthy_station_sun_rows_are_unchanged_by_the_rule():
     rows = [x for x in r.sun_daily if x["stn_id"] == "101" and x["date"] <= "2026-10-24"]
     assert all(x["filled"] is False for x in rows)
     assert all(x["rs_day_mj"] == 10 + dt.date.fromisoformat(x["date"]).timetuple().tm_yday % 7 for x in rows)
+
+
+# ── 지점 단위 최소 자료 규칙 (평년선 유효 일수 100일 미만 = 일사 미측정 지점) ───────────────
+def _normal_days(rows, stn="101"):
+    return sum(1 for x in rows if x["stn_id"] == stn and x["rs_normal_day_mj"] is not None)
+
+
+def test_yeongju_like_station_with_one_normal_day_gets_empty_rows():
+    """영주형: 평년선 1일(전에는 "평년의 100%"로 나왔다) → 일사 미측정 지점, 빈 값 줄로 덮어쓴다"""
+    r, _, _ = _run(gsr_calendar_days={"101": 1})
+    rows = [x for x in r.sun_daily if x["stn_id"] == "101"]
+    assert len(rows) == 365 and _normal_days(rows) == 0
+    assert all(x["rs_day_mj"] is None and x["rs_cum_mj"] is None and x["filled"] is True for x in rows)
+    assert next(x for x in r.stations if x["stn_id"] == "101")["sun"] == "자료 없음"
+    assert check_rows("sun_daily", rows) == []
+
+
+def test_new_station_like_244_normal_days_is_kept():
+    """신설 지점형: 평년선 244일은 유효 지점"""
+    r, _, _ = _run(gsr_calendar_days={"101": 244})
+    rows = [x for x in r.sun_daily if x["stn_id"] == "101"]
+    assert _normal_days(rows) == 244
+    assert any(x["rs_day_mj"] is not None and x["filled"] is False for x in rows)
+
+
+def test_normal_days_boundary_99_empty_and_100_kept():
+    r99, _, _ = _run(gsr_calendar_days={"101": 99})
+    r100, _, _ = _run(gsr_calendar_days={"101": 100})
+    rows99 = [x for x in r99.sun_daily if x["stn_id"] == "101"]
+    rows100 = [x for x in r100.sun_daily if x["stn_id"] == "101"]
+    assert _normal_days(rows99) == 0 and all(x["rs_day_mj"] is None for x in rows99)
+    assert _normal_days(rows100) == 100 and any(x["rs_day_mj"] is not None for x in rows100)

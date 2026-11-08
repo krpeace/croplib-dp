@@ -12,6 +12,7 @@ ETo가 크게 줄어든다. 값 범위 검사(0~40)로는 걸러지지 않는다
      자료가 10일 미만인 달은 일 단위 규칙만 쓴다. 달마다 따로 판단해서, 센서를 고친 다음 달부터는 다시 쓴다.
   3. 대체 순서: 유효한 일사 → 일조시간(FAO-56 식35) → 기온차(식50, kRs는 지점별) → 비움(None)
   4. 앞 7일 평균으로 채운 날이 연속 7일을 넘으면 8일째부터 ETo를 비운다 (daily_weather 에서 쓴다)
+  5. 지점 단위: 평년선의 유효 일수가 100일 미만이면 일사 미측정 지점으로 본다 (적산일사 수집기에서 쓴다)
 """
 
 import datetime as dt
@@ -26,6 +27,7 @@ MIN_RS_RATIO = 0.01  # 일사 하한 = 0.01 × Ra (결정 0020: 정상 지점에
 MONTH_MIN_DAYS = 10  # 이 일수 이상 자료가 있는 달만 월 단위로 판단한다
 MONTH_INVALID_RATIO = 0.9  # 자료 중 무효가 이 비율 이상이면 그 달 전체 무효
 MAX_FILL_DAYS = 7  # 앞 7일 평균으로 채우는 연속 일수 한도
+MIN_NORMAL_DAYS = 100  # 평년선의 유효 일수가 이보다 적으면 일사 미측정 지점 (정상 지점 최소 244일, 영주 1일)
 
 # rs_source 값: 계산에 쓴 일사가 어디서 왔나 (없으면 None)
 OBSERVED, SUNSHINE, TEMP_RANGE = "observed", "sunshine", "temp_range"
@@ -60,6 +62,11 @@ def clean_observed_rs(rs_by_day: Mapping[dt.date, float | None], lat: float) -> 
         if n >= MONTH_MIN_DAYS and bad[ym] / n >= MONTH_INVALID_RATIO  # 규칙 2
     }
     return {d: (None if (d.year, d.month) in dead else v) for d, v in out.items()}
+
+
+def has_enough_normals(normal: Mapping[tuple[int, int], float]) -> bool:
+    """규칙 5. 평년선 {(월, 일): 값}의 유효 일수가 100일 이상이면 일사를 재는 지점이다."""
+    return len(normal) >= MIN_NORMAL_DAYS
 
 
 def choose_rs(

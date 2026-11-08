@@ -16,7 +16,9 @@ from croplib_dp.core.daily_weather import StationMeta, daily_weather
 from croplib_dp.core.fao56 import eto_penman_monteith, extra_radiation, rs_from_sunshine, wind_2m
 from croplib_dp.core.radiation import (
     KRS_INLAND,
+    MIN_NORMAL_DAYS,
     clean_observed_rs,
+    has_enough_normals,
     rs_floor,
 )
 from croplib_dp.core.solar import ra_rso, rs_s1
@@ -62,7 +64,7 @@ MAY1 = dt.date(2026, 5, 1)
 
 
 # ── 1. 일 단위 규칙 ───────────────────────────────────────────────────────
-def test_floor_is_five_percent_of_extraterrestrial_radiation():
+def test_floor_is_one_percent_of_extraterrestrial_radiation():
     assert rs_floor(LAT, MAY1) == pytest.approx(0.01 * extra_radiation(LAT, _doy(MAY1)))
 
 
@@ -279,3 +281,28 @@ def test_values_after_a_blank_run_are_computed_normally():
     items = [_item("2026-05-01")] + [_blank(f"2026-05-{d:02d}") for d in range(2, 12)] + [_item("2026-05-12")]
     out = daily_weather(items, STN)
     assert out[-1]["filled"] is False and out[-1]["eto_mm"] == pytest.approx(_pm(20.0, dt.date(2026, 5, 12)))
+
+
+# ── 4. 지점 단위 최소 자료 규칙: 평년선의 유효 일수가 100일 미만이면 일사 미측정 지점 ──────────────
+def _normals(n_days):
+    """평년선 {(월, 일): 값} 달력 날짜 n_days 개 (2월 29일 제외)"""
+    first = dt.date(2025, 1, 1)
+    return {((first + dt.timedelta(k)).month, (first + dt.timedelta(k)).day): 10.0 for k in range(n_days)}
+
+
+def test_minimum_normal_days_is_100():
+    assert MIN_NORMAL_DAYS == 100
+
+
+def test_yeongju_like_one_normal_day_is_not_measuring():
+    assert has_enough_normals(_normals(1)) is False
+    assert has_enough_normals({}) is False
+
+
+def test_new_station_like_244_normal_days_is_measuring():
+    assert has_enough_normals(_normals(244)) is True
+
+
+def test_normal_days_boundary_99_is_not_and_100_is():
+    assert has_enough_normals(_normals(99)) is False
+    assert has_enough_normals(_normals(100)) is True
