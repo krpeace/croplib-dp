@@ -24,8 +24,10 @@ GRAIN_ITEMS: dict[str, str] = {
     "OVR0000000072": "콩",
     "OVR0000000021": "감자",
 }
-NO_TEXT_WARN_ITEMS: dict[str, str] = {**HORT_MONTH_ITEMS, **GRAIN_ITEMS}
-MIN_CHARS_PER_PAGE = 50
+UNREADABLE_SCOPE_ITEMS: dict[str, str] = {**HORT_MONTH_ITEMS, **GRAIN_ITEMS}
+NO_TEXT_WARN_ITEMS: dict[str, str] = UNREADABLE_SCOPE_ITEMS
+UNREADABLE_ISSUE_TITLE = "[krei] 판독 불가 월보 목록(그림 PDF)"
+MIN_CHARS_PER_PAGE = 30
 _UNUSED_CLOSE = {}
 
 _FILE_ID_RE = re.compile(r"/download/(\d+)(?:/|$)")
@@ -332,22 +334,69 @@ def decompress_pages_json(gz_bytes: bytes) -> list[dict[str, Any]]:
     return json.loads(gzip.decompress(gz_bytes).decode("utf-8"))
 
 
-def compute_text_stats(pages: Iterable[Mapping[str, Any]]) -> tuple[int, str]:
-    """쪽별 단어 좌표 목록(pages)에서 전체 글자 수(text_chars)와 상태('ok' | 'no_text')를 계산한다.
-    문서 전체 글자 수가 쪽당 50자 미만이면 'no_text'(그림·윤곽선 PDF)로 판정한다."""
+def compute_page_text_stats(pages: Iterable[Mapping[str, Any]]) -> tuple[int, int, str]:
+    """쪽별 단어 좌표 목록(pages)에서 (전체 글자 수 text_chars, 글자 없는 쪽 수 no_text_pages,
+    상태 'ok' | 'partial' | 'no_text')를 계산한다.
+    - 쪽당 글자 30자(`MIN_CHARS_PER_PAGE`) 미만인 쪽을 '글자 없는 쪽'(`no_text_pages`)으로 센다.
+    - 모든 쪽이 글자 없는 쪽이면 'no_text', 절반 이상(`no_text_pages * 2 >= n_pages`)이면 'partial',
+      나머지는 'ok'로 판정한다."""
     page_list = list(pages)
     n_pages = len(page_list)
     text_chars = 0
+    no_text_pages = 0
     for p in page_list:
+        page_chars = 0
         for wd in p.get("words", ()):
             if isinstance(wd, Mapping):
                 txt = str(wd.get("text", "")).strip()
             else:
                 txt = str(wd[4]).strip() if len(wd) >= 5 else ""
-            text_chars += len(txt)
-    if n_pages <= 0 or text_chars < n_pages * MIN_CHARS_PER_PAGE:
-        return text_chars, "no_text"
-    return text_chars, "ok"
+            page_chars += len(txt)
+        text_chars += page_chars
+        if page_chars < MIN_CHARS_PER_PAGE:
+            no_text_pages += 1
+    if n_pages <= 0 or no_text_pages == n_pages:
+        status = "no_text"
+    elif no_text_pages * 2 >= n_pages:
+        status = "partial"
+    else:
+        status = "ok"
+    return text_chars, no_text_pages, status
+
+
+def compute_text_stats(pages: Iterable[Mapping[str, Any]]) -> tuple[int, str]:
+    """하위 호환용: (text_chars, text_status) 2-튜플 반환."""
+    text_chars, _no_text_pages, status = compute_page_text_stats(pages)
+    return text_chars, status
+
+
+def is_unreadable_in_scope(ovr_item_code: str | None, text_status: str | None) -> bool:
+    """대상 범위(원예 4부류 + 쌀·콩·감자)에서 판독 불가('no_text' 또는 'partial')인지 여부."""
+    return str(ovr_item_code or "") in UNREADABLE_SCOPE_ITEMS and text_status in ("no_text", "partial")
+
+
+def format_unreadable_comment(reports: Iterable[Mapping[str, Any]]) -> str:
+    """새로 받은 범위 안 판독 불가('no_text'·'partial') 건을 GitHub 이슈 댓글 마크다운으로 만든다."""
+    rows = list(reports)
+    lines = [
+        "### 새로 확인된 판독 불가 발행물",
+        "",
+        "| 부류 | 월호 | 파일번호 | 쪽수 (글자 없는 쪽) | 상태 | PDF 링크 |",
+        "|---|---:|---:|---:|:---:|---|",
+    ]
+    for r in rows:
+        code = str(r.get("ovr_item_code") or "")
+        name = r.get("item_name") or UNREADABLE_SCOPE_ITEMS.get(code, code)
+        ym = f"{int(r['yyyy']):04d}-{int(r['mm']):02d} {r.get('report_type') or '월보'}"
+        fid = int(r["file_id"])
+        pages = int(r.get("pages") or 0)
+        no_pages = int(r.get("no_text_pages") or 0)
+        status = r.get("text_status") or "no_text"
+        url = resolve_pdf_url(str(r.get("pdf_link") or ""))
+        lines.append(
+            f"| {name} | {ym} | `#{fid}` | {pages}쪽 ({no_pages}쪽) | `{status}` | [원문 PDF]({url}) |"
+        )
+    return "\n".join(lines)
 
 
 def list_storage_path(api: str, yyyy: int, mm: int) -> str:

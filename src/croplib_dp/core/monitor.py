@@ -13,6 +13,7 @@ warn (경고) — 서비스는 되지만 기록해 둘 것
               대상은 운영 지점(is_active) 전부 — 물 수집 지점보다 넓다 (결정 0017)
   - krei    : 매달 8일 23:59 KST 뒤(9일 00:00~)에도 원예 4부류(과일·과채·엽근채소·양념채소)의 이번 달 월보가
               fetched 가 아니거나, fetch_status = 'failed' 인 건이 있음 (결정 0019)
+              (판독 불가 no_text·partial 월보는 별도 목록 이슈에 자동 댓글로 알리므로 감시 경고에서 제외)
 빠진 지점이 많으면(MAX_NAMED 곳 넘음) "N곳 — 앞 10곳 …" 으로 줄인다 (이슈·메일 가독성).
 """
 
@@ -23,7 +24,7 @@ from typing import Any
 
 import pandas as pd
 
-from croplib_dp.core.krei import HORT_MONTH_ITEMS, NO_TEXT_WARN_ITEMS
+from croplib_dp.core.krei import HORT_MONTH_ITEMS
 
 # 이보다 오래 갱신이 없으면 멈춤. 정상 최대 간격 약 16시간(02시 회차 → 17시 회차 마감 18:30) + 여유.
 # CropMon src/domain/freshness.ts STALE_AFTER_MS 와 같은 값이어야 함
@@ -98,25 +99,6 @@ def _check_krei(now: pd.Timestamp, krei_reports: Iterable[Mapping[str, Any]]) ->
         raw_err = str(r.get("fetch_error") or "이유 없음").strip()
         first_line = (raw_err.splitlines() or ["이유 없음"])[0]
         out.append(Alert("warn", "krei", f"KREI 수집 실패 ({item_name} #{fid}) — {first_line}"))
-    no_text = sorted(
-        (
-            r
-            for r in rows
-            if r.get("fetch_status") == "fetched"
-            and r.get("text_status") == "no_text"
-            and str(r.get("ovr_item_code")) in NO_TEXT_WARN_ITEMS
-        ),
-        key=lambda r: int(r.get("file_id") or 0),
-    )
-    for r in no_text:
-        item_name = (
-            r.get("item_name")
-            or NO_TEXT_WARN_ITEMS.get(str(r.get("ovr_item_code")), "")
-            or str(r.get("ovr_item_code") or "미상")
-        )
-        fid = r.get("file_id")
-        chars = int(r.get("text_chars") or 0)
-        out.append(Alert("warn", "krei", f"KREI 글자 없음 ({item_name} #{fid}) — 그림 PDF ({chars}자)"))
     return out
 
 

@@ -314,6 +314,7 @@ SPECS["krei.report"] = TableSpec(
         "pub_date",
         "text_path",
         "text_chars",
+        "no_text_pages",
         "text_status",
         "fetch_status",
         "fetch_error",
@@ -342,12 +343,13 @@ SPECS["krei.report"] = TableSpec(
         "pages": (1, 1000),
         "issue_no": (1, 100000),
         "text_chars": (0, 10000000),
+        "no_text_pages": (0, 1000),
     },
     enums={
         "api": ("monthly", "news"),
         "fetch_status": ("listed", "fetched", "failed"),
         "parse_status": ("pending", "parsed", "failed", "skipped"),
-        "text_status": ("ok", "no_text", None),
+        "text_status": ("ok", "partial", "no_text", None),
     },
     key=("file_id",),
 )

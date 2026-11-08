@@ -62,10 +62,27 @@ GitHub Actions(미국 시카고 러너)에서 KREI 농업관측 API(`reportItem`
        - **`#8687`(2026-05 엽근채소) → 윤곽선(Outline) 변환 PDF:** 쪽마다 벡터 곡선(`curves`)이 1,200~3,100여 개씩 들어 있는 **글자를 윤곽선(벡터 도형)으로 깨뜨린 PDF**다.
        - **`#8691`(2026-05 양념채소) → 통이미지(Full-page Raster) PDF:** 1~12쪽 모든 쪽에 `curves=0`이고 `2480×3508px`(A4 300dpi) 통이미지 1장만 들어 있는 **쪽 전체를 비트맵 이미지로 구운 PDF**다.
 
-- **원본 대신 좌표 보관 결정의 한계와 이번 단계 대응:**
-  - `pages.json.gz`(글자 좌표)만 보관하는 방식은 텍스트가 살아 있는 PDF에서는 원본의 1% 크기로 완벽히 동작하지만, 인쇄소에서 윤곽선·통이미지로 내보낸 PDF에서는 빈 배열(`words: []`)만 남는다. 다행히 KREI가 `pdf_link`로 원본 PDF를 계속 제공하고 `pdf_sha256`을 기록해 두었으므로, 우선 어떤 발행물이 글자가 없는지 정확히 식별·기록·감시하고 추후 파싱 단계에서 처리 방식(OCR 또는 KREI 측 텍스트 PDF 요청 등)을 정한다.
-  - 구체적 조치:
-    1. **스키마 열 추가 (`20261108010000_krei_report_text_status.sql`):** `krei.report`에 `text_chars int`, `text_status text check (text_status in ('ok','no_text'))` 열을 추가하고 `krei_api.reports` 뷰에도 노출한다.
-    2. **판정 기준 (`core/krei.py` `compute_text_stats`):** 문서 전체 추출 글자 수(`text_chars`)가 **쪽당 50자 미만**이면 `text_status = 'no_text'`, 이상이면 `'ok'`로 기록한다. 파일 내려받기 자체는 성공이므로 `fetch_status`는 `'fetched'`로 유지하며, 실행 요약(`brief.md` / `summary.md`)에 `"글자 없음(그림 PDF)"` 건수와 목록을 따로 표시한다.
-    3. **기존 수집 건 소급 채우기 (`--backfill-text-status`):** 이미 받아 둔 건은 원본 PDF를 다시 받지 않고 Storage의 `pages.json.gz`만 읽어 `text_chars`·`text_status`를 채운다.
-    4. **감시 규칙 (`core/monitor.py`):** 주요 분석 대상인 **원예 4부류(과일·과채·엽근채소·양념채소)와 곡물 3부류(쌀·콩·감자)**에서 `text_status = 'no_text'`가 나오면 파일번호별 고유 키(`warn:krei:KREI 글자 없음 (부류 #파일번호)`)로 **경고 1회**(같은 건은 중복 댓글·메일 없음)를 보내고, 축산·국제곡물·버섯 등은 감시 경고 없이 수집 요약에만 표시한다.
+- **초기 조치 (`20261108010000_krei_report_text_status.sql`):**
+  - `krei.report`에 `text_chars int`, `text_status text` 열을 추가하고 `--backfill-text-status` 명령으로 기존 수집 건을 채웠다.
+
+## 보충 3 (2026-11-08): 비전 판독·OCR 미채택 결정 및 쪽 단위 판정(`no_text_pages`·`partial`)·목록 안내 체계
+
+- **비전 판독·OCR을 하지 않기로 결정:**
+  - 윤곽선·통이미지 PDF에 대해 비전 모델 판독이나 OCR을 도입하면 비용·실행 시간·숫자 오인식 위험이 커진다. 대신 **비전 판독·OCR은 하지 않고**, 판독 불가(그림 PDF) 월보 목록을 투명하게 기록·안내하고 CropMon 화면에서는 원문 PDF 링크(`pdf_link`)로 바로 보게 하는 체계를 택했다.
+
+- **구체적 설계 및 구현:**
+  1. **쪽 단위 판정 (`20261108020000_krei_unreadable_and_page_status.sql`, `compute_page_text_stats`):**
+     - `krei.report`에 `no_text_pages smallint` 열을 추가하고 `text_status` 허용값을 `('ok', 'partial', 'no_text')`로 넓혔다.
+     - **판정 기준:** 쪽당 추출 글자 수가 **30자 미만**인 쪽을 '글자 없는 쪽'(`no_text_pages`)으로 세어:
+       - 모든 쪽이 30자 미만(`no_text_pages == pages`)이면 `'no_text'`
+       - 절반 이상이 30자 미만(`no_text_pages * 2 >= pages`)이면 `'partial'`
+       - 나머지(`no_text_pages * 2 < pages`)는 `'ok'`로 판정한다.
+     - 예: `#8703`(2026-06 과채 월보, 20쪽, 총 1,439자)은 표지(1쪽, 2자)와 마지막 쪽(20쪽, 21자)만 30자 미만이고 본문 2~19쪽은 51~127자씩 들어 있어 `no_text_pages = 2`, `text_status = 'ok'`가 된다.
+     - 2026년 1~11월 수집분(105건) 중 대상 범위(원예 4부류 + 쌀·콩·감자)의 판독 불가 월보는 총 **16건**(모두 `no_text`: 엽근채소 5~11월 7건 `#8687`·`#8705`·`#8721`·`#8731`·`#8748`·`#8769`·`#8786`, 양념채소 5~11월 7건 `#8691`·`#8696`·`#8717`·`#8727`·`#8745`·`#8763`·`#8780`, 감자 5·6월 2건 `#8693`·`#8710`)이다.
+  2. **GitHub 이슈 목록 및 자동 댓글 갱신 (이슈 #57):**
+     - `[krei] 판독 불가 월보 목록(그림 PDF)`(이슈 #57)에 대상 범위와 2026년 판독 불가 표(부류·월호·파일번호·쪽수·PDF 링크)를 등록했다.
+     - 수집기(`collectors/krei.py`)가 대상 범위(원예 4부류 + 쌀·콩·감자)에서 `no_text` 또는 `partial` 발행물을 새로 받으면 위 이슈에 부류·월호·파일번호·PDF 링크를 댓글로 자동 추가한다. 이슈가 닫혀 있더라도 다시 열지 않고 댓글만 추가한다.
+  3. **감시(`core/monitor.py`)에서 `no_text` 경고 제거:**
+     - 엽근채소·양념채소 등에서 그림 PDF가 매달 반복 발행되는 현상이므로 수집 감시(`monitor`)의 `no_text` 경고는 빼고(위 2번 이슈 댓글로 갈음), `fetch_status = 'failed'` 경고와 매달 9일 00:00 KST 이후 원예 4부류 월보 미수집 경고만 유지한다.
+  4. **공동활용 뷰 `krei_api.unreadable` 추가:**
+     - CropMon에서 해당 부류·월호의 `"원문 보기"` 안내를 바로 띄울 수 있도록, 대상 범위(원예 4부류 + 쌀·콩·감자) 중 `text_status in ('no_text', 'partial')`인 발행물의 부류·월호·파일번호·쪽수·`pdf_link`를 노출하는 `krei_api.unreadable` 뷰(`security_invoker = true`, `anon`·`authenticated`·`service_role` 조회 권한 부여)를 추가했다.
