@@ -31,11 +31,24 @@ def _item(d: dt.date, gsr=True, zero_gsr=False) -> dict:
 
 class FakeAsos:
     def __init__(
-        self, missing=(), no_gsr=("216",), fail_stn=None, nodata_years=(), zero_gsr=(), zero_days=()
+        self,
+        missing=(),
+        no_gsr=("216",),
+        fail_stn=None,
+        nodata_years=(),
+        zero_gsr=(),
+        zero_days=(),
+        gsr_calendar_days=None,
     ):
         self.missing, self.no_gsr, self.fail_stn = set(missing), set(no_gsr), fail_stn
         self.zero_gsr = set(zero_gsr)  # 이 지점은 일사가 늘 0.0 (센서 고장)
         self.zero_days = set(zero_days)  # 모든 지점에서 이 날들만 일사가 0.0
+        # {지점: n}: 이 지점은 일사가 1월 1일부터 달력 날짜 n 개(2월 29일 제외, 해마다 같은 날짜)에만 있다
+        ref = dt.date(2025, 1, 1)
+        self.gsr_calendar = {
+            s: {((ref + dt.timedelta(k)).month, (ref + dt.timedelta(k)).day) for k in range(n)}
+            for s, n in (gsr_calendar_days or {}).items()
+        }
         self.nodata_years = set(nodata_years)  # 이 해는 관측이 없다 (nodata 응답)
         self.calls: list[tuple[str, str, str]] = []  # 모든 요청 (지점, 시작, 끝)
 
@@ -64,7 +77,12 @@ class FakeAsos:
         items = [
             _item(
                 d0 + dt.timedelta(days=k),
-                gsr=stn not in self.no_gsr,
+                gsr=stn not in self.no_gsr
+                and (
+                    stn not in self.gsr_calendar
+                    or ((d0 + dt.timedelta(days=k)).month, (d0 + dt.timedelta(days=k)).day)
+                    in self.gsr_calendar[stn]
+                ),
                 zero_gsr=stn in self.zero_gsr or d0 + dt.timedelta(days=k) in self.zero_days,
             )
             for k in range((d1 - d0).days + 1)

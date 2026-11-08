@@ -2,7 +2,7 @@
 
 입력은 모두 가짜 값이다. 지점 이름·번호는 실제 관측소를 닮았지만 값은 시험용이다.
 규칙:
-  1. 일 단위: 일사가 0.02 × Ra 보다 작으면 결측으로 본다 (물리적으로 불가능한 값만 거른다)
+  1. 일 단위: 일사가 0.01 × Ra 보다 작으면 결측으로 본다 (물리적으로 불가능한 값만 거른다)
   2. 달력 월 단위: 자료가 10일 이상이고 그중 무효가 90% 이상이면 그 달 일사를 전부 무효로 본다
   3. 대체 순서: 유효한 일사 → 일조시간(식35) → 기온차(식50, kRs는 지점별) → 비움
   4. 앞 7일 평균으로 채운 날이 연속 7일을 넘으면 8일째부터 ETo를 비운다(filled = True)
@@ -16,7 +16,9 @@ from croplib_dp.core.daily_weather import StationMeta, daily_weather
 from croplib_dp.core.fao56 import eto_penman_monteith, extra_radiation, rs_from_sunshine, wind_2m
 from croplib_dp.core.radiation import (
     KRS_INLAND,
+    MIN_NORMAL_DAYS,
     clean_observed_rs,
+    has_enough_normals,
     rs_floor,
 )
 from croplib_dp.core.solar import ra_rso, rs_s1
@@ -62,8 +64,8 @@ MAY1 = dt.date(2026, 5, 1)
 
 
 # ── 1. 일 단위 규칙 ───────────────────────────────────────────────────────
-def test_floor_is_five_percent_of_extraterrestrial_radiation():
-    assert rs_floor(LAT, MAY1) == pytest.approx(0.02 * extra_radiation(LAT, _doy(MAY1)))
+def test_floor_is_one_percent_of_extraterrestrial_radiation():
+    assert rs_floor(LAT, MAY1) == pytest.approx(0.01 * extra_radiation(LAT, _doy(MAY1)))
 
 
 def test_zero_radiation_with_sunshine_equals_sunshine_only():
@@ -102,17 +104,18 @@ def test_temperature_range_krs_is_per_station_and_default_is_inland():
 
 
 def test_tiny_radiation_below_floor_is_invalid_in_august():
-    """8월 하한(0.02×Ra, 약 0.8 MJ)보다 작은 0.5 MJ 는 물리적으로 불가능 → 무효, 일조시간으로 대체"""
+    """8월 하한(0.01×Ra, 약 0.4 MJ)보다 작은 0.2 MJ 는 물리적으로 불가능 → 무효, 일조시간으로 대체"""
     day = dt.date(2026, 8, 4)
-    assert 0.5 < rs_floor(LAT, day) < 1.0
-    r = daily_weather([_item("2026-08-04", sumGsr="0.5")], STN)[0]
+    assert 0.2 < rs_floor(LAT, day) < 1.0
+    r = daily_weather([_item("2026-08-04", sumGsr="0.2")], STN)[0]
     assert r["rs_source"] == "sunshine"
 
 
 def test_heavily_overcast_day_is_kept_as_observed():
-    """흐리고 비 오는 날의 진짜 낮은 일사(Ra의 3% 안팎)는 버리지 않는다 (0.05×Ra 하한은 이것까지 버렸다)"""
+    """호우 날의 진짜 낮은 일사(Ra의 1.5%: 제주 2/24 0.39 MJ·비 55 mm 같은 날)는 버리지 않는다.
+    0.05·0.02×Ra 하한은 이것까지 버렸다"""
     day = dt.date(2026, 5, 1)
-    low = 0.03 * extra_radiation(LAT, _doy(day))
+    low = 0.015 * extra_radiation(LAT, _doy(day))
     assert low > rs_floor(LAT, day)
     r = daily_weather([_item("2026-05-01", sumGsr=f"{low:.2f}", sumRn="30.0")], STN)[0]
     assert r["rs_source"] == "observed" and r["rs_mj"] == pytest.approx(round(low, 2))
@@ -278,3 +281,28 @@ def test_values_after_a_blank_run_are_computed_normally():
     items = [_item("2026-05-01")] + [_blank(f"2026-05-{d:02d}") for d in range(2, 12)] + [_item("2026-05-12")]
     out = daily_weather(items, STN)
     assert out[-1]["filled"] is False and out[-1]["eto_mm"] == pytest.approx(_pm(20.0, dt.date(2026, 5, 12)))
+
+
+# ── 4. 지점 단위 최소 자료 규칙: 평년선의 유효 일수가 100일 미만이면 일사 미측정 지점 ──────────────
+def _normals(n_days):
+    """평년선 {(월, 일): 값} 달력 날짜 n_days 개 (2월 29일 제외)"""
+    first = dt.date(2025, 1, 1)
+    return {((first + dt.timedelta(k)).month, (first + dt.timedelta(k)).day): 10.0 for k in range(n_days)}
+
+
+def test_minimum_normal_days_is_100():
+    assert MIN_NORMAL_DAYS == 100
+
+
+def test_yeongju_like_one_normal_day_is_not_measuring():
+    assert has_enough_normals(_normals(1)) is False
+    assert has_enough_normals({}) is False
+
+
+def test_new_station_like_244_normal_days_is_measuring():
+    assert has_enough_normals(_normals(244)) is True
+
+
+def test_normal_days_boundary_99_is_not_and_100_is():
+    assert has_enough_normals(_normals(99)) is False
+    assert has_enough_normals(_normals(100)) is True
