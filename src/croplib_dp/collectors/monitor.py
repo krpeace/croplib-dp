@@ -21,7 +21,9 @@ from croplib_dp.io.github_issue import IssueAlerts, Request, http_request
 DRILL_TITLE = "[수집 경고] 알림 연습 (실제 문제 아님)"
 DRILL_LABEL = "수집 경고 연습"
 RUN_COLS = "run_at,run_name,stn_id,started_at,finished_at,result,on_time,error"
-KREI_COLS = "file_id,yyyy,mm,ovr_item_code,item_name,report_type,fetch_status,fetch_error"
+KREI_COLS = (
+    "file_id,yyyy,mm,ovr_item_code,item_name,report_type,fetch_status,fetch_error,text_chars,text_status"
+)
 
 
 def read_krei_reports(base: str, key: str, http: RestGet = rest_get, now=None) -> list[dict]:

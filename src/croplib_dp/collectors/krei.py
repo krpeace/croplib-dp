@@ -9,8 +9,12 @@ r"""KREI 농업관측 수집기 1단계: 품목분류·발행물 목록·글자 
      - `write=false`(시험 실행)이면 PDF 는 표본 1건만 받고 끝낸다.
      - 시간 예산(기본 25분, `--budget-minutes` 또는 `KREI_BUDGET_MINUTES`)이 지나면 새 PDF 를 시작하지 않고
        정상 종료하며, 요약에 `"남은 N건, 다음 실행에서 이어 받음"`을 남긴다.
+     - 추출한 글자 수(`text_chars`)가 쪽당 50자 미만이면 `text_status = 'no_text'`(그림·윤곽선 PDF),
+       50자 이상이면 `'ok'`로 기록하되 `fetch_status`는 `'fetched'`로 둔다.
      - PDF 1건을 처리할 때마다 바로 글자 좌표(`pages.json.gz`) 업로드와 `krei.report` 행 upsert,
        그리고 `out/` 요약 파일 갱신을 끝내 중간에 취소돼도 이미 받은 건이 남게 한다.
+  4. `--backfill-text-status` 옵션을 주면 PDF 를 다시 받지 않고 Storage 의 `pages.json.gz` 만 읽어
+     기존 `fetched` 행의 `text_chars`·`text_status` 를 채운다.
 """
 
 import argparse
@@ -25,6 +29,8 @@ from typing import Any
 from croplib_dp.collectors.water import Clock, RunLog, _env, _iso
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.krei import (
+    compute_text_stats,
+    decompress_pages_json,
     default_months,
     list_storage_path,
     months_between,
@@ -58,7 +64,7 @@ class KreiResult:
     reports: list[dict[str, Any]] = field(default_factory=list)
     listed_count: int = 0  # 조회된 달 전체 고유 발행물 건수
     list_counts: dict[str, int] = field(default_factory=dict)  # "2026-11 monthly" -> 건수
-    fetched: list[dict[str, Any]] = field(default_factory=list)  # 새로 받은 건 요약
+    fetched: list[dict[str, Any]] = field(default_factory=list)  # 새로 받은(또는 다시 채운) 건 요약
     failed_reports: list[dict[str, Any]] = field(default_factory=list)  # 실패한 건 요약
     skipped_count: int = 0  # 이미 fetched 라 건너뛴 건수
     remaining_count: int = 0  # 시간 예산 도달로 다음 실행에 이어 받을 건수
@@ -83,6 +89,19 @@ def read_existing(
     reports = read_table(base_url, key, "report", http=http, query="select=*", schema=KREI_SCHEMA)
     by_id = {int(r["file_id"]): r for r in reports if r.get("file_id") is not None}
     return items, by_id
+
+
+def read_storage_bytes(base_url: str, key: str, bucket: str, path: str, http: RestGet = rest_get) -> bytes:
+    """Supabase Storage 에서 객체 바이트를 읽는다."""
+    url = f"{base_url.rstrip('/')}/storage/v1/object/{bucket}/{path.lstrip('/')}"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    status, body = http(url, headers)
+    if status != 200:
+        text = (
+            body.decode("utf-8", "replace")[:200] if isinstance(body, bytes | bytearray) else str(body)[:200]
+        )
+        raise RuntimeError(f"Storage {bucket}/{path} 읽기 실패: HTTP {status} {text}")
+    return body
 
 
 def resolve_months(
@@ -190,6 +209,8 @@ def _persist_one_report(
             rep["fetch_status"] = "failed"
             rep["fetch_error"] = err
             rep["text_path"] = None
+            rep["text_chars"] = None
+            rep["text_status"] = None
             r.problems.append(f"#{rep['file_id']} {rep['item_name']}: {err}")
             r.failed_reports.append(
                 dict(
@@ -312,6 +333,8 @@ def run(
                     issue_no=prev.get("issue_no"),
                     pub_date=prev.get("pub_date"),
                     text_path=prev.get("text_path"),
+                    text_chars=prev.get("text_chars"),
+                    text_status=prev.get("text_status"),
                     fetch_status="fetched",
                     fetch_error=None,
                     parse_status=prev.get("parse_status") or "pending",
@@ -369,6 +392,8 @@ def run(
                 issue_no=None,
                 pub_date=None,
                 text_path=None,
+                text_chars=None,
+                text_status=None,
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
                 parse_status="pending",
@@ -414,6 +439,8 @@ def run(
                 issue_no=None,
                 pub_date=None,
                 text_path=None,
+                text_chars=None,
+                text_status=None,
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
                 parse_status="pending",
@@ -428,6 +455,10 @@ def run(
 
         t_path = text_storage_path(item["ovr_item_code"], item["yyyy"], item["mm"], file_id)
         gz_bytes = ext["gz_bytes"]
+        text_chars = ext.get("text_chars")
+        text_status = ext.get("text_status")
+        if text_chars is None or text_status is None:
+            text_chars, text_status = compute_text_stats(ext.get("pages_data") or ())
         r.text_files[t_path] = gz_bytes
         r.fetched.append(
             dict(
@@ -442,6 +473,8 @@ def run(
                 gz_bytes=len(gz_bytes),
                 issue_no=ext["issue_no"],
                 pub_date=ext["pub_date"],
+                text_chars=text_chars,
+                text_status=text_status,
             )
         )
         rep_row = dict(
@@ -464,6 +497,8 @@ def run(
             issue_no=ext["issue_no"],
             pub_date=ext["pub_date"],
             text_path=t_path,
+            text_chars=text_chars,
+            text_status=text_status,
             fetch_status="fetched",
             fetch_error=None,
             parse_status="pending",
@@ -472,6 +507,86 @@ def run(
         r.reports.append(rep_row)
         if writer is not None:
             _persist_one_report(r, writer, rep_row, gz_bytes=gz_bytes)
+        if out_dir is not None:
+            write_outputs(r, out_dir)
+
+    if out_dir is not None:
+        write_outputs(r, out_dir)
+    return r
+
+
+def backfill_text_status(
+    base_url: str,
+    key: str,
+    *,
+    http: RestGet = rest_get,
+    writer: Any | None = None,
+    clock: Clock | None = None,
+    force: bool = False,
+    out_dir: Path | None = None,
+) -> KreiResult:
+    """이미 fetched 인 보고서들의 Storage pages.json.gz 를 읽어 text_chars·text_status 를 채운다.
+    원본 PDF 를 다시 받지 않는다."""
+    clock = clock or Clock()
+    now_iso = _iso(clock.now()) or ""
+    existing_items, existing_reports = read_existing(base_url, key, http=http)
+    months_seen = sorted({(int(rep["yyyy"]), int(rep["mm"])) for rep in existing_reports.values()})
+    r = KreiResult(months=months_seen, items=existing_items, listed_count=len(existing_reports))
+
+    for file_id in sorted(existing_reports):
+        rep = dict(existing_reports[file_id])
+        if rep.get("fetch_status") != "fetched" or not rep.get("text_path"):
+            r.skipped_count += 1
+            r.reports.append(rep)
+            continue
+        if not force and rep.get("text_status") in ("ok", "no_text") and rep.get("text_chars") is not None:
+            r.skipped_count += 1
+            r.reports.append(rep)
+            continue
+        try:
+            gz_bytes = read_storage_bytes(base_url, key, STORAGE_BUCKET, str(rep["text_path"]), http=http)
+            pages_data = decompress_pages_json(gz_bytes)
+            text_chars, text_status = compute_text_stats(pages_data)
+        except Exception as e:
+            err = f"pages.json.gz 읽기·해석 실패: {type(e).__name__}: {str(e)[:200]}"
+            r.problems.append(f"#{file_id} {rep.get('item_name')}: {err}")
+            r.failed_reports.append(
+                dict(
+                    file_id=file_id,
+                    item_name=rep.get("item_name") or "",
+                    report_type=rep.get("report_type") or "",
+                    error=err,
+                )
+            )
+            r.reports.append(rep)
+            continue
+
+        rep["text_chars"] = text_chars
+        rep["text_status"] = text_status
+        if rep.get("pages") is None and pages_data:
+            rep["pages"] = len(pages_data)
+        rep["updated_at"] = _iso(clock.now()) or now_iso
+        r.reports.append(rep)
+        r.fetched.append(
+            dict(
+                file_id=file_id,
+                yyyy=int(rep["yyyy"]),
+                mm=int(rep["mm"]),
+                ovr_item_code=str(rep["ovr_item_code"]),
+                item_name=str(rep["item_name"]),
+                report_type=str(rep["report_type"]),
+                pages=rep.get("pages") or len(pages_data),
+                pdf_bytes=int(rep.get("pdf_bytes") or 0),
+                gz_bytes=len(gz_bytes),
+                issue_no=rep.get("issue_no"),
+                pub_date=rep.get("pub_date"),
+                text_chars=text_chars,
+                text_status=text_status,
+            )
+        )
+        if writer is not None:
+            r._persisted_incrementally = True
+            _persist_one_report(r, writer, rep)
         if out_dir is not None:
             write_outputs(r, out_dir)
 
@@ -510,6 +625,8 @@ def publish(r: KreiResult, writer: Any) -> KreiResult:
             rep["fetch_status"] = "failed"
             rep["fetch_error"] = err
             rep["text_path"] = None
+            rep["text_chars"] = None
+            rep["text_status"] = None
             r.problems.append(f"#{rep['file_id']} {rep['item_name']}: {err}")
             r.failed_reports.append(
                 dict(
@@ -532,14 +649,17 @@ def publish(r: KreiResult, writer: Any) -> KreiResult:
 
 
 def brief_text(r: KreiResult) -> str:
-    """실행 요약: 조회한 달, 목록 건수, 새로 받은 건(부류·종류·파일번호·쪽수·크기), 남은 건, 실패 건."""
-    ym_str = ", ".join(f"{y:04d}-{m:02d}" for y, m in r.months)
+    """실행 요약: 조회한 달, 목록·새로 받은 건, 글자 없음(그림 PDF), 남은 건, 실패 건."""
+    ym_str = ", ".join(f"{y:04d}-{m:02d}" for y, m in r.months) or "전체"
     total_listed = r.listed_count if r.listed_count else len(r.reports)
+    no_text_fetched = [f for f in r.fetched if f.get("text_status") == "no_text"]
+    no_text_note = f", 글자 없음(그림 PDF) {len(no_text_fetched)}건" if no_text_fetched else ""
     lines = [
         f"# KREI 농업관측 수집 ({ym_str}, 계산 {CALC_VERSION})",
         f"- 조회한 달: {ym_str}",
         f"- 품목분류: {len(r.items)}건 · 목록: {total_listed}건 "
-        f"(새로 받음 {len(r.fetched)}건 · 기존 건너뜀 {r.skipped_count}건 · 실패 {len(r.failed_reports)}건)",
+        f"(새로 받음 {len(r.fetched)}건{no_text_note} · "
+        f"기존 건너뜀 {r.skipped_count}건 · 실패 {len(r.failed_reports)}건)",
     ]
     if r.remaining_count > 0:
         lines.append(f"- 남은 {r.remaining_count}건, 다음 실행에서 이어 받음")
@@ -553,12 +673,27 @@ def brief_text(r: KreiResult) -> str:
         for f in r.fetched:
             kb = f["gz_bytes"] / 1024
             mb = f["pdf_bytes"] / 1e6
+            chars = f.get("text_chars")
+            status = f.get("text_status")
+            char_str = ""
+            if chars is not None:
+                if status == "no_text":
+                    char_str = f" · 글자 {chars}자 [글자 없음(그림 PDF)]"
+                else:
+                    char_str = f" · 글자 {chars:,}자"
             meta = ""
             if f.get("issue_no") or f.get("pub_date"):
                 meta = f" (통권 {f.get('issue_no') or '-'}호, 발행 {f.get('pub_date') or '-'})"
             lines.append(
                 f"- {f['yyyy']:04d}-{f['mm']:02d} {f['item_name']} · {f['report_type']} · "
-                f"#{f['file_id']} · {f['pages']}쪽 · PDF {mb:.2f}MB → 좌표 {kb:.1f}KB{meta}"
+                f"#{f['file_id']} · {f['pages']}쪽 · PDF {mb:.2f}MB → 좌표 {kb:.1f}KB{char_str}{meta}"
+            )
+    if no_text_fetched:
+        lines.append("\n## 글자 없음(그림 PDF)")
+        for f in no_text_fetched:
+            lines.append(
+                f"- {f['yyyy']:04d}-{f['mm']:02d} {f['item_name']} · {f['report_type']} · "
+                f"#{f['file_id']} · {f['pages']}쪽 · 글자 {f.get('text_chars') or 0}자"
             )
     if r.failed_reports:
         lines.append("\n## 실패 건")
@@ -619,11 +754,34 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="시간 예산(분, 기본 25분 또는 환경변수 KREI_BUDGET_MINUTES)",
     )
+    p.add_argument(
+        "--backfill-text-status",
+        action="store_true",
+        help="PDF를 다시 받지 않고 Storage의 pages.json.gz를 읽어 text_chars·text_status를 채움",
+    )
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase DB·Storage에 쓰기")
     a = p.parse_args(argv)
 
     clock = Clock()
+    out_path = Path(a.out)
+
+    if a.backfill_text_status:
+        sb_url = _env("SUPABASE_URL")
+        sb_key = _env("SUPABASE_SERVICE_ROLE_KEY")
+        writer = None
+        if a.write:
+            from croplib_dp.io.supabase_write import SupabaseWriter
+
+            writer = SupabaseWriter(sb_url, sb_key)
+        r = backfill_text_status(sb_url, sb_key, writer=writer, clock=clock, out_dir=out_path)
+        if not a.write:
+            r.problems += check(r)
+        out = write_outputs(r, out_path)
+        print(brief_text(r))
+        print(f"결과 폴더: {out}")
+        return 1 if r.failed else 0
+
     months = resolve_months(clock, yyyy=a.yyyy, mm=a.mm, from_ym=a.from_ym, to_ym=a.to_ym)
     budget_minutes = resolve_budget_minutes(a.budget_minutes)
 
@@ -648,7 +806,6 @@ def main(argv: list[str] | None = None) -> int:
 
         writer = SupabaseWriter(sb_url, sb_key)
 
-    out_path = Path(a.out)
     r = run(
         months=months,
         existing_items=existing_items,
