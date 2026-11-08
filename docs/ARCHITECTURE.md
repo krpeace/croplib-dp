@@ -58,7 +58,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 
 - 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 기본 대상이 `has_forecast` 지점뿐이라 예보 없는 지점은 `--stations`로 따로 지정했을 때만 돌고, 그때는 관측 물수지만 계산하며 ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다. 수집 지점이 0곳이면 회차를 실패로 남긴다.
 - 서버는 받은 예보를 쌓아 두지 않는다. 그래서 하루 넘게 지난 관측 결측일은 예보로 채우지 못하고 앞 7일 평균이 된다(연속 7일까지만, 8일째부터 ETo를 비운다). 물3에서 예보 원자료를 Storage에 쌓으면 현장 PC처럼 채운다.
-- 일사(Rs)는 `core/radiation.py` 규칙으로 고른다(결정 0020): 0.05×Ra보다 작은 값은 무효, 한 달(자료 10일 이상) 무효가 90% 이상이면 그 달 전체 무효 → 유효한 관측 일사 → 일조시간(식35) → 기온차(식50, `StationMeta.krs` 기본 0.16) → 비움. 어느 방식을 썼는지는 계산 결과의 `rs_source`에 있다(DB에는 아직 안 올림). 적산일사(`sun_daily`)는 관측 일사만 쓰고, 걸러진 날은 비운다.
+- 일사(Rs)는 `core/radiation.py` 규칙으로 고른다(결정 0020): 0.02×Ra보다 작은 값(0.0 등)은 무효, 한 달(자료 10일 이상) 무효가 90% 이상이면 그 달 전체 무효 → 유효한 관측 일사 → 일조시간(식35) → 기온차(식50, `StationMeta.krs` 기본 0.16) → 비움. 어느 방식을 썼는지는 계산 결과의 `rs_source`에 있다(DB에는 아직 안 올림). 적산일사(`sun_daily`)는 관측 일사만 쓰고, 걸러진 날은 비운다.
 - 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--soil-backfill] [--out out]`. 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
 - ASOS 조회가 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 세 번 더 시도한다. 시험 실행에서 공공데이터포털이 몇 분 동안 모든 요청에 응답하지 않은 적이 두 번 있었다.
 - 시험 실행: GitHub Actions → `collect-dryrun` → Run workflow. 손으로 누를 때만 돌고, 결과 파일은 그 실행의 Artifacts(7일 보관)에 올라간다. 요약과 오류는 실행의 알림(annotation)에도 남겨, API로 결과를 확인할 수 있다.

@@ -6,7 +6,7 @@ core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Sup
   올해 구간이 거꾸로(시작 > 끝)라서 올해는 평년선만 만들고, 작년 12/31 값을 채운다 (이슈 #40, 결정 0018).
 - 기준온도는 작물 사전 crops.t_base_c (표준값 층). 비어 있으면 그 작물은 계산하지 않고 문제로 남긴다.
 - 일사를 재지 않는 지점(sumGsr 가 하나도 없음)은 sun_daily 줄을 만들지 않는다.
-- sun_daily 는 관측 일사만 쓴다. 0.05×Ra 보다 작은 값과 한 달 대부분이 무효인 달의 값은 비우고,
+- sun_daily 는 관측 일사만 쓴다. 0.02×Ra 보다 작은 값과 한 달 대부분이 무효인 달의 값은 비우고,
   일조시간·기온차 추정값은 섞지 않는다(결정 0020). 값은 있었는데 모두 걸러진 지점(일사가 늘 0.0 인
   센서 고장)은, DB 에 이미 올라간 옛 줄을 지우지 않고 같은 키로 값을 비운 줄을 올려 덮어쓴다(삭제 없음).
 - 한 지점이 끝내 받지 못하면 그 지점만 빼고, 회차를 실패로 남긴다(조용히 넘어가지 않음).
@@ -125,7 +125,7 @@ def _empty_sun_rows(stn_id: str, year: int, nf: int, nt: int) -> list[dict]:
 def build_station(
     stn_id: str, items: list[dict], crops: dict[str, float], year: int, nf: int, nt: int, lat: float
 ):
-    """한 지점의 ASOS 일자료 → (heat 줄, sun 줄, 요약). lat 는 일사 하한(0.05×Ra)을 구하는 데 쓴다."""
+    """한 지점의 ASOS 일자료 → (heat 줄, sun 줄, 요약). lat 는 일사 하한(0.02×Ra)을 구하는 데 쓴다."""
     by_day = {d: it for it in items if (d := _date(it)) is not None}
     temp_days = [
         d for d, it in by_day.items() if num(it.get("maxTa")) is not None and num(it.get("minTa")) is not None
