@@ -55,7 +55,7 @@ def make_test_pdf(words_on_page: list[str] | None = None) -> bytes:
             "3일",
             "발행",
             "과일",
-            "농업관측센터월보사과배단감감귤포도복숭아출하량전년대비증가전망생육양호",
+            "농업관측센터월보사과배단감감귤포도복숭아출하량전년대비증가전망생육양호" * 6,
         ]
     charset: list[str] = []
     for w in words_on_page:
@@ -750,22 +750,22 @@ def test_compute_page_text_stats_and_no_text_summary():
     def _page(n_chars: int) -> dict:
         return {"w": 595, "h": 842, "words": [[0, 0, 10, 10, "가" * n_chars]] if n_chars else []}
 
-    # 1쪽 29자(<30자) → no_text_pages=1, no_text / 1쪽 30자(>=30자) → no_text_pages=0, ok
-    assert compute_page_text_stats([_page(29)]) == (29, 1, "no_text")
-    assert compute_page_text_stats([_page(30)]) == (30, 0, "ok")
-    assert compute_text_stats([_page(29)]) == (29, "no_text")
-    assert compute_text_stats([_page(30)]) == (30, "ok")
+    # 1쪽 199자(<200자) → no_text_pages=1, no_text / 1쪽 200자(>=200자) → no_text_pages=0, ok
+    assert compute_page_text_stats([_page(199)]) == (199, 1, "no_text")
+    assert compute_page_text_stats([_page(200)]) == (200, 0, "ok")
+    assert compute_text_stats([_page(199)]) == (199, "no_text")
+    assert compute_text_stats([_page(200)]) == (200, "ok")
 
-    # 4쪽 중 4쪽 모두 <30자 → no_text
-    assert compute_page_text_stats([_page(0), _page(10), _page(29), _page(0)]) == (39, 4, "no_text")
-    # 4쪽 중 2쪽(절반 이상) <30자 → partial
-    assert compute_page_text_stats([_page(0), _page(29), _page(30), _page(100)]) == (159, 2, "partial")
-    # 4쪽 중 1쪽(절반 미만) <30자 → ok
-    assert compute_page_text_stats([_page(0), _page(30), _page(50), _page(100)]) == (180, 1, "ok")
+    # 4쪽 중 4쪽 모두 <200자 → no_text
+    assert compute_page_text_stats([_page(0), _page(50), _page(199), _page(0)]) == (249, 4, "no_text")
+    # 4쪽 중 2쪽(절반 이상) <200자 → partial
+    assert compute_page_text_stats([_page(0), _page(199), _page(200), _page(600)]) == (999, 2, "partial")
+    # 4쪽 중 1쪽(절반 미만) <200자 → ok
+    assert compute_page_text_stats([_page(120), _page(200), _page(500), _page(800)]) == (1620, 1, "ok")
 
-    # #8703 (2026-06 과채 월보) 실제 분포: 20쪽 중 2쪽만 <30자 (2자, 21자), 나머지 18쪽은 51~127자 → ok
+    # #8703 (2026-06 과채 월보) 실제 분포: 20쪽 모두 2~127자(<200자) → no_text_pages=20, no_text
     p8703_counts = [2, 63, 86, 70, 95, 64, 127, 64, 90, 68, 96, 65, 91, 69, 89, 68, 88, 51, 72, 21]
-    assert compute_page_text_stats([_page(c) for c in p8703_counts]) == (1439, 2, "ok")
+    assert compute_page_text_stats([_page(c) for c in p8703_counts]) == (1439, 20, "no_text")
 
     # 글자 0개인 그림·윤곽선 PDF → fetched, no_text_pages=1, text_status='no_text', 요약에 표시됨
     empty_pdf = make_test_pdf([])
@@ -786,12 +786,12 @@ def test_compute_page_text_stats_and_no_text_summary():
 
 def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Path):
     clock = FakeClock("2026-11-08 10:00:00")
-    ok_gz = compress_pages_json([{"w": 595.3, "h": 841.9, "words": [[10, 10, 50, 20, "가" * 120]]}])
+    ok_gz = compress_pages_json([{"w": 595.3, "h": 841.9, "words": [[10, 10, 50, 20, "가" * 500]]}])
     empty_gz = compress_pages_json([{"w": 595.3, "h": 841.9, "words": []}])
     partial_gz = compress_pages_json(
         [
-            {"w": 595.3, "h": 841.9, "words": []},
             {"w": 595.3, "h": 841.9, "words": [[10, 10, 50, 20, "가" * 80]]},
+            {"w": 595.3, "h": 841.9, "words": [[10, 10, 50, 20, "가" * 600]]},
         ]
     )
 
@@ -817,7 +817,7 @@ def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Pa
             issue_no=1422,
             pub_date="2026-11-03",
             text_path="text/OVR0000000013/2026/11/8778.pages.json.gz",
-            text_chars=120,
+            text_chars=500,
             no_text_pages=None,
             text_status="ok",
             fetch_status="fetched",
@@ -920,15 +920,31 @@ def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Pa
     assert all("aglook.krei.re.kr" not in u for u in get_urls)
     assert len(upserted) == 3
     by_id = {row["file_id"]: row for row in upserted}
-    assert by_id[8778]["text_chars"] == 120
+    assert by_id[8778]["text_chars"] == 500
     assert by_id[8778]["no_text_pages"] == 0
     assert by_id[8778]["text_status"] == "ok"
     assert by_id[8780]["text_chars"] == 0
     assert by_id[8780]["no_text_pages"] == 1
     assert by_id[8780]["text_status"] == "no_text"
-    assert by_id[8779]["text_chars"] == 80
+    assert by_id[8779]["text_chars"] == 680
     assert by_id[8779]["no_text_pages"] == 1
     assert by_id[8779]["text_status"] == "partial"
+
+    # 이미 no_text_pages까지 채워진 행이라도 force=True 면 전체를 다시 계산한다
+    db_reports = list(by_id.values())
+    db_reports[0]["no_text_pages"] = 99
+    upserted.clear()
+    r_force = K.backfill_text_status(
+        "https://x.supabase.co",
+        "srv",
+        http=fake_rest_get,
+        writer=writer,
+        clock=clock,
+        force=True,
+    )
+    assert not r_force.failed
+    assert len(upserted) == 3
+    assert next(row for row in upserted if row["file_id"] == 8778)["no_text_pages"] == 0
 
 
 def test_notify_unreadable_issue_comments_for_in_scope_and_never_reopens_closed_issue():

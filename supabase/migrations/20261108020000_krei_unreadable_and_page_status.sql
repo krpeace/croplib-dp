@@ -1,6 +1,6 @@
 -- 목적: KREI 판독 불가(그림 PDF) 쪽 단위 판정 열(no_text_pages), text_status 'partial' 허용,
 --       그리고 외부(CropMon 등)에서 판독 불가 원문 안내에 쓸 공개 뷰(krei_api.unreadable) 추가.
---   - no_text_pages: 쪽당 글자 30자 미만인 쪽 수 (smallint)
+--   - no_text_pages: 쪽당 글자 200자 미만인 쪽 수 (smallint)
 --   - text_status: 전부 글자 없으면 'no_text', 절반 이상이면 'partial', 나머지 'ok'
 --   - krei_api.unreadable: 대상 범위(원예 4부류 + 쌀·콩·감자) 중 'no_text'·'partial'인 건의
 --     부류·월호·파일번호·pdf_link 목록

@@ -27,8 +27,7 @@ GRAIN_ITEMS: dict[str, str] = {
 UNREADABLE_SCOPE_ITEMS: dict[str, str] = {**HORT_MONTH_ITEMS, **GRAIN_ITEMS}
 NO_TEXT_WARN_ITEMS: dict[str, str] = UNREADABLE_SCOPE_ITEMS
 UNREADABLE_ISSUE_TITLE = "[krei] 판독 불가 월보 목록(그림 PDF)"
-MIN_CHARS_PER_PAGE = 30
-_UNUSED_CLOSE = {}
+MIN_CHARS_PER_PAGE = 200
 
 _FILE_ID_RE = re.compile(r"/download/(\d+)(?:/|$)")
 _ISSUE_NO_RE = re.compile(r"통권\s*제\s*(\d+)\s*호")
@@ -337,7 +336,7 @@ def decompress_pages_json(gz_bytes: bytes) -> list[dict[str, Any]]:
 def compute_page_text_stats(pages: Iterable[Mapping[str, Any]]) -> tuple[int, int, str]:
     """쪽별 단어 좌표 목록(pages)에서 (전체 글자 수 text_chars, 글자 없는 쪽 수 no_text_pages,
     상태 'ok' | 'partial' | 'no_text')를 계산한다.
-    - 쪽당 글자 30자(`MIN_CHARS_PER_PAGE`) 미만인 쪽을 '글자 없는 쪽'(`no_text_pages`)으로 센다.
+    - 쪽당 글자 200자(`MIN_CHARS_PER_PAGE`) 미만인 쪽을 '글자 없는 쪽'(`no_text_pages`)으로 센다.
     - 모든 쪽이 글자 없는 쪽이면 'no_text', 절반 이상(`no_text_pages * 2 >= n_pages`)이면 'partial',
       나머지는 'ok'로 판정한다."""
     page_list = list(pages)

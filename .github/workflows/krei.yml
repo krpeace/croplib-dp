@@ -34,7 +34,7 @@ on:
         required: false
         default: "25"
       backfill_text_status:
-        description: "Storage의 pages.json.gz를 읽어 기존 fetched 행의 text_chars·no_text_pages·text_status만 채우기"
+        description: "Storage의 pages.json.gz를 읽어 기존 fetched 행 전체의 text_chars·no_text_pages·text_status 다시 계산(--force)"
         type: boolean
         default: false
 
@@ -76,7 +76,7 @@ jobs:
           if [ -n "$FROM_YM" ]; then args+=(--from "$FROM_YM"); fi
           if [ -n "$TO_YM" ]; then args+=(--to "$TO_YM"); fi
           if [ -n "$KREI_BUDGET_MINUTES" ]; then args+=(--budget-minutes "$KREI_BUDGET_MINUTES"); fi
-          if [ "$BACKFILL_TEXT_STATUS" = "true" ]; then args+=(--backfill-text-status); fi
+          if [ "$BACKFILL_TEXT_STATUS" = "true" ]; then args+=(--backfill-text-status --force); fi
           if [ "$WRITE" = "true" ]; then args+=(--write); fi
           set +e
           for attempt in 1 2; do

@@ -9,7 +9,7 @@ r"""KREI 농업관측 수집기 1단계: 품목분류·발행물 목록·글자 
      - `write=false`(시험 실행)이면 PDF 는 표본 1건만 받고 끝낸다.
      - 시간 예산(기본 25분, `--budget-minutes` 또는 `KREI_BUDGET_MINUTES`)이 지나면 새 PDF 를 시작하지 않고
        정상 종료하며, 요약에 `"남은 N건, 다음 실행에서 이어 받음"`을 남긴다.
-     - 쪽당 글자 30자 미만인 쪽을 `no_text_pages`로 세어 전부면 `text_status = 'no_text'`,
+     - 쪽당 글자 200자 미만인 쪽을 `no_text_pages`로 세어 전부면 `text_status = 'no_text'`,
        절반 이상이면 `'partial'`, 나머지는 `'ok'`로 기록하되 `fetch_status`는 `'fetched'`로 둔다.
      - PDF 1건을 처리할 때마다 바로 글자 좌표(`pages.json.gz`) 업로드와 `krei.report` 행 upsert,
        그리고 `out/` 요약 파일 갱신을 끝내 중간에 취소돼도 이미 받은 건이 남게 한다.
@@ -818,6 +818,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Storage의 pages.json.gz를 읽어 text_chars·no_text_pages·text_status를 채움",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="--backfill-text-status 실행 시 이미 값이 채워진 행도 전체 다시 계산",
+    )
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase DB·Storage에 쓰기")
     a = p.parse_args(argv)
@@ -833,7 +838,7 @@ def main(argv: list[str] | None = None) -> int:
             from croplib_dp.io.supabase_write import SupabaseWriter
 
             writer = SupabaseWriter(sb_url, sb_key)
-        r = backfill_text_status(sb_url, sb_key, writer=writer, clock=clock, out_dir=out_path)
+        r = backfill_text_status(sb_url, sb_key, writer=writer, clock=clock, force=a.force, out_dir=out_path)
         if not a.write:
             r.problems += check(r)
         out = write_outputs(r, out_path)
