@@ -42,12 +42,24 @@ TS = pd.Timestamp
 
 def make_test_pdf(words_on_page: list[str] | None = None) -> bytes:
     """외부 글꼴 없이 pdfplumber 가 쪽 크기·단어 좌표·한국어 글자를 뽑을 수 있는 시험용 PDF 생성."""
-    words_on_page = words_on_page or ["통권", "제312호", "2026년", "11월", "3일", "발행", "과일"]
+    if words_on_page is None:
+        words_on_page = [
+            "통권",
+            "제312호",
+            "2026년",
+            "11월",
+            "3일",
+            "발행",
+            "과일",
+            "농업관측센터월보사과배단감감귤포도복숭아출하량전년대비증가전망생육양호",
+        ]
     charset: list[str] = []
     for w in words_on_page:
         for ch in w:
             if ch not in charset:
                 charset.append(ch)
+    if not charset:
+        charset = [" "]
     code_of = {ch: i + 33 for i, ch in enumerate(charset)}
     bfchar = [f"<{code:02X}> <{ch.encode('utf-16-be').hex().upper()}>" for ch, code in code_of.items()]
     cmap = (
@@ -744,3 +756,253 @@ def test_dry_run_write_false_fetches_at_most_one_pdf(tmp_path: Path, monkeypatch
     assert K.resolve_budget_minutes("40") == 40.0
     with pytest.raises(ValueError, match="0보다 커야"):
         K.resolve_budget_minutes(0)
+
+
+# ── 11. 글자 없음(no_text) 판정·소급 채우기·감시 경고 1회 ───────────────────
+def test_compute_text_stats_and_no_text_summary():
+    from croplib_dp.core.krei import compute_text_stats
+
+    # 1쪽 49자 → no_text, 1쪽 50자 → ok
+    assert compute_text_stats([{"w": 595, "h": 842, "words": [[0, 0, 10, 10, "가" * 49]]}]) == (
+        49,
+        "no_text",
+    )
+    assert compute_text_stats([{"w": 595, "h": 842, "words": [[0, 0, 10, 10, "가" * 50]]}]) == (50, "ok")
+    # 2쪽 합계 99자(쪽당 49.5자) → no_text, 2쪽 합계 100자(쪽당 50자) → ok
+    assert compute_text_stats(
+        [
+            {"w": 595, "h": 842, "words": [[0, 0, 10, 10, "가" * 50]]},
+            {"w": 595, "h": 842, "words": [[0, 0, 10, 10, "나" * 49]]},
+        ]
+    ) == (99, "no_text")
+    assert compute_text_stats(
+        [
+            {"w": 595, "h": 842, "words": [[0, 0, 10, 10, "가" * 50]]},
+            {"w": 595, "h": 842, "words": [[0, 0, 10, 10, "나" * 50]]},
+        ]
+    ) == (100, "ok")
+
+    # 글자 0개인 그림·윤곽선 PDF → fetch_status='fetched', text_status='no_text', 요약에 표시됨
+    empty_pdf = make_test_pdf([])
+    clock = FakeClock("2026-11-07 20:40:00")
+    http = FakeKreiHttp(pdf_bytes=empty_pdf)
+    r = K.run(months=[(2026, 11)], http=http, clock=clock, write=False)
+    assert not r.failed
+    assert len(r.fetched) == 1
+    rep = r.reports[0]
+    assert rep["fetch_status"] == "fetched"
+    assert rep["text_chars"] == 0
+    assert rep["text_status"] == "no_text"
+    summary = K.brief_text(r)
+    assert "글자 없음(그림 PDF)" in summary
+    assert "## 글자 없음(그림 PDF)" in summary
+
+
+def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Path):
+    clock = FakeClock("2026-11-08 10:00:00")
+    ok_gz = compress_pages_json([{"w": 595.3, "h": 841.9, "words": [[10, 10, 50, 20, "가" * 120]]}])
+    empty_gz = compress_pages_json([{"w": 595.3, "h": 841.9, "words": []}])
+
+    db_reports = [
+        dict(
+            file_id=8778,
+            api="monthly",
+            report_type="월보",
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000013",
+            prt_ovr_item_code="OVR0000000093",
+            item_name="과일",
+            pdf_link="https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/download/8778/ORGTEXT_FILE",
+            reg_at="2026-11-03T15:10:04+09:00",
+            mod_at=None,
+            description=None,
+            first_seen_at="2026-11-07T20:40:00+09:00",
+            pdf_sha256="a" * 64,
+            pdf_bytes=8000000,
+            pages=1,
+            issue_no=1422,
+            pub_date="2026-11-03",
+            text_path="text/OVR0000000013/2026/11/8778.pages.json.gz",
+            text_chars=None,
+            text_status=None,
+            fetch_status="fetched",
+            fetch_error=None,
+            parse_status="pending",
+            updated_at="2026-11-07T20:40:00+09:00",
+        ),
+        dict(
+            file_id=8780,
+            api="monthly",
+            report_type="월보",
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000036",
+            prt_ovr_item_code="OVR0000000093",
+            item_name="양념채소",
+            pdf_link="https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000036/download/8780/ORGTEXT_FILE",
+            reg_at="2026-11-03T15:10:04+09:00",
+            mod_at=None,
+            description=None,
+            first_seen_at="2026-11-07T20:40:00+09:00",
+            pdf_sha256="b" * 64,
+            pdf_bytes=4000000,
+            pages=1,
+            issue_no=None,
+            pub_date=None,
+            text_path="text/OVR0000000036/2026/11/8780.pages.json.gz",
+            text_chars=None,
+            text_status=None,
+            fetch_status="fetched",
+            fetch_error=None,
+            parse_status="pending",
+            updated_at="2026-11-07T20:40:00+09:00",
+        ),
+    ]
+
+    get_urls: list[str] = []
+
+    def fake_rest_get(url: str, headers: dict) -> tuple[int, bytes]:
+        get_urls.append(url)
+        if "/rest/v1/item" in url:
+            return 200, b"[]"
+        if "/rest/v1/report" in url:
+            return 200, json.dumps(db_reports).encode("utf-8")
+        if url.endswith("8778.pages.json.gz"):
+            return 200, ok_gz
+        if url.endswith("8780.pages.json.gz"):
+            return 200, empty_gz
+        return 404, b"Not Found"
+
+    upserted: list[dict] = []
+
+    def fake_sb_write(method, url, headers, body):
+        if "/rest/v1/report" in url:
+            upserted.extend(json.loads(body.decode("utf-8")))
+        return 201, b""
+
+    writer = SupabaseWriter("https://x.supabase.co", "srv", http=fake_sb_write)
+    r = K.backfill_text_status(
+        "https://x.supabase.co",
+        "srv",
+        http=fake_rest_get,
+        writer=writer,
+        clock=clock,
+        out_dir=tmp_path,
+    )
+    assert not r.failed
+    # KREI PDF 다운로드 요청 없이 Storage 의 pages.json.gz 만 읽었는지 확인
+    assert all("aglook.krei.re.kr" not in u for u in get_urls)
+    assert len(upserted) == 2
+    by_id = {row["file_id"]: row for row in upserted}
+    assert by_id[8778]["text_chars"] == 120 and by_id[8778]["text_status"] == "ok"
+    assert by_id[8780]["text_chars"] == 0 and by_id[8780]["text_status"] == "no_text"
+
+
+def test_monitor_no_text_warns_once_for_hort_and_grain_only():
+    from croplib_dp.io.github_issue import IssueAlerts
+
+    now = TS("2026-11-05 10:00")
+    rows = [
+        # 원예(양념채소) no_text → 경고 대상
+        dict(
+            file_id=8780,
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000036",
+            item_name="양념채소",
+            report_type="월보",
+            fetch_status="fetched",
+            text_chars=0,
+            text_status="no_text",
+        ),
+        # 곡물(쌀) no_text → 경고 대상
+        dict(
+            file_id=8775,
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000070",
+            item_name="쌀",
+            report_type="월보",
+            fetch_status="fetched",
+            text_chars=0,
+            text_status="no_text",
+        ),
+        # 축산(산란계)·국제곡물·버섯 no_text → 감시 경고 제외 (요약에만 표시)
+        dict(
+            file_id=8776,
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000018",
+            item_name="산란계",
+            report_type="순보",
+            fetch_status="fetched",
+            text_chars=0,
+            text_status="no_text",
+        ),
+        dict(
+            file_id=8777,
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000073",
+            item_name="국제곡물",
+            report_type="월보",
+            fetch_status="fetched",
+            text_chars=0,
+            text_status="no_text",
+        ),
+        dict(
+            file_id=8790,
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000087",
+            item_name="버섯",
+            report_type="월보",
+            fetch_status="fetched",
+            text_chars=0,
+            text_status="no_text",
+        ),
+    ]
+    alerts = check_health(now, _ok_run("2026-11-05 10:00"), {}, {"101": "춘천"}, krei_reports=rows)
+    krei_alerts = [a for a in alerts if a.code == "krei"]
+    assert [a.text for a in krei_alerts] == [
+        "KREI 글자 없음 (쌀 #8775) — 그림 PDF (0자)",
+        "KREI 글자 없음 (양념채소 #8780) — 그림 PDF (0자)",
+    ]
+
+    # IssueAlerts 로 동기화할 때 처음 1회만 이슈를 열고, 다음 점검에서는 같은 건을 다시 보내지 않음(unchanged)
+    issues: list[dict] = []
+    comments: list[str] = []
+
+    def fake_gh(method, url, headers, body):
+        path = urllib.parse.urlparse(url).path.removeprefix("/repos/o/r")
+        data = json.loads(body) if body else None
+        if path.startswith("/labels/"):
+            return 200, b"{}"
+        if path == "/issues" and method == "GET":
+            return 200, json.dumps(issues).encode("utf-8")
+        if path == "/issues" and method == "POST":
+            i = dict(number=1, state="open", **data)
+            issues.append(i)
+            return 201, json.dumps(i).encode("utf-8")
+        if path.endswith("/comments"):
+            comments.append(data["body"])
+            return 201, b"{}"
+        issues[0].update(data)
+        return 200, json.dumps(issues[0]).encode("utf-8")
+
+    sink = IssueAlerts("o/r", "tok", http=fake_gh)
+    keys = [a.key for a in alerts]
+    assert sink.sync(keys, report(alerts, now)) == "opened"
+    assert sink.sync(keys, report(alerts, now + pd.Timedelta(hours=1))) == "unchanged"
+    assert comments == []
+
+
+def test_krei_second_migration_adds_text_chars_and_text_status():
+    mig_dir = Path(__file__).parent.parent / "supabase" / "migrations"
+    first_sql = (mig_dir / "20261108000000_krei_schema.sql").read_text(encoding="utf-8").lower()
+    second_sql = (mig_dir / "20261108010000_krei_report_text_status.sql").read_text(encoding="utf-8").lower()
+    assert "text_chars" not in first_sql
+    assert "add column if not exists text_chars int" in second_sql
+    assert "add column if not exists text_status text" in second_sql
+    assert "check (text_status in ('ok', 'no_text'))" in second_sql

@@ -7,6 +7,8 @@ name: krei
 # - 실행 시작 후 시간 예산(기본 25분)이 지나면 새 PDF를 시작하지 않고 정상 종료하며,
 #   남은 건은 다음 실행에서 자동으로 이어 받는다.
 # - write=false(시험 실행)는 목록 조회 + PDF 표본 1건만 받고 끝낸다.
+# - backfill_text_status=true 로 실행하면 PDF를 다시 받지 않고 Storage의 pages.json.gz만 읽어
+#   기존 fetched 행의 text_chars·text_status를 채운다.
 
 on:
   schedule:
@@ -29,6 +31,10 @@ on:
         description: "시간 예산(분, 기본 25 — 이 시간이 지나면 새 PDF를 시작하지 않고 정상 종료)"
         required: false
         default: "25"
+      backfill_text_status:
+        description: "Storage의 pages.json.gz를 읽어 기존 fetched 행의 text_chars·text_status만 채우기"
+        type: boolean
+        default: false
 
 concurrency:
   group: krei
@@ -59,11 +65,13 @@ jobs:
           # 예약 실행은 항상 쓰고, 사람이 누를 때는 write 입력을 따른다
           WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
           KREI_BUDGET_MINUTES: ${{ inputs.budget_minutes || '25' }}
+          BACKFILL_TEXT_STATUS: ${{ inputs.backfill_text_status }}
         run: |
           args=(--out out)
           if [ -n "$FROM_YM" ]; then args+=(--from "$FROM_YM"); fi
           if [ -n "$TO_YM" ]; then args+=(--to "$TO_YM"); fi
           if [ -n "$KREI_BUDGET_MINUTES" ]; then args+=(--budget-minutes "$KREI_BUDGET_MINUTES"); fi
+          if [ "$BACKFILL_TEXT_STATUS" = "true" ]; then args+=(--backfill-text-status); fi
           if [ "$WRITE" = "true" ]; then args+=(--write); fi
           set +e
           for attempt in 1 2; do

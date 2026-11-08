@@ -19,6 +19,14 @@ HORT_MONTH_ITEMS: dict[str, str] = {
     "OVR0000000008": "엽근채소",
     "OVR0000000036": "양념채소",
 }
+GRAIN_ITEMS: dict[str, str] = {
+    "OVR0000000070": "쌀",
+    "OVR0000000072": "콩",
+    "OVR0000000021": "감자",
+}
+NO_TEXT_WARN_ITEMS: dict[str, str] = {**HORT_MONTH_ITEMS, **GRAIN_ITEMS}
+MIN_CHARS_PER_PAGE = 50
+_UNUSED_CLOSE = {}
 
 _FILE_ID_RE = re.compile(r"/download/(\d+)(?:/|$)")
 _ISSUE_NO_RE = re.compile(r"통권\s*제\s*(\d+)\s*호")
@@ -317,6 +325,29 @@ def compress_pages_json(pages: list[dict[str, Any]]) -> bytes:
     """pages 목록을 JSON 직렬화 후 gzip 압축한다."""
     raw = json.dumps(pages, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return gzip.compress(raw, mtime=0)
+
+
+def decompress_pages_json(gz_bytes: bytes) -> list[dict[str, Any]]:
+    """gzip 압축된 pages.json.gz 바이트를 풀어 쪽별 단어 좌표 목록으로 돌려준다."""
+    return json.loads(gzip.decompress(gz_bytes).decode("utf-8"))
+
+
+def compute_text_stats(pages: Iterable[Mapping[str, Any]]) -> tuple[int, str]:
+    """쪽별 단어 좌표 목록(pages)에서 전체 글자 수(text_chars)와 상태('ok' | 'no_text')를 계산한다.
+    문서 전체 글자 수가 쪽당 50자 미만이면 'no_text'(그림·윤곽선 PDF)로 판정한다."""
+    page_list = list(pages)
+    n_pages = len(page_list)
+    text_chars = 0
+    for p in page_list:
+        for wd in p.get("words", ()):
+            if isinstance(wd, Mapping):
+                txt = str(wd.get("text", "")).strip()
+            else:
+                txt = str(wd[4]).strip() if len(wd) >= 5 else ""
+            text_chars += len(txt)
+    if n_pages <= 0 or text_chars < n_pages * MIN_CHARS_PER_PAGE:
+        return text_chars, "no_text"
+    return text_chars, "ok"
 
 
 def list_storage_path(api: str, yyyy: int, mm: int) -> str:
