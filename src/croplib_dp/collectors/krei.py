@@ -6,11 +6,11 @@ r"""KREI 농업관측 수집기 1단계: 품목분류·발행물 목록·글자 
      - 목록 XML 원문은 Storage `krei-raw/list/{api}/{yyyy}-{mm}.xml` 에 보관
      - `pdf_link` 에서 `/download/(\d+)/` 로 `file_id` 추출 (못 뽑으면 그 건만 실패로 기록하고 계속)
   3. 아직 `fetched` 가 아니거나 `mod_date` 가 새로 채워진/바뀐 건만 PDF 를 임시 폴더에 받아:
-     - `%PDF` 시그니처·크기·sha256 확인
-     - `pdfplumber` 로 쪽별 글자 좌표(`{"w","h","words":[[x0,top,x1,bottom,text],…]}`) 추출 → gzip 압축
-       → Storage `krei-raw/text/{ovr_item_code}/{yyyy}/{mm}/{file_id}.pages.json.gz`
-     - 1쪽 글자에서 통권(`issue_no`)·발행일(`pub_date`) 추출 (없으면 null)
-     - `krei.report` 에 `fetch_status = 'fetched'` (실패 시 `'failed'` + `fetch_error`) 기록
+     - `write=false`(시험 실행)이면 PDF 는 표본 1건만 받고 끝낸다.
+     - 시간 예산(기본 25분, `--budget-minutes` 또는 `KREI_BUDGET_MINUTES`)이 지나면 새 PDF 를 시작하지 않고
+       정상 종료하며, 요약에 `"남은 N건, 다음 실행에서 이어 받음"`을 남긴다.
+     - PDF 1건을 처리할 때마다 바로 글자 좌표(`pages.json.gz`) 업로드와 `krei.report` 행 upsert,
+       그리고 `out/` 요약 파일 갱신을 끝내 중간에 취소돼도 이미 받은 건이 남게 한다.
 """
 
 import argparse
@@ -47,6 +47,7 @@ from croplib_dp.io.krei import (
 KREI_SCHEMA = "krei"
 ITEM_KEY = SPECS["krei.item"].key
 REPORT_KEY = SPECS["krei.report"].key
+DEFAULT_BUDGET_MINUTES = 25.0
 PdfExtractor = Callable[[bytes], dict[str, Any]]
 
 
@@ -55,15 +56,19 @@ class KreiResult:
     months: list[tuple[int, int]] = field(default_factory=list)
     items: list[dict[str, Any]] = field(default_factory=list)
     reports: list[dict[str, Any]] = field(default_factory=list)
+    listed_count: int = 0  # 조회된 달 전체 고유 발행물 건수
     list_counts: dict[str, int] = field(default_factory=dict)  # "2026-11 monthly" -> 건수
     fetched: list[dict[str, Any]] = field(default_factory=list)  # 새로 받은 건 요약
     failed_reports: list[dict[str, Any]] = field(default_factory=list)  # 실패한 건 요약
     skipped_count: int = 0  # 이미 fetched 라 건너뛴 건수
+    remaining_count: int = 0  # 시간 예산 도달로 다음 실행에 이어 받을 건수
+    sample_skipped_count: int = 0  # 시험 실행(write=false)에서 표본 1건만 받고 생략한 건수
     list_files: dict[str, bytes] = field(default_factory=dict)  # Storage path -> xml bytes
     text_files: dict[str, bytes] = field(default_factory=dict)  # Storage path -> pages.json.gz bytes
     problems: list[str] = field(default_factory=list)
     log: RunLog = field(default_factory=RunLog)
     uploaded: bool = False
+    _persisted_incrementally: bool = False
 
     @property
     def failed(self) -> bool:
@@ -105,6 +110,18 @@ def resolve_months(
     return default_months(clock.now().date())
 
 
+def resolve_budget_minutes(budget_minutes: float | str | None = None) -> float:
+    """CLI 인자 또는 환경변수 `KREI_BUDGET_MINUTES` 에서 시간 예산(분)을 읽는다 (기본 25분)."""
+    if budget_minutes is not None and str(budget_minutes).strip() != "":
+        val = float(budget_minutes)
+    else:
+        env_val = os.environ.get("KREI_BUDGET_MINUTES", "").strip()
+        val = float(env_val) if env_val else DEFAULT_BUDGET_MINUTES
+    if val <= 0:
+        raise ValueError(f"시간 예산(budget_minutes)은 0보다 커야 합니다: {val}")
+    return val
+
+
 def _ensure_report_items_exist(
     items: list[dict[str, Any]], reports: Iterable[Mapping[str, Any]], updated_at: str
 ) -> None:
@@ -132,6 +149,64 @@ def _ensure_report_items_exist(
         )
 
 
+def _persist_items_and_lists(r: KreiResult, writer: Any) -> bool:
+    """품목 사전(krei.item)과 목록 XML을 먼저 올린다 (report 외래키 참조 보장)."""
+    probs = check_rows("krei.item", r.items)
+    if probs:
+        r.problems += probs
+        return False
+    for path, xml_bytes in sorted(r.list_files.items()):
+        try:
+            writer.upload(STORAGE_BUCKET, path, xml_bytes, content_type="application/xml")
+        except Exception as e:
+            r.problems.append(f"목록 XML Storage 올리기 실패 ({path}): {type(e).__name__}: {str(e)[:200]}")
+    try:
+        if r.items:
+            writer.upsert("item", r.items, on_conflict=ITEM_KEY, schema=KREI_SCHEMA)
+        r.uploaded = True
+        return True
+    except Exception as e:
+        r.problems.append(f"DB 올리기 실패 (item): {type(e).__name__}: {str(e)[:200]}")
+        return False
+
+
+def _persist_one_report(
+    r: KreiResult,
+    writer: Any,
+    rep: dict[str, Any],
+    gz_bytes: bytes | None = None,
+) -> None:
+    """PDF 1건 처리 직후 글자 좌표 업로드와 krei.report 1행 upsert를 바로 끝낸다."""
+    probs = check_rows("krei.report", [rep])
+    if probs:
+        r.problems += probs
+        return
+    t_path = rep.get("text_path")
+    if rep.get("fetch_status") == "fetched" and t_path and gz_bytes is not None:
+        try:
+            writer.upload(STORAGE_BUCKET, t_path, gz_bytes, content_type="application/gzip")
+        except Exception as e:
+            err = f"Storage 올리기 실패: {type(e).__name__}: {str(e)[:200]}"
+            rep["fetch_status"] = "failed"
+            rep["fetch_error"] = err
+            rep["text_path"] = None
+            r.problems.append(f"#{rep['file_id']} {rep['item_name']}: {err}")
+            r.failed_reports.append(
+                dict(
+                    file_id=rep["file_id"],
+                    item_name=rep["item_name"],
+                    report_type=rep["report_type"],
+                    error=err,
+                )
+            )
+            r.fetched = [f for f in r.fetched if f.get("file_id") != rep["file_id"]]
+    try:
+        writer.upsert("report", [rep], on_conflict=REPORT_KEY, schema=KREI_SCHEMA)
+        r.uploaded = True
+    except Exception as e:
+        r.problems.append(f"#{rep['file_id']} DB 올리기 실패: {type(e).__name__}: {str(e)[:200]}")
+
+
 def run(
     months: list[tuple[int, int]] | None = None,
     existing_items: Iterable[Mapping[str, Any]] = (),
@@ -139,14 +214,28 @@ def run(
     http: KreiHttp = http_get,
     clock: Clock | None = None,
     pdf_extractor: PdfExtractor = extract_pdf_bytes,
+    *,
+    write: bool = True,
+    writer: Any | None = None,
+    budget_minutes: float | None = DEFAULT_BUDGET_MINUTES,
+    max_pdfs: int | None = None,
+    out_dir: Path | None = None,
 ) -> KreiResult:
-    """KREI 목록·원문 수집 1회 실행."""
+    """KREI 목록·원문 수집 1회 실행.
+    - `write=False`(시험 실행)이면 목록은 모두 조회하되 PDF 는 최대 1건(표본)만 받는다.
+    - `writer`가 주어지면 PDF 1건을 처리할 때마다 즉시 Storage·DB에 반영한다.
+    - `budget_minutes`(기본 25분)가 지나면 새 PDF 를 시작하지 않고 남은 건수를 기록해 정상 종료한다.
+    - `out_dir`이 주어지면 목록 조회 직후와 PDF 1건 처리마다 요약 파일을 갱신한다."""
     clock = clock or Clock()
-    target_months = months if months is not None else default_months(clock.now().date())
+    started_at = clock.now()
+    budget_s = budget_minutes * 60.0 if budget_minutes is not None else None
+    effective_max_pdfs = max_pdfs if max_pdfs is not None else (1 if not write else None)
+
+    target_months = months if months is not None else default_months(started_at.date())
     existing_by_id = dict(existing_reports or {})
     r = KreiResult(months=list(target_months))
     client = KreiClient(http=http, clock=clock, log=r.log)
-    now_iso = _iso(clock.now()) or ""
+    now_iso = _iso(started_at) or ""
 
     # 1. reportItem 조회 및 동기화
     ok_item, item_xml, item_err = client.fetch_report_items()
@@ -183,9 +272,18 @@ def run(
             for row in rows:
                 listed_by_id[int(row["file_id"])] = row
 
+    r.listed_count = len(listed_by_id)
     _ensure_report_items_exist(r.items, listed_by_id.values(), now_iso)
 
-    # 3. 각 발행물 재수집 여부 판정 및 PDF → 글자 좌표 추출
+    if writer is not None:
+        r._persisted_incrementally = True
+        if not _persist_items_and_lists(r, writer):
+            if out_dir is not None:
+                write_outputs(r, out_dir)
+            return r
+
+    # 3. 각 발행물 재수집 여부 판정
+    todo_items: list[tuple[int, dict[str, Any]]] = []
     for file_id, item in sorted(listed_by_id.items()):
         prev = existing_by_id.get(file_id)
         first_seen = (prev.get("first_seen_at") if prev else None) or now_iso
@@ -220,8 +318,24 @@ def run(
                     updated_at=updated_at,
                 )
             )
-            continue
+        else:
+            todo_items.append((file_id, item))
 
+    if out_dir is not None:
+        write_outputs(r, out_dir)
+
+    # 4. PDF 내려받기 → 글자 좌표 추출 → 1건씩 즉시 저장 및 요약 파일 갱신
+    for idx, (file_id, item) in enumerate(todo_items):
+        if effective_max_pdfs is not None and idx >= effective_max_pdfs:
+            r.sample_skipped_count = len(todo_items) - idx
+            break
+        elapsed_s = (clock.now() - started_at).total_seconds()
+        if budget_s is not None and elapsed_s >= budget_s:
+            r.remaining_count = len(todo_items) - idx
+            break
+
+        prev = existing_by_id.get(file_id)
+        first_seen = (prev.get("first_seen_at") if prev else None) or now_iso
         ok_pdf, pdf_bytes, pdf_err = client.fetch_pdf(item["pdf_link"], file_id)
         updated_at = _iso(clock.now()) or now_iso
         if not ok_pdf:
@@ -235,33 +349,36 @@ def run(
                     error=err_msg,
                 )
             )
-            r.reports.append(
-                dict(
-                    file_id=file_id,
-                    api=item["api"],
-                    report_type=item["report_type"],
-                    yyyy=item["yyyy"],
-                    mm=item["mm"],
-                    ovr_item_code=item["ovr_item_code"],
-                    prt_ovr_item_code=item.get("prt_ovr_item_code"),
-                    item_name=item["item_name"],
-                    pdf_link=item["pdf_link"],
-                    reg_at=item.get("reg_at"),
-                    mod_at=item.get("mod_at"),
-                    description=item.get("description"),
-                    first_seen_at=first_seen,
-                    pdf_sha256=None,
-                    pdf_bytes=None,
-                    pages=None,
-                    issue_no=None,
-                    pub_date=None,
-                    text_path=None,
-                    fetch_status="failed",
-                    fetch_error=err_msg[:500],
-                    parse_status="pending",
-                    updated_at=updated_at,
-                )
+            rep_row = dict(
+                file_id=file_id,
+                api=item["api"],
+                report_type=item["report_type"],
+                yyyy=item["yyyy"],
+                mm=item["mm"],
+                ovr_item_code=item["ovr_item_code"],
+                prt_ovr_item_code=item.get("prt_ovr_item_code"),
+                item_name=item["item_name"],
+                pdf_link=item["pdf_link"],
+                reg_at=item.get("reg_at"),
+                mod_at=item.get("mod_at"),
+                description=item.get("description"),
+                first_seen_at=first_seen,
+                pdf_sha256=None,
+                pdf_bytes=None,
+                pages=None,
+                issue_no=None,
+                pub_date=None,
+                text_path=None,
+                fetch_status="failed",
+                fetch_error=err_msg[:500],
+                parse_status="pending",
+                updated_at=updated_at,
             )
+            r.reports.append(rep_row)
+            if writer is not None:
+                _persist_one_report(r, writer, rep_row)
+            if out_dir is not None:
+                write_outputs(r, out_dir)
             continue
 
         try:
@@ -277,33 +394,36 @@ def run(
                     error=err_msg,
                 )
             )
-            r.reports.append(
-                dict(
-                    file_id=file_id,
-                    api=item["api"],
-                    report_type=item["report_type"],
-                    yyyy=item["yyyy"],
-                    mm=item["mm"],
-                    ovr_item_code=item["ovr_item_code"],
-                    prt_ovr_item_code=item.get("prt_ovr_item_code"),
-                    item_name=item["item_name"],
-                    pdf_link=item["pdf_link"],
-                    reg_at=item.get("reg_at"),
-                    mod_at=item.get("mod_at"),
-                    description=item.get("description"),
-                    first_seen_at=first_seen,
-                    pdf_sha256=None,
-                    pdf_bytes=len(pdf_bytes),
-                    pages=None,
-                    issue_no=None,
-                    pub_date=None,
-                    text_path=None,
-                    fetch_status="failed",
-                    fetch_error=err_msg[:500],
-                    parse_status="pending",
-                    updated_at=updated_at,
-                )
+            rep_row = dict(
+                file_id=file_id,
+                api=item["api"],
+                report_type=item["report_type"],
+                yyyy=item["yyyy"],
+                mm=item["mm"],
+                ovr_item_code=item["ovr_item_code"],
+                prt_ovr_item_code=item.get("prt_ovr_item_code"),
+                item_name=item["item_name"],
+                pdf_link=item["pdf_link"],
+                reg_at=item.get("reg_at"),
+                mod_at=item.get("mod_at"),
+                description=item.get("description"),
+                first_seen_at=first_seen,
+                pdf_sha256=None,
+                pdf_bytes=len(pdf_bytes),
+                pages=None,
+                issue_no=None,
+                pub_date=None,
+                text_path=None,
+                fetch_status="failed",
+                fetch_error=err_msg[:500],
+                parse_status="pending",
+                updated_at=updated_at,
             )
+            r.reports.append(rep_row)
+            if writer is not None:
+                _persist_one_report(r, writer, rep_row)
+            if out_dir is not None:
+                write_outputs(r, out_dir)
             continue
 
         t_path = text_storage_path(item["ovr_item_code"], item["yyyy"], item["mm"], file_id)
@@ -324,33 +444,39 @@ def run(
                 pub_date=ext["pub_date"],
             )
         )
-        r.reports.append(
-            dict(
-                file_id=file_id,
-                api=item["api"],
-                report_type=item["report_type"],
-                yyyy=item["yyyy"],
-                mm=item["mm"],
-                ovr_item_code=item["ovr_item_code"],
-                prt_ovr_item_code=item.get("prt_ovr_item_code"),
-                item_name=item["item_name"],
-                pdf_link=item["pdf_link"],
-                reg_at=item.get("reg_at"),
-                mod_at=item.get("mod_at"),
-                description=item.get("description"),
-                first_seen_at=first_seen,
-                pdf_sha256=ext["pdf_sha256"],
-                pdf_bytes=ext["pdf_bytes"],
-                pages=ext["pages"],
-                issue_no=ext["issue_no"],
-                pub_date=ext["pub_date"],
-                text_path=t_path,
-                fetch_status="fetched",
-                fetch_error=None,
-                parse_status="pending",
-                updated_at=updated_at,
-            )
+        rep_row = dict(
+            file_id=file_id,
+            api=item["api"],
+            report_type=item["report_type"],
+            yyyy=item["yyyy"],
+            mm=item["mm"],
+            ovr_item_code=item["ovr_item_code"],
+            prt_ovr_item_code=item.get("prt_ovr_item_code"),
+            item_name=item["item_name"],
+            pdf_link=item["pdf_link"],
+            reg_at=item.get("reg_at"),
+            mod_at=item.get("mod_at"),
+            description=item.get("description"),
+            first_seen_at=first_seen,
+            pdf_sha256=ext["pdf_sha256"],
+            pdf_bytes=ext["pdf_bytes"],
+            pages=ext["pages"],
+            issue_no=ext["issue_no"],
+            pub_date=ext["pub_date"],
+            text_path=t_path,
+            fetch_status="fetched",
+            fetch_error=None,
+            parse_status="pending",
+            updated_at=updated_at,
         )
+        r.reports.append(rep_row)
+        if writer is not None:
+            _persist_one_report(r, writer, rep_row, gz_bytes=gz_bytes)
+        if out_dir is not None:
+            write_outputs(r, out_dir)
+
+    if out_dir is not None:
+        write_outputs(r, out_dir)
     return r
 
 
@@ -359,7 +485,10 @@ def check(r: KreiResult) -> list[str]:
 
 
 def publish(r: KreiResult, writer: Any) -> KreiResult:
-    """계약 검사 통과 후 Storage(krei-raw)와 DB(krei.item, krei.report)에 반영한다."""
+    """계약 검사 통과 후 Storage(krei-raw)와 DB(krei.item, krei.report)에 반영한다.
+    `run(..., writer=writer)`로 이미 한 건씩 저장한 경우에는 중복 업로드를 건너뛴다."""
+    if r._persisted_incrementally:
+        return r
     probs = check(r)
     if probs:
         r.problems += probs
@@ -403,15 +532,19 @@ def publish(r: KreiResult, writer: Any) -> KreiResult:
 
 
 def brief_text(r: KreiResult) -> str:
-    """실행 요약: 조회한 달, 목록 건수, 새로 받은 건(부류·종류·파일번호·쪽수·크기), 실패 건."""
+    """실행 요약: 조회한 달, 목록 건수, 새로 받은 건(부류·종류·파일번호·쪽수·크기), 남은 건, 실패 건."""
     ym_str = ", ".join(f"{y:04d}-{m:02d}" for y, m in r.months)
-    total_listed = len(r.reports)
+    total_listed = r.listed_count if r.listed_count else len(r.reports)
     lines = [
         f"# KREI 농업관측 수집 ({ym_str}, 계산 {CALC_VERSION})",
         f"- 조회한 달: {ym_str}",
         f"- 품목분류: {len(r.items)}건 · 목록: {total_listed}건 "
         f"(새로 받음 {len(r.fetched)}건 · 기존 건너뜀 {r.skipped_count}건 · 실패 {len(r.failed_reports)}건)",
     ]
+    if r.remaining_count > 0:
+        lines.append(f"- 남은 {r.remaining_count}건, 다음 실행에서 이어 받음")
+    if r.sample_skipped_count > 0:
+        lines.append(f"- 시험 실행(write=false): PDF 표본 1건만 받고 나머지 {r.sample_skipped_count}건 생략")
     if r.list_counts:
         counts_str = ", ".join(f"{k}: {v}건" for k, v in sorted(r.list_counts.items()))
         lines.append(f"- 달별 응답: {counts_str}")
@@ -446,6 +579,12 @@ def brief_text(r: KreiResult) -> str:
 summary_text = brief_text
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 def write_outputs(r: KreiResult, out_dir: Path) -> Path:
     tag = "_".join(f"{y:04d}{m:02d}" for y, m in r.months[:2]) or "run"
     d = out_dir / f"krei_{tag}"
@@ -457,13 +596,14 @@ def write_outputs(r: KreiResult, out_dir: Path) -> Path:
         ("failed", r.failed_reports),
         ("problems", r.problems),
     ):
-        (d / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    (d / "collect_log.jsonl").write_text(
-        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in r.log.entries), encoding="utf-8"
+        _atomic_write_text(d / f"{name}.json", json.dumps(data, ensure_ascii=False, indent=1))
+    _atomic_write_text(
+        d / "collect_log.jsonl",
+        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in r.log.entries),
     )
     text = brief_text(r)
-    (d / "brief.md").write_text(text, encoding="utf-8")
-    (d / "summary.md").write_text(text, encoding="utf-8")
+    _atomic_write_text(d / "brief.md", text)
+    _atomic_write_text(d / "summary.md", text)
     return d
 
 
@@ -473,12 +613,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mm", help="조회할 월 (--yyyy 와 함께)")
     p.add_argument("--from", dest="from_ym", help="조회 시작 연-월 (예: 2026-01)")
     p.add_argument("--to", dest="to_ym", help="조회 끝 연-월 (예: 2026-11)")
+    p.add_argument(
+        "--budget-minutes",
+        type=float,
+        default=None,
+        help="시간 예산(분, 기본 25분 또는 환경변수 KREI_BUDGET_MINUTES)",
+    )
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase DB·Storage에 쓰기")
     a = p.parse_args(argv)
 
     clock = Clock()
     months = resolve_months(clock, yyyy=a.yyyy, mm=a.mm, from_ym=a.from_ym, to_ym=a.to_ym)
+    budget_minutes = resolve_budget_minutes(a.budget_minutes)
 
     existing_items: list[dict[str, Any]] = []
     existing_reports: dict[int, dict[str, Any]] = {}
@@ -493,21 +640,28 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             if a.write:
                 raise
-            print(f"참고: 기존 DB 조회 생략 ({e})", file=sys.stderr)
+            print(f"참고: 기존 DB 조회 생략 ({e})")
 
+    writer = None
+    if a.write:
+        from croplib_dp.io.supabase_write import SupabaseWriter
+
+        writer = SupabaseWriter(sb_url, sb_key)
+
+    out_path = Path(a.out)
     r = run(
         months=months,
         existing_items=existing_items,
         existing_reports=existing_reports,
         clock=clock,
+        write=a.write,
+        writer=writer,
+        budget_minutes=budget_minutes,
+        out_dir=out_path,
     )
-    if a.write:
-        from croplib_dp.io.supabase_write import SupabaseWriter
-
-        publish(r, SupabaseWriter(sb_url, sb_key))
-    else:
+    if not a.write:
         r.problems += check(r)
-    out = write_outputs(r, Path(a.out))
+    out = write_outputs(r, out_path)
     print(brief_text(r))
     print(f"결과 폴더: {out}")
     return 1 if r.failed else 0

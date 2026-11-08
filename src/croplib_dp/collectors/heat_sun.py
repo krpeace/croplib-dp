@@ -5,7 +5,10 @@ core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Sup
 - 새해 1월 1~3일(PREV_YEAR_DAYS)에는 작년도 12/31 까지 다시 계산해 마감한다. 1/1 의 '어제'는 작년 12/31 이라
   올해 구간이 거꾸로(시작 > 끝)라서 올해는 평년선만 만들고, 작년 12/31 값을 채운다 (이슈 #40, 결정 0018).
 - 기준온도는 작물 사전 crops.t_base_c (표준값 층). 비어 있으면 그 작물은 계산하지 않고 문제로 남긴다.
-- 일사를 재지 않는 지점(평년 기간에 sumGsr 가 하나도 없음)은 sun_daily 줄을 만들지 않는다.
+- 일사를 재지 않는 지점(sumGsr 가 하나도 없음)은 sun_daily 줄을 만들지 않는다.
+- sun_daily 는 관측 일사만 쓴다. 0.02×Ra 보다 작은 값과 한 달 대부분이 무효인 달의 값은 비우고,
+  일조시간·기온차 추정값은 섞지 않는다(결정 0020). 값은 있었는데 모두 걸러진 지점(일사가 늘 0.0 인
+  센서 고장)은, DB 에 이미 올라간 옛 줄을 지우지 않고 같은 키로 값을 비운 줄을 올려 덮어쓴다(삭제 없음).
 - 한 지점이 끝내 받지 못하면 그 지점만 빼고, 회차를 실패로 남긴다(조용히 넘어가지 않음).
 - 대상 지점은 운영 중인 지점(stations.is_active = true) 전부다. 폐지·휴지 지점은 올해 관측이 없어
   돌지 않고 실패로도 남기지 않는다. `--stations` 를 주면 그 지점만 돈다.
@@ -24,6 +27,7 @@ from croplib_dp.collectors.water import ASOS_RETRY_S, Clock, RunLog, _env
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.daily_weather import num
 from croplib_dp.core.heat_sun import calc_gdd, normals_by_day, year_table
+from croplib_dp.core.radiation import clean_observed_rs
 from croplib_dp.io import kma
 from croplib_dp.io.asos_cache import AsosCache, is_complete
 from croplib_dp.io.contract import SPECS, check_rows
@@ -98,8 +102,30 @@ def _r(v, n=2):
     return None if v is None else round(float(v), n)
 
 
-def build_station(stn_id: str, items: list[dict], crops: dict[str, float], year: int, nf: int, nt: int):
-    """한 지점의 ASOS 일자료 → (heat 줄, sun 줄, 요약)"""
+def _empty_sun_rows(stn_id: str, year: int, nf: int, nt: int) -> list[dict]:
+    """값을 모두 비운 sun_daily 줄(그해 1/1~12/31). 옛 줄을 지우지 않고 덮어쓰는 데 쓴다."""
+    first = dt.date(year, 1, 1)
+    return [
+        dict(
+            stn_id=stn_id,
+            date=(first + dt.timedelta(days=k)).isoformat(),
+            rs_day_mj=None,
+            rs_cum_mj=None,
+            rs_normal_day_mj=None,
+            rs_normal_cum_mj=None,
+            normal_from=nf,
+            normal_to=nt,
+            filled=True,
+            calc_version=CALC_VERSION,
+        )
+        for k in range((dt.date(year, 12, 31) - first).days + 1)
+    ]
+
+
+def build_station(
+    stn_id: str, items: list[dict], crops: dict[str, float], year: int, nf: int, nt: int, lat: float
+):
+    """한 지점의 ASOS 일자료 → (heat 줄, sun 줄, 요약). lat 는 일사 하한(0.02×Ra)을 구하는 데 쓴다."""
     by_day = {d: it for it in items if (d := _date(it)) is not None}
     temp_days = [
         d for d, it in by_day.items() if num(it.get("maxTa")) is not None and num(it.get("minTa")) is not None
@@ -139,10 +165,14 @@ def build_station(stn_id: str, items: list[dict], crops: dict[str, float], year:
             if last
             else None
         )
-    rs = {d: num(it.get("sumGsr")) for d, it in by_day.items()}
+    raw_rs = {d: num(it.get("sumGsr")) for d, it in by_day.items()}
+    rs = clean_observed_rs(raw_rs, lat)  # 0.0·무효 달은 None (추정값을 섞지 않는다)
     normal_rs = normals_by_day(rs, nf, nt)
     sun = []
-    if normal_rs:
+    if not normal_rs and any(v is not None for v in raw_rs.values()):
+        sun = _empty_sun_rows(stn_id, year, nf, nt)  # 값은 있었는데 모두 걸러짐 → 옛 줄을 빈 값으로 덮어쓴다
+        summary["sun"] = "자료 없음"
+    elif normal_rs:
         for x in year_table(year, {d: v for d, v in rs.items() if d.year == year}, normal_rs, last_obs):
             sun.append(
                 dict(
@@ -201,6 +231,13 @@ def run(
         r.problems.append("대상 지점이 0곳 — 지점 사전 is_active 확인")
     for stn_id in targets:
         name = d.stations.get(stn_id, {}).get("name_ko", "")
+        lat = d.stations.get(stn_id, {}).get("lat")
+        if lat is None:  # 일사 하한을 못 구한다. 조용히 넘어가지 않고 이 지점을 뺀다
+            r.problems.append(f"{stn_id} {name}: 지점 사전에 위도(lat)가 없어 이 지점을 뺌")
+            for b in r.blocks:
+                b.stations.append(dict(stn_id=stn_id, name=name, error="위도 없음"))
+            continue
+        lat = float(lat)
         items: list[dict] = []
         ok = True
         for y in range(years[0] - NORMAL_YEARS, year + 1):  # 가장 오래된 해의 평년 첫 해 ~ 올해
@@ -224,7 +261,7 @@ def run(
                 b.stations.append(dict(stn_id=stn_id, name=name, error="ASOS 실패"))
             continue
         for b in r.blocks:  # 받은 자료 한 벌로 해마다 계산한다
-            heat, sun, summary = build_station(stn_id, items, crops, b.year, b.normal_from, b.normal_to)
+            heat, sun, summary = build_station(stn_id, items, crops, b.year, b.normal_from, b.normal_to, lat)
             r.heat_daily += heat
             r.sun_daily += sun
             b.stations.append(dict(summary, name=name))
