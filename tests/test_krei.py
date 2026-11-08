@@ -936,8 +936,13 @@ def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Pa
     assert by_id[8779]["no_text_pages"] == 1
     assert by_id[8779]["text_status"] == "partial"
 
-    # 이미 no_text_pages까지 채워진 행이라도 force=True 면 전체를 다시 계산한다
-    db_reports = list(by_id.values())
+    # backfill 은 기존 행 갱신이므로 parse_status·parser_version·parsed_at 열을 upsert 페이로드에 넣지 않는다
+    assert "parse_status" not in by_id[8778]
+    assert "parser_version" not in by_id[8778]
+    assert "parsed_at" not in by_id[8778]
+
+    # 실제 DB 상태(기존 열 유지 + upsert 된 열 반영)를 시뮬레이션
+    db_reports = [{**orig, **by_id[orig["file_id"]]} for orig in db_reports]
     db_reports[0]["no_text_pages"] = 99
     upserted.clear()
     r_force = K.backfill_text_status(
@@ -1055,3 +1060,216 @@ def test_krei_second_and_third_migrations():
     assert "create or replace view krei_api.unreadable" in third_sql
     assert "r.text_status in ('no_text', 'partial')" in third_sql
     assert "grant select on krei_api.unreadable to anon, authenticated, service_role;" in third_sql
+
+
+def test_storage_read_with_real_path_format(tmp_path: Path):
+    """실제 text_path 값(DB 형식)과 실제 Storage 응답 형태(2-tuple / 3-tuple)를 다루고
+    run(reparse=True) 실행 시 storage_http를 통해 Storage에서 정상적으로 읽어 파싱하는지 확인."""
+    from croplib_dp.collectors.krei import read_storage_bytes
+
+    # 1. read_storage_bytes가 2-tuple과 3-tuple을 모두 지원하는지 검증
+    payload = b"dummy_content"
+
+    def fake_2tuple(url, headers):
+        assert "storage/v1/object/krei-raw/text/OVR0000000013/2026/11/8778.pages.json.gz" in url
+        assert headers["apikey"] == "test-key"
+        assert headers["Authorization"] == "Bearer test-key"
+        return 200, payload
+
+    def fake_3tuple(url, headers):
+        return 200, payload, None
+
+    res2 = read_storage_bytes(
+        "https://xyz.supabase.co",
+        "test-key",
+        "krei-raw",
+        "text/OVR0000000013/2026/11/8778.pages.json.gz",
+        http=fake_2tuple,
+    )
+    assert res2 == payload
+
+    res3 = read_storage_bytes(
+        "https://xyz.supabase.co",
+        "test-key",
+        "krei-raw",
+        "text/OVR0000000013/2026/11/8778.pages.json.gz",
+        http=fake_3tuple,
+    )
+    assert res3 == payload
+
+    # 2. run(reparse=True)에서 storage_http를 사용해 실제 DB 경로 형식의 파일을 다운로드하여 파싱하는지 확인
+    pages_fixture = [
+        {
+            "w": 595.3,
+            "h": 841.9,
+            "words": [[10, 10, 50, 20, "2026년 11월 농업관측 과일"], [10, 30, 50, 40, "사과 표"]],
+        }
+    ]
+    gz_bytes = compress_pages_json(pages_fixture)
+
+    real_text_path = "text/OVR0000000013/2026/11/8778.pages.json.gz"
+    existing_rep = {
+        "file_id": 8778,
+        "api": "monthly",
+        "report_type": "월보",
+        "yyyy": 2026,
+        "mm": 11,
+        "ovr_item_code": "OVR0000000013",
+        "prt_ovr_item_code": "OVR0000000093",
+        "item_name": "과일",
+        "pdf_link": "https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/download/8778/ORGTEXT_FILE",
+        "first_seen_at": "2026-11-07T20:40:00+09:00",
+        "text_path": real_text_path,
+        "text_chars": 500,
+        "no_text_pages": 0,
+        "text_status": "ok",
+        "fetch_status": "fetched",
+        "parse_status": "pending",
+        "updated_at": "2026-11-07T20:40:00+09:00",
+    }
+
+    storage_calls = []
+
+    def mock_storage_http(url, headers):
+        storage_calls.append(url)
+        if real_text_path in url:
+            return 200, gz_bytes
+        return 404, b"Not found"
+
+    clock = FakeClock("2026-11-08 10:00:00")
+    http = FakeKreiHttp()
+    r = K.run(
+        months=[(2026, 11)],
+        existing_reports={8778: existing_rep},
+        http=http,
+        clock=clock,
+        reparse=True,
+        write=False,
+        base_url="https://xyz.supabase.co",
+        key="test-key",
+        storage_http=mock_storage_http,
+        out_dir=tmp_path,
+    )
+    # Storage 읽기 실패가 없어야 함
+    assert not any("Storage 읽기 실패" in p for p in r.problems)
+    assert len(storage_calls) == 1
+    assert real_text_path in storage_calls[0]
+    assert any(p["file_id"] == 8778 for p in r.parsed)
+
+
+def test_rerun_collection_preserves_parse_status():
+    """수집 단계를 다시 돌려도 기존 행의 parse_status·parser_version·parsed_at이 유지된다."""
+    clock = FakeClock("2026-11-08 10:00:00")
+    http = FakeKreiHttp()
+
+    existing_reports = {
+        8778: dict(
+            file_id=8778,
+            api="monthly",
+            report_type="월보",
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000013",
+            prt_ovr_item_code="OVR0000000093",
+            item_name="과일",
+            pdf_link="https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000013/download/8778/ORGTEXT_FILE",
+            first_seen_at="2026-11-07T20:40:00+09:00",
+            text_path="text/OVR0000000013/2026/11/8778.pages.json.gz",
+            text_chars=500,
+            no_text_pages=0,
+            text_status="ok",
+            fetch_status="fetched",
+            parse_status="parsed",
+            parser_version="krei_v1",
+            parsed_at="2026-11-08T01:00:00+09:00",
+            updated_at="2026-11-07T20:40:00+09:00",
+        ),
+        8780: dict(
+            file_id=8780,
+            api="monthly",
+            report_type="월보",
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000036",
+            prt_ovr_item_code="OVR0000000093",
+            item_name="양념채소",
+            pdf_link="https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000036/download/8780/ORGTEXT_FILE",
+            first_seen_at="2026-11-07T20:40:00+09:00",
+            text_path="text/OVR0000000036/2026/11/8780.pages.json.gz",
+            text_chars=0,
+            no_text_pages=1,
+            text_status="no_text",
+            fetch_status="fetched",
+            parse_status="skipped",
+            parser_version=None,
+            parsed_at=None,
+            updated_at="2026-11-07T20:40:00+09:00",
+        ),
+    }
+
+    upserted_rows: list[dict] = []
+
+    def fake_sb(method, url, headers, body):
+        if "/rest/v1/report" in url and method in ("POST", "PUT"):
+            upserted_rows.extend(json.loads(body.decode("utf-8")))
+        return 201, b""
+
+    writer = SupabaseWriter("https://x.supabase.co", "srv", http=fake_sb)
+
+    # 1. 수집 재실행 (write=True, incremental write)
+    r = K.run(
+        months=[(2026, 11)],
+        existing_reports=existing_reports,
+        http=http,
+        clock=clock,
+        write=True,
+        writer=writer,
+        reparse=False,
+    )
+    assert not r.failed
+
+    # 기존 행(8778, 8780)의 parse_status가 Python 메모리 상에서도 유지되는지 확인
+    rep_8778 = next(rep for rep in r.reports if rep["file_id"] == 8778)
+    assert rep_8778["parse_status"] == "parsed"
+    assert rep_8778["parser_version"] == "krei_v1"
+    assert rep_8778["parsed_at"] == "2026-11-08T01:00:00+09:00"
+
+    rep_8780 = next(rep for rep in r.reports if rep["file_id"] == 8780)
+    assert rep_8780["parse_status"] == "skipped"
+
+    # 수집 중 upsert된 기존 행이 있다면 parse_status, parser_version, parsed_at이 제외되었는지 확인
+    for row in upserted_rows:
+        if row.get("file_id") in (8778, 8780):
+            assert "parse_status" not in row
+            assert "parser_version" not in row
+            assert "parsed_at" not in row
+
+    # 2. publish()를 통한 수집 반영 시에도 기존 행의 parse_status가 제외되는지 확인
+    upserted_rows.clear()
+    r_batch = K.run(
+        months=[(2026, 11)],
+        existing_reports=existing_reports,
+        http=http,
+        clock=clock,
+        write=False,
+        reparse=False,
+    )
+    K.publish(r_batch, writer)
+    for row in upserted_rows:
+        if row.get("file_id") in (8778, 8780):
+            assert "parse_status" not in row
+            assert "parser_version" not in row
+            assert "parsed_at" not in row
+
+
+def test_brief_text_problem_count_formatting():
+    """문제가 10건 초과일 때 '문제 N건(앞 10건)'으로 표시되는지 확인."""
+    r = K.KreiResult(months=[(2026, 11)])
+    r.problems = [f"오류_{i}" for i in range(15)]
+    text = K.brief_text(r)
+    assert "## 문제 15건(앞 10건)" in text
+
+    r2 = K.KreiResult(months=[(2026, 11)])
+    r2.problems = [f"오류_{i}" for i in range(5)]
+    text2 = K.brief_text(r2)
+    assert "## 문제 5건" in text2
