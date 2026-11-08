@@ -44,7 +44,7 @@ def test_weekly_without_auto_only_reads_and_reminds_that_archiving_is_waiting():
     res = RT.weekly(_env(f), NOW, auto=False, sink=_sink(gh))
     assert f.writes == [] and res.applied is None and not res.failed  # 쓰기·삭제 0
     assert _keys(res) == ["warn:retention:보관 대기"]
-    assert "16줄" in res.alerts[0].text and "RETENTION_AUTO_APPLY" in res.alerts[0].text
+    assert "16줄" in res.alerts[0].text and "자동 삭제" in res.alerts[0].text
     assert (
         res.action == "opened"
         and gh.issues[0]["title"] == RT.ALERT_TITLE
@@ -290,18 +290,120 @@ def test_workflow_runs_every_sunday_0510_kst_and_has_the_issue_permission():
     assert "inputs.mode || 'weekly'" in y  # 예약 실행은 weekly
 
 
-def test_schedule_applies_by_default_and_only_the_variable_false_turns_it_off():
+def test_workflow_hands_the_three_facts_to_python_and_decides_nothing_itself():
+    """끄는 판단은 셸이 아니라 파이썬(decide_auto)이 한다. 워크플로는 사실 셋(실행 방식·weekly_apply·변수 값)만 넘긴다."""
     y = _yml("retention.yml")
-    block = y[y.index("AUTO_APPLY: ${{ vars.RETENTION_AUTO_APPLY }}") :]
-    assert '"$AUTO_APPLY" = "false"' in block and "--no-auto" in block  # 변수 false → 읽기만
-    assert "--auto" not in y.replace("--no-auto", "")  # 켜는 플래그는 없다(기본 켜짐)
+    assert "AUTO_APPLY: ${{ vars.RETENTION_AUTO_APPLY }}" in y and "EVENT: ${{ github.event_name }}" in y
+    assert "WEEKLY_APPLY: ${{ inputs.weekly_apply }}" in y
+    assert (
+        '--event "$EVENT"' in y and '--weekly-apply "$WEEKLY_APPLY"' in y and '--auto-var "$AUTO_APPLY"' in y
+    )
+    assert "--no-auto" not in y.replace("# ", "")  # 셸에서 직접 끄는 줄이 없다(주석 제외)
     assert "RETENTION_AUTO_APPLY=true" not in y  # 켜기 위해 변수를 만들 필요가 없다
 
 
-def test_manual_weekly_only_reads_unless_weekly_apply_is_switched_on():
+def test_manual_weekly_input_weekly_apply_exists():
     y = _yml("retention.yml")
-    assert "weekly_apply" in y and "EVENT: ${{ github.event_name }}" in y
-    assert '"$EVENT" != "schedule"' in y and '"$WEEKLY_APPLY" != "true"' in y
+    assert "weekly_apply" in y and "default: false" in y
+
+
+# ── 켜짐·꺼짐 판단과 이유 (사용자 보고 2026-11-08: 변수를 만든 적이 없는데 "비상 정지 변수 false"로 나옴) ──────────
+@pytest.mark.parametrize(
+    "event, weekly_apply, var, auto, reason",
+    [
+        ("schedule", "", "", True, "schedule"),  # 예약 + 변수 없음(빈 글자) = 삭제 켜짐. 가장 중요한 경우
+        ("schedule", "", "true", True, "schedule"),
+        (
+            "schedule",
+            "false",
+            "",
+            True,
+            "schedule",
+        ),  # 예약에는 weekly_apply 가 비어 있다. 값이 있어도 영향 없음
+        ("schedule", "", "false", False, "emergency"),  # 비상 정지
+        ("schedule", "", " False ", False, "emergency"),  # 대소문자·공백이 달라도 끈다(안전한 쪽)
+        ("workflow_dispatch", "false", "", False, "manual"),  # 수동 점검
+        ("workflow_dispatch", "", "", False, "manual"),
+        ("workflow_dispatch", "true", "", True, "weekly_apply"),  # 수동 + weekly_apply 켬
+        ("workflow_dispatch", "true", "false", False, "emergency"),  # 비상 정지가 weekly_apply 보다 앞선다
+        ("workflow_dispatch", "false", "false", False, "emergency"),  # 둘 다면 비상 정지가 이유
+    ],
+)
+def test_decide_auto_covers_every_case(event, weekly_apply, var, auto, reason):
+    d = RT.decide_auto(event, weekly_apply, var)
+    assert (d.auto, d.reason) == (auto, reason)
+
+
+def test_decide_auto_direct_cli_run_and_the_explicit_off_flag():
+    assert RT.decide_auto(None, "", "") == RT.AutoDecision(True, "cli")
+    assert RT.decide_auto("schedule", "", "", no_auto=True) == RT.AutoDecision(False, "flag")
+
+
+def test_the_three_off_reasons_and_the_on_reasons_read_differently():
+    texts = {r: RT.AUTO_REASON_TEXT[r] for r in ("manual", "emergency", "schedule", "weekly_apply")}
+    assert "수동 점검" in texts["manual"] and "weekly_apply 꺼짐" in texts["manual"]
+    assert "비상 정지" in texts["emergency"] and "RETENTION_AUTO_APPLY=false" in texts["emergency"]
+    assert "예약" in texts["schedule"] and "weekly_apply" in texts["weekly_apply"]
+    assert "RETENTION_AUTO_APPLY" not in texts["manual"] and "RETENTION_AUTO_APPLY" not in texts["schedule"]
+    assert len(set(texts.values())) == 4
+
+
+def _run_weekly_cli(tmp_path, *args):
+    f = _fake()
+    code = RT.main(["weekly", "--no-issue", "--out", str(tmp_path), *args], env=_env(f), now=NOW)
+    data = json.loads((tmp_path / "retention" / "weekly.json").read_text(encoding="utf-8"))
+    return f, code, data, (tmp_path / "retention" / "weekly.md").read_text(encoding="utf-8")
+
+
+def test_scheduled_run_with_the_variable_unset_really_deletes(tmp_path):
+    """예약 실행 + 변수 없음(Actions 에서는 빈 글자) → 실제로 지운다. 워크플로가 넘기는 인자 그대로."""
+    f, code, data, md = _run_weekly_cli(
+        tmp_path, "--event", "schedule", "--weekly-apply", "", "--auto-var", ""
+    )
+    assert code == 0 and data["auto"] is True and data["auto_reason"] == "schedule"
+    assert data["applied_rows"] == 16 and len(f.tables["water_outlook"]) == 6
+    assert "켜짐" in md and "예약 실행" in md and "꺼짐" not in md and "RETENTION_AUTO_APPLY" not in md
+
+
+def test_scheduled_run_with_the_variable_false_only_reads_and_says_emergency_stop(tmp_path):
+    f, code, data, md = _run_weekly_cli(
+        tmp_path, "--event", "schedule", "--weekly-apply", "", "--auto-var", "false"
+    )
+    assert code == 0 and f.writes == [] and data["auto"] is False and data["auto_reason"] == "emergency"
+    assert "꺼짐" in md and "비상 정지" in md and "RETENTION_AUTO_APPLY=false" in md
+    assert "수동 점검" not in md and len(f.tables["water_outlook"]) == 18
+
+
+def test_manual_weekly_without_weekly_apply_reads_only_and_says_manual_check(tmp_path):
+    """사용자가 11/8 14:28 에 누른 경우: 변수는 없고 수동 실행, weekly_apply 꺼짐."""
+    f, code, data, md = _run_weekly_cli(
+        tmp_path, "--event", "workflow_dispatch", "--weekly-apply", "false", "--auto-var", ""
+    )
+    assert code == 0 and f.writes == [] and data["auto"] is False and data["auto_reason"] == "manual"
+    assert "수동 점검(weekly_apply 꺼짐)" in md
+    assert "비상 정지" not in md and "RETENTION_AUTO_APPLY=false" not in md  # 변수 탓이라고 하지 않는다
+
+
+def test_manual_weekly_with_weekly_apply_deletes_like_the_schedule(tmp_path):
+    f, code, data, md = _run_weekly_cli(
+        tmp_path, "--event", "workflow_dispatch", "--weekly-apply", "true", "--auto-var", ""
+    )
+    assert code == 0 and data["auto"] is True and data["auto_reason"] == "weekly_apply"
+    assert data["applied_rows"] == 16 and "weekly_apply 켬" in md
+
+
+def test_waiting_reminder_names_the_real_reason():
+    for reason, must, must_not in [
+        ("manual", "수동 점검", "비상 정지"),
+        ("emergency", "비상 정지", "수동 점검"),
+    ]:
+        f = _fake()
+        res = RT.weekly(_env(f), NOW, auto=False, auto_reason=reason)
+        t = res.alerts[0].text
+        assert must in t and must_not not in t and "16줄" in t
+        assert (
+            res.alerts[0].key == "warn:retention:보관 대기"
+        )  # 열쇠는 이유와 무관(이슈에 댓글이 쌓이지 않음)
 
 
 def test_manual_modes_keep_their_inputs():
