@@ -40,6 +40,7 @@ from croplib_dp.core.forecast_daily import (
     usable_items,
 )
 from croplib_dp.core.forecast_eto import forecast_table
+from croplib_dp.core.grid import check_station_grid, forecast_ready
 from croplib_dp.core.kc import adjust_crop, stage_climate
 from croplib_dp.core.outlook import (
     MAIN_DAYS,
@@ -368,6 +369,9 @@ class SlotResult:
     stations: list[dict] = field(default_factory=list)  # 지점별 요약 (사람이 읽는 보고)
     raw_files: dict[str, bytes] = field(default_factory=dict)  # Storage 버킷 raw 에 올릴 파일
     problems: list[str] = field(default_factory=list)  # 계약 검사·올리기에서 생긴 문제
+    warnings: list[str] = field(
+        default_factory=list
+    )  # 실패는 아니지만 알릴 것(격자 비어 있음·다름, 결정 0025)
     uploaded: bool = False
 
     @property
@@ -585,6 +589,24 @@ def collect_stations(d: Dictionaries) -> list[str]:
     )
 
 
+def _grid_warning(stn_id: str, st: dict, result: SlotResult) -> None:
+    """예보 지점의 격자 점검(결정 0025). DB 격자가 비어 있으면 그 지점 예보만 건너뛰고(관측은 계속),
+    DB 격자가 계산값과 다르면 DB 값으로 예보를 계속하되 경고한다."""
+    c = check_station_grid(st)
+    label = f"{stn_id} {st.get('name_ko') or ''}".strip()
+    if c.status == "missing":
+        calc = f" 계산값은 {c.calc[0]},{c.calc[1]}" if c.calc else ""
+        result.warnings.append(
+            f"{label}: 예보 격자가 비어 있어 예보를 건너뜀(관측은 계속).{calc} CropMon 격자 시드 필요"
+        )
+    elif c.status == "differs":
+        result.warnings.append(
+            f"{label}: DB 격자 {c.db[0]},{c.db[1]}가 계산값 {c.calc[0]},{c.calc[1]}과 다름 "
+            "— DB 값으로 예보 계속"
+            "(경계 근처 좌표 차이일 수 있음)"
+        )
+
+
 def run_slot(
     name: str,
     issue: Any,
@@ -611,7 +633,9 @@ def run_slot(
         st = d.stations[stn_id]
         scen = d.scenarios_for(stn_id, D.year)
         collector, col = None, None
-        if st.get("has_forecast") and st.get("grid_nx") is not None:
+        if st.get("has_forecast"):
+            _grid_warning(stn_id, st, result)
+        if forecast_ready(st):
             started = _iso(clock.now())
             collector = ForecastCollector(key, st["grid_nx"], st["grid_ny"], http, clock, result.log)
             col = collector.collect_service(issue, wait=wait)
@@ -683,6 +707,8 @@ def summary_text(r: SlotResult) -> str:
             )
     if r.problems:
         lines += ["", "## 문제"] + [f"- {x}" for x in r.problems]
+    if r.warnings:
+        lines += ["", "## 경고"] + [f"- {x}" for x in r.warnings]
     lines += [
         "",
         f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
@@ -702,6 +728,8 @@ def brief_text(r: SlotResult) -> str:
     lines = [f"# 물 수집 {r.run_name} {r.issue:%Y-%m-%d %H:%M} (계산 {CALC_VERSION})"]
     if r.problems:
         lines += [f"! {x}"[:300] for x in r.problems[:5]]
+    if r.warnings:
+        lines += [f"? {x}"[:300] for x in r.warnings[:5]]
     for s in r.stations:
         last = str(s.get("asos_last") or "")[5:] or "없음"
         parts = [s.get("result", "관측만"), f"ASOS ~{last}"]
@@ -827,7 +855,9 @@ def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -
     """이 회차가 이미 '정시 성공'으로 끝났나 (예보 지점 모두).
     예약을 여러 번 걸어 둔 실행이 같은 일을 다시 하지 않게 한다.
     정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다."""
-    stations = collect_stations(d)
+    # 예보를 할 수 있는 지점(격자 있음)만 기다린다. 격자가 비어 있는 지점은 예보를 건너뛰므로 그 지점 때문에
+    # 같은 회차가 반복되면 안 된다(#28 문제 ④, 결정 0025).
+    stations = [s for s in collect_stations(d) if forecast_ready(d.stations[s])]
     if not stations:
         return False
     run_at = urllib.parse.quote(_iso(issue), safe="")

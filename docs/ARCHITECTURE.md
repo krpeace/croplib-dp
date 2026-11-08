@@ -21,6 +21,7 @@
 | `core/forecast_eto.py` | 예보 ETo·ETc (S4 고정 계수, 안 되면 S3) | `cropwater_fcst.forecast_table` |
 | `core/outlook.py` | 3일 전망: 오차표, 세 경로(중심·빠르면·늦으면), 아침·저녁 출발, 관측 지연 (`water_outlook` 한 줄), 요약: 관수 필요 예상일(주 지표 3일)·권장 관수량·3일 합 (`water_outlook_summary` 한 줄) | `fcst_wb.service_outlook`, 서비스 엑셀 "관수 전망" |
 | `core/heat_sun.py` | 적산온도(GDD, maxmin)·도달일, 같은 날 평균 평년, 1/1~12/31 한 해 표(결측은 평년으로 채움), 평년보다 며칠 빠른가 (`heat_daily`·`sun_daily`) | cropweather `temp_core.calc_gdd`·`gdd_reaching_dates` |
+| `core/grid.py` | 예보 격자(순수 함수): 위경도 → 기상청 단기예보 격자(Lambert 정각원추, `kma_lcc_5km_v1`), 반올림 경계 근접 판정, 지점 격자 점검(`ok`·`differs`·`missing`·`unchecked`), `forecast_ready`(has_forecast + DB 격자 있음, DB 값이 기준), 운영 지점 격자 표·겹침 (결정 0025) |
 | `core/retention.py` | 전망 표 월 보관·원문 보관 기간 규칙(순수 함수): 14일 기준(한국 날짜)·월·보관 파일 경로·열·합치기·결정적 csv.gz, 대표 밖 원문 90일 판정(`fcst-ext/`만), gzip·xz 원문 읽기, xz 절감 추정 (결정 0022) | 새로 만듦 |
 | `core/coast.py` | 해안선까지 거리(km)·섬 판정·해상도 보정(땅 밖 3 km 이내는 거리 0, 표시). 육지 = 가장 큰 땅 다각형 (결정 0021) | 새로 만듦 (Natural Earth 10m 자료를 읽는 것은 `io/coast_data.py`) |
 | `core/radiation_report.py` | 일사 점검 결과 + 해안선 거리 → 실태표 csv·보고서 md·관계 그림 svg(문자열 생성) (결정 0021) | 새로 만듦 |
@@ -101,6 +102,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 | `core/monitor.py` | 경고 규칙: 마지막 회차가 17시간 넘게 지남(오류), 마지막 회차 실패(오류), 수집 지점 0곳(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고), 12시 뒤에도 어제 적산온도 없음(경고), 매달 9일 뒤에도 KREI 원예 4부류(과일·과채·엽근채소·양념채소) 이번 달 월보 미수집 또는 `failed` 건 있음(경고). 빠진 지점이 10곳을 넘으면 "N곳 — 앞 10곳 …"으로 줄임. DB 용량(정확 400/450MB, 추정 360/405MB, 조회 실패)(결정 0022) |
 | `io/github_issue.py` | "수집 경고" 이슈 열기·댓글·닫기. 새 경고가 생길 때만 댓글(같은 경고로 메일이 쌓이지 않게). 제목·라벨을 바꿔 쓸 수 있음(알림 연습) |
 | `collectors/monitor.py` | DB에서 최근 서버 회차 기록, 수집 지점(`stations.has_forecast = true`)의 관측 마지막 날, 운영 지점(`is_active = true`)의 어제 적산온도 유무(`heat_daily` 한 번에 조회), KREI 이번 달 발행물·실패 건(`krei.report`)을 읽어 규칙을 돌리고 이슈에 반영. 관측은 수집 지점만, 적산온도는 운영 지점 전부 본다(결정 0007 보충, 0017, 0019). DB 크기는 CropMon `db_size_bytes()` RPC, 없으면 표 8개 줄 수 × 줄당 크기로 추정(결정 0022) |
+| `collectors/grid_table.py` | 사람이 손으로 한 번(워크플로 없음): 운영 지점 예보 격자 표 `docs/data/stations_grid_<날짜>.csv`·`.md`(겹침·경계 근접). `--source csv`(저장소 지점 목록) 또는 `db`(읽기 전용 키로 `stations`만 읽고 DB 격자와 비교). DB 쓰기 없음 (결정 0025) |
 | `collectors/radiation_audit.py` | 사람이 누를 때만(`radiation-audit.yml`): 운영 지점 × 지난 365일 ASOS 일자료 → `core/radiation_audit` → 결과 파일. **DB 쓰기 없음**, 지점 목록만 읽음 (결정 0021) |
 | `io/storage.py` | Supabase Storage: 목록(재귀·크기)·내려받기·올리기·지우기. 서버 키 사용, 지운 개수가 요청과 다르면 오류 (결정 0022) |
 | `io/db_stats.py` | DB 읽기 도우미: 줄 수(`Prefer: count=exact`)·1,000줄씩 이어 읽기 (결정 0022) |
