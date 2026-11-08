@@ -48,6 +48,38 @@ def read_table(
     return json.loads(body)
 
 
+def read_pages(
+    base_url: str,
+    key: str,
+    table: str,
+    http: RestGet = rest_get,
+    query: str = "select=*",
+    page: int = 1000,
+) -> list[dict]:
+    """한 번에 1,000줄(PostgREST 기본 한도)을 넘을 수 있는 읽기: limit·offset 으로 쪽을 이어 받는다.
+    쪽 순서가 흔들리지 않게 query 에 order 가 있어야 한다."""
+    out: list[dict] = []
+    while True:
+        rows = read_table(base_url, key, table, http, f"{query}&limit={page}&offset={len(out)}")
+        out += rows
+        if len(rows) < page:
+            return out
+
+
+def column_exists(base_url: str, key: str, table: str, column: str, http: RestGet = rest_get) -> bool:
+    """표에 그 칸이 있나. 한 줄만 골라 읽어 보고, PostgREST 가 "칸 없음"(HTTP 400, 코드 42703)으로
+    답하면 False.
+    그 밖의 오류(인증·서버·연결)는 알 수 없는 것이므로 오류를 그대로 올린다(없다고 단정하지 않는다)."""
+    try:
+        read_table(base_url, key, table, http, f"select={column}&limit=1")
+        return True
+    except RuntimeError as e:
+        text = str(e)
+        if "HTTP 400" in text and ("42703" in text or "does not exist" in text):
+            return False
+        raise
+
+
 @dataclass
 class Dictionaries:
     stations: dict[str, dict] = field(default_factory=dict)

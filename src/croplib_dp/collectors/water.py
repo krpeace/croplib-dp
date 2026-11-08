@@ -12,6 +12,12 @@
   3) 지점마다 ASOS 일자료(작기 시작 또는 3/1 ~ 어제) 한 번 조회 → 일 기상값·ETo
   4) 계산 조건마다 Kc 기후보정 → 관측 물수지(빠진 날은 아침 D+0 예보로) → (예보 지점) 3일 전망
      예보 지점(has_forecast)은 토성 12종 작물 공통 물 상태(`soil_water_daily`)도 함께 계산한다.
+  4') 관측만 하는 지점(운영 is_active 인데 예보 지점이 아님, Actions 변수 OBS_ALL_STATIONS=true 일 때만,
+  결정 0026):
+     예보·계산 조건(사과·배추)·forecast_runs 없이 ASOS(1/1~어제)와 토성 12종 작물 공통 물 상태만 계산한다.
+     평소 회차는 최근 14일 줄만 올리고(창 시작 전날 Dr 을 DB 줄에서 읽어 이어 계산, 없으면 전체 재계산 +
+     경고),
+     ASOS 실패는 회차 실패가 아니라 경고(재시도 2번, 단계 20분 상한). 소급(--soil-backfill)은 20곳씩.
   5) DB 표와 같은 모양의 줄(forecast_runs, weather_daily, water_balance_daily, soil_water_daily,
      water_outlook, water_outlook_summary)과 수집 기록
 """
@@ -21,9 +27,11 @@ import datetime as dt
 import gzip
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +50,7 @@ from croplib_dp.core.forecast_daily import (
 from croplib_dp.core.forecast_eto import forecast_table
 from croplib_dp.core.grid import check_station_grid, forecast_ready
 from croplib_dp.core.kc import adjust_crop, stage_climate
+from croplib_dp.core.monitor import named
 from croplib_dp.core.outlook import (
     MAIN_DAYS,
     fill_from_forecast,
@@ -52,16 +61,19 @@ from croplib_dp.core.outlook import (
     service_outlook,
     wb_frame,
 )
-from croplib_dp.core.soil_water import soil_water_rows
+from croplib_dp.core.retention import ROW_BYTES
+from croplib_dp.core.soil_water import MissingPrior, soil_water_rows, window_needs_prior
 from croplib_dp.core.water_balance import observed_water_balance
 from croplib_dp.io import kma
 from croplib_dp.io.coefficients import load_error_rows, load_s3_coef, load_s4_coef
 from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import (
     Dictionaries,
+    column_exists,
     crop_height,
     crop_params,
     load_dictionaries,
+    read_pages,
     read_table,
     rest_get,
     soil_of,
@@ -75,7 +87,11 @@ DEADLINE_MIN = 90  # 마감 = 발표 + 90분 (03:30, 18:30). cropwater 2026-10-1
 RETRY_MIN = (0, 5, 10, 15, 20, 30, 45, 60, 80)  # 회차 시작(발표 + 10분)부터의 재시도 시각(분)
 CATCHUP_H = 24  # 함께 받는 앞선 발표 범위(시간)
 COLLECTOR = "actions"
-SOIL_UPLOAD_DAYS = 14  # 평소 회차에서 올리는 최근 일수 (--soil-backfill 이면 그해 3/1부터 전체)
+SOIL_UPLOAD_DAYS = 14  # 평소 회차에서 올리는 최근 일수 (--soil-backfill 이면 그해 1/1부터 전체)
+OBS_ASOS_RETRY_S = (30, 90)  # 관측만 하는 지점의 ASOS 재시도(모두 3번): 대표 지점의 (30, 90, 180)보다 짧게
+OBS_STAGE_MAX_S = 20 * 60  # 관측만 하는 지점 단계 전체의 시간 상한. 넘으면 남은 지점은 다음 회차로
+OBS_BACKFILL_MAX = 20  # 소급은 한 번에 관측만 하는 지점 20곳까지 (사용자 확정 2026-11-08)
+OBS_SWITCH = "OBS_ALL_STATIONS"  # Actions 변수: true 일 때만 관측 전 지점(기본 꺼짐)
 RESULTS = (
     "정시 성공",
     "백업: S3",
@@ -349,6 +365,7 @@ WEATHER_COLS = (
     "u2_ms",
     "sunshine_h",
     "rs_mj",
+    "rs_source",
     "rain_mm",
     "eto_mm",
     "filled",
@@ -371,14 +388,14 @@ class SlotResult:
     problems: list[str] = field(default_factory=list)  # 계약 검사·올리기에서 생긴 문제
     warnings: list[str] = field(
         default_factory=list
-    )  # 실패는 아니지만 알릴 것(격자 비어 있음·다름, 결정 0025)
+    )  # 실패는 아니지만 알릴 것(격자 비어 있음·다름 결정 0025, 관측 전용 지점 문제 결정 0026)
     uploaded: bool = False
 
     @property
     def failed(self) -> bool:
         return (
             any(r["result"] == "실패" for r in self.forecast_runs)
-            or any(not s["asos_ok"] for s in self.stations)
+            or any(not s["asos_ok"] for s in self.stations if not s.get("obs_only"))
             or bool(self.problems)
         )
 
@@ -386,16 +403,19 @@ class SlotResult:
 ASOS_RETRY_S = (30, 90, 180)  # ASOS 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 다시 (모두 4번)
 
 
-def fetch_weather(key, stn_id, st, start, end, http, clock, log) -> tuple[list[dict], dict]:
-    """ASOS start~end → (일 기상값 목록, ASOS 조회 결과). 일시 오류(retry)는 세 번 더 시도한다"""
-    for attempt in range(1, len(ASOS_RETRY_S) + 2):
+def fetch_weather(
+    key, stn_id, st, start, end, http, clock, log, retry_s: Sequence[int] = ASOS_RETRY_S
+) -> tuple[list[dict], dict]:
+    """ASOS start~end → (일 기상값 목록, ASOS 조회 결과). 일시 오류(retry)는 retry_s 만큼 더 시도한다
+    (대표 지점은 30·90·180초 = 세 번 더, 관측만 하는 지점은 30·90초 = 두 번 더)"""
+    for attempt in range(1, len(retry_s) + 2):
         res = kma.fetch_asos_days(key, stn_id, start, end, http)
         for page, body in res["bodies"]:
             log.raw.append((f"asos_{stn_id}_{start:%Y%m%d}_{end:%Y%m%d}_a{attempt}_p{page}", body))
         log.add(clock, "asos", f"{stn_id} {start}~{end}", attempt, res, res["status"])
-        if res["status"] != "retry" or attempt > len(ASOS_RETRY_S):
+        if res["status"] != "retry" or attempt > len(retry_s):
             break
-        clock.sleep(ASOS_RETRY_S[attempt - 1])
+        clock.sleep(retry_s[attempt - 1])
     items = [it for it in res["items"] if start <= dt.date.fromisoformat(str(it.get("tm", ""))[:10]) <= end]
     return daily_weather(items, station_meta(st)), res
 
@@ -589,6 +609,123 @@ def collect_stations(d: Dictionaries) -> list[str]:
     )
 
 
+def _is_true(v: Any) -> bool:
+    return v is True or str(v).strip().lower() == "true"
+
+
+def obs_all_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """관측 물 계산을 운영 지점 전부로 넓힐지. Actions 변수 OBS_ALL_STATIONS 가 true 일 때만 켜짐(기본 꺼짐).
+    비상 정지 변수(RETENTION_AUTO_APPLY)와 반대로 "켜는" 변수다. 새 수집은 승인된 뒤에만 켜져야 한다."""
+    env = os.environ if env is None else env
+    return str(env.get(OBS_SWITCH, "")).strip().lower() == "true"
+
+
+def observation_stations(d: Dictionaries) -> list[str]:
+    """관측 대상 = 운영 지점(is_active). 폐지·휴지 지점은 새 줄을 쓰지 않는다(결정 0024)."""
+    return sorted(
+        (k for k, st in d.stations.items() if _is_true(st.get("is_active"))),
+        key=lambda k: (d.stations[k].get("sort_order", 0), k),
+    )
+
+
+def observation_only_stations(d: Dictionaries) -> list[str]:
+    """관측만 하는 지점 = 운영 지점 중 예보 지점(has_forecast)이 아닌 곳 (작물 공통 12토성만, 결정 D1·D2)."""
+    return [k for k in observation_stations(d) if not d.stations[k].get("has_forecast")]
+
+
+def has_calc_inputs(st: Mapping[str, Any]) -> bool:
+    """ETo·물 계산에 필요한 지점 값(위경도·고도·풍속계 높이)이 모두 있나"""
+    return all(st.get(c) is not None for c in ("lat", "lon", "elev_m", "wind_height_m"))
+
+
+def default_soil_code(soils: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]]) -> str | None:
+    """감시가 "어제 줄이 있나"를 볼 때 쓰는 토성 하나: 기본(is_default) 토성, 없으면 정렬 첫
+    토성."""
+    rows = list(soils.values() if isinstance(soils, Mapping) else soils)
+    if not rows:
+        return None
+    rows.sort(key=lambda x: (x.get("sort_order", 0), x["soil_code"]))
+    pick = next((x for x in rows if _is_true(x.get("is_default"))), rows[0])
+    return pick["soil_code"]
+
+
+def load_soil_prior(
+    base: str, key: str, stations: Sequence[str], day: dt.date, http=rest_get
+) -> dict[tuple[str, str], dict]:
+    """창 재계산의 시작점: 그 날짜(창 시작 전날)의 soil_water_daily 줄 → {(지점, 토성): {dr_mm, dp_mm,
+    filled}}.
+    지점 × 토성 줄이 1,000줄을 넘어(97 × 12) 쪽으로 나눠 읽는다. 읽기만 한다."""
+    if not stations:
+        return {}
+    query = (
+        f"select=stn_id,soil_code,dr_mm,dp_mm,filled&date=eq.{day}"
+        f"&stn_id=in.({','.join(str(s) for s in stations)})&order=stn_id,soil_code"
+    )
+    out: dict[tuple[str, str], dict] = {}
+    for r in read_pages(base, key, "soil_water_daily", http, query):
+        num = lambda v: None if v is None else float(v)  # noqa: E731
+        out[(str(r["stn_id"]), r["soil_code"])] = dict(
+            dr_mm=num(r.get("dr_mm")), dp_mm=num(r.get("dp_mm")), filled=bool(r.get("filled"))
+        )
+    return out
+
+
+def rs_source_state(base: str, key: str, http=rest_get) -> tuple[bool, str]:
+    """DB weather_daily 에 rs_source 칸이 있나(C7, CropMon 반영 여부). (있음?, 빼고 올릴 때 보고 문구).
+    있다고 확인될 때만 올린다. 없거나 확인하지 못하면 그 칸만 빼고 올려 weather_daily 쓰기 전체가
+    실패하지 않게 하되
+    문구를 요약에 남긴다(조용히 넘어가지 않음)."""
+    try:
+        if column_exists(base, key, "weather_daily", "rs_source", http):
+            return True, ""
+        return False, "weather_daily.rs_source 칸이 DB에 없어 그 칸만 빼고 올림 (CropMon C7 반영 대기)"
+    except Exception as e:
+        return False, f"weather_daily.rs_source 칸이 있는지 확인하지 못해({str(e)[:120]}) 그 칸만 빼고 올림"
+
+
+@dataclass(frozen=True)
+class DispatchOptions:
+    stations: list[str] | None  # None = 기본 대상
+    soil_backfill: bool
+    write: bool
+    skip_if_done: bool
+
+
+def dispatch_options(
+    event: str, stations: str = "", backfill: str = "", dry_run: str = ""
+) -> DispatchOptions:
+    """실행 방식(collect.yml)에서 넘어온 값 → 실제 옵션. **새 입력(지점·소급·시험 실행)은
+    workflow_dispatch 에서만 쓴다.**
+    예약(schedule) 실행은 입력이 어떻게 와도 지금과 같다(기본 대상, 쓰기, 끝난 회차는 건너뜀).
+    지점이나 소급이나 시험 실행을 적은 수동 실행은 끝난 회차를 건너뛰지 않는다(그래야 소급·점검이 돈다)."""
+    if event != "workflow_dispatch":
+        return DispatchOptions(None, False, True, True)
+    ids = [t.strip() for t in str(stations or "").split(",") if t.strip()]
+    for t in ids:
+        if not re.fullmatch(r"[0-9]{1,5}", t):
+            raise SystemExit(f"지점 번호는 숫자만 쉼표로 적습니다: {t!r}")
+    bf = str(backfill or "").strip().lower() == "true"
+    dry = str(dry_run or "").strip().lower() == "true"
+    return DispatchOptions(ids or None, bf, not dry, not (ids or bf or dry))
+
+
+def check_backfill_scope(
+    d: Dictionaries, stations: Sequence[str] | None, soil_backfill: bool, obs_all: bool
+) -> None:
+    """소급은 관측만 하는 지점 20곳까지(사용자 확정). 지점을 안 적으면 97곳 전부라 멈춘다. 스위치가 꺼져
+    있거나
+    소급이 아니면 검사하지 않는다."""
+    if not (soil_backfill and obs_all):
+        return
+    only = observation_only_stations(d)
+    targets = only if not stations else [s for s in stations if s in set(only)]
+    if len(targets) > OBS_BACKFILL_MAX:
+        raise SystemExit(
+            f"소급은 관측만 하는 지점을 한 번에 {OBS_BACKFILL_MAX}곳까지만 합니다(지금 {len(targets)}곳). "
+            f"지점 번호(stations)를 {OBS_BACKFILL_MAX}곳 이하로 적어 주세요"
+        )
+
+
 def _grid_warning(stn_id: str, st: dict, result: SlotResult) -> None:
     """예보 지점의 격자 점검(결정 0025). DB 격자가 비어 있으면 그 지점 예보만 건너뛰고(관측은 계속),
     DB 격자가 계산값과 다르면 DB 값으로 예보를 계속하되 경고한다."""
@@ -607,6 +744,123 @@ def _grid_warning(stn_id: str, st: dict, result: SlotResult) -> None:
         )
 
 
+def run_obs_station(
+    stn_id: str,
+    issue: pd.Timestamp,
+    d: Dictionaries,
+    key: str,
+    http: kma.Http,
+    clock: Clock,
+    result: SlotResult,
+    fetched_at: str | None,
+    soil_backfill: bool = False,
+    soil_prior: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+) -> tuple[dict, bool]:
+    """관측만 하는 지점 하나(결정 0026): ASOS 1/1~어제 한 번 → 일 기상값·ETo → 토성별 작물 공통 물 상태.
+    예보·계산 조건(사과·배추)·forecast_runs 는 만들지 않는다(D1·D2).
+    평소 회차는 weather_daily·soil_water_daily 를 최근 14일만 올린다. 계산은 1/1부터 받은 기상값 전체로
+    하고(월 단위
+    일사 규칙·ETo 채우기를 소급 때와 같게), 토양은 창 시작 전날의 DB 줄(soil_prior)에서 이어 계산한다.
+    시작점이
+    없는 토성이 있으면 그 지점은 전체 재계산(올리는 건 창만)하고 반환값 둘째(시작점 없음)가 True 다.
+    반환: (지점 요약, 시작점 없음)"""
+    st = d.stations[stn_id]
+    prev = (issue.normalize() - pd.Timedelta(days=1)).date()
+    win_start = prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1)
+    start = dt.date(prev.year, 1, 1)
+    cutoff = None if soil_backfill else win_start
+    summary = dict(
+        stn_id=stn_id, name=st.get("name_ko"), n_weather=0, scenarios=[], error="", obs_only=True, n_soil=0
+    )
+    weather, res = fetch_weather(
+        key, stn_id, st, start, prev, http, clock, result.log, retry_s=OBS_ASOS_RETRY_S
+    )
+    for w in weather:
+        if cutoff is not None and w["date"] < cutoff:
+            continue
+        result.weather_daily.append(
+            _jsonable(
+                dict(
+                    stn_id=stn_id,
+                    date=w["date"],
+                    **{k: w[k] for k in WEATHER_COLS},
+                    fetched_at=fetched_at,
+                    calc_version=CALC_VERSION,
+                )
+            )
+        )
+    prior_missing = False
+    if weather and d.soils:
+        needs_prior = (not soil_backfill) and window_needs_prior(win_start, prev)
+        soils_sorted = sorted(d.soils.values(), key=lambda x: (x.get("sort_order", 0), x["soil_code"]))
+        for soil_row in soils_sorted:
+            if soil_row.get("fc") is None or soil_row.get("wp") is None:
+                continue
+            fc, wp = float(soil_row["fc"]), float(soil_row["wp"])
+            s_rows = None
+            if needs_prior:
+                pr = (soil_prior or {}).get((stn_id, soil_row["soil_code"]))
+                if pr is not None:
+                    try:
+                        s_rows = soil_water_rows(weather, fc, wp, window_start=win_start, prior=pr)
+                    except MissingPrior:
+                        s_rows = None
+                if s_rows is None:
+                    prior_missing = True
+            if s_rows is None:  # 시작점이 필요 없거나(3/1 시작·겨울·소급) 없어서 1/1부터 전체 재계산
+                s_rows = [
+                    r for r in soil_water_rows(weather, fc, wp) if cutoff is None or r["date"] >= cutoff
+                ]
+            for r in s_rows:
+                result.soil_water_daily.append(
+                    _jsonable(
+                        dict(
+                            stn_id=stn_id,
+                            soil_code=soil_row["soil_code"],
+                            date=r["date"],
+                            **{k: r[k] for k in SOIL_WATER_COLS},
+                        )
+                    )
+                )
+                summary["n_soil"] += 1
+    summary.update(
+        n_weather=len(weather),
+        asos_ok=res.get("status") == "ok",
+        asos_last=str(weather[-1]["date"]) if weather else None,
+        asos_status=res.get("status"),
+    )
+    return summary, prior_missing
+
+
+def _obs_warnings(
+    d: Dictionaries, result: SlotResult, skipped: dict[str, list[str]], prior_day: dt.date
+) -> None:
+    """관측만 하는 지점 단계의 경고를 종류별로 한 줄씩(지점이 많아도 줄 수가 늘지 않게)."""
+    names = {k: str(st.get("name_ko") or "") for k, st in d.stations.items()}
+    if skipped["no_input"]:
+        result.warnings.append(
+            f"관측 전용 {len(skipped['no_input'])}곳은 계산 입력(위경도·고도·풍속계 높이)이 비어 건너뜀 — "
+            f"{named(skipped['no_input'], names)}: stations 표 확인 필요"
+        )
+    if skipped["cap"]:
+        result.warnings.append(
+            f"관측 전용 단계가 {OBS_STAGE_MAX_S // 60}분 상한을 넘어 {len(skipped['cap'])}곳을 건너뜀 — "
+            f"{named(skipped['cap'], names)}: 다음 회차가 다시 받음"
+        )
+    failed = [s["stn_id"] for s in result.stations if s.get("obs_only") and not s.get("asos_ok", True)]
+    if failed:
+        result.warnings.append(
+            f"관측 전용 ASOS 실패 {len(failed)}곳 — {named(failed, names)}: 회차 실패로 세지 않음"
+            "(감시가 표 최신성으로 알림)"
+        )
+    if skipped["prior"]:
+        result.warnings.append(
+            f"관측 전용 {len(skipped['prior'])}곳: 창 시작 전날({prior_day})의 Dr 이 DB에 없어 "
+            f"1/1부터 전체 재계산함(올리는 건 최근 {SOIL_UPLOAD_DAYS}일만) — "
+            f"{named(skipped['prior'], names)}: 소급이 필요합니다"
+        )
+
+
 def run_slot(
     name: str,
     issue: Any,
@@ -617,8 +871,14 @@ def run_slot(
     stations: list[str] | None = None,
     wait: bool = True,
     soil_backfill: bool = False,
+    obs_all: bool = False,
+    soil_prior: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
 ) -> SlotResult:
-    """한 회차 전체. stations: 돌릴 지점(없으면 수집 지점 has_forecast. 감시·slot_done 과 같은 기준)"""
+    """한 회차 전체. stations: 돌릴 지점(없으면 수집 지점 has_forecast. 감시·slot_done 과 같은 기준).
+    obs_all: 켜면(OBS_ALL_STATIONS=true) 운영 지점 중 예보 지점이 아닌 곳을 "관측만 하는 지점"으로 뒤에
+    더하고,
+    stations 에 적힌 그런 지점도 관측만 하는 규칙으로 돈다(결정 0026). 꺼져 있으면 예전과 똑같다.
+    soil_prior: 관측만 하는 지점의 창 시작 전날 DB 줄 {(지점, 토성): {dr_mm, dp_mm, filled}} (평소 회차)."""
     clock = clock or Clock()
     issue = pd.Timestamp(issue)
     result = SlotResult(run_name=name, issue=issue)
@@ -626,11 +886,30 @@ def run_slot(
     prev = (D - pd.Timedelta(days=1)).date()
     fetched_at = _iso(clock.now())
     err_all = load_error_rows()
-    ids = stations or collect_stations(d)
+    obs_only = observation_only_stations(d) if obs_all else []
+    obs_set = set(obs_only)
+    ids = stations or (collect_stations(d) + obs_only)
     if not ids:
         result.problems.append("수집 지점이 0곳 — 지점 사전 has_forecast 확인")
+    skipped: dict[str, list[str]] = dict(no_input=[], cap=[], prior=[])
+    obs_t0 = None
     for stn_id in ids:
         st = d.stations[stn_id]
+        if stn_id in obs_set:
+            if not has_calc_inputs(st):
+                skipped["no_input"].append(stn_id)
+                continue
+            obs_t0 = obs_t0 or clock.now()
+            if (clock.now() - obs_t0).total_seconds() > OBS_STAGE_MAX_S:
+                skipped["cap"].append(stn_id)
+                continue
+            summary, prior_missing = run_obs_station(
+                stn_id, issue, d, key, http, clock, result, fetched_at, soil_backfill, soil_prior
+            )
+            if prior_missing:
+                skipped["prior"].append(stn_id)
+            result.stations.append(summary)
+            continue
         scen = d.scenarios_for(stn_id, D.year)
         collector, col = None, None
         if st.get("has_forecast"):
@@ -672,6 +951,8 @@ def run_slot(
         summary["asos_last"] = str(weather[-1]["date"]) if weather else None
         summary["asos_status"] = res.get("status") if res else "조회 안 함"
         result.stations.append(summary)
+    if obs_set:
+        _obs_warnings(d, result, skipped, prev - dt.timedelta(days=SOIL_UPLOAD_DAYS))
     return result
 
 
@@ -715,8 +996,21 @@ def summary_text(r: SlotResult) -> str:
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
         f"water_balance_daily {len(r.water_balance_daily)}, soil_water_daily {len(r.soil_water_daily)}, "
         f"water_outlook {len(r.water_outlook)}, water_outlook_summary {len(r.water_outlook_summary)}",
+        growth_text(r),
     ]
     return "\n".join(lines) + "\n"
+
+
+def growth_text(r: SlotResult) -> str:
+    """관측 물 상태 줄이 DB를 얼마나 늘리나(전부 새 줄일 때의 상한, 줄당 실측 크기 × 줄 수). 소급
+    dry-run 보고용.
+    이미 있는 줄은 덮어쓰므로 실제 증가는 이보다 작거나 같다."""
+    n_soil, n_wx = len(r.soil_water_daily), len(r.weather_daily)
+    mb = (n_soil * ROW_BYTES["soil_water_daily"] + n_wx * ROW_BYTES["weather_daily"]) / 1024 / 1024
+    return (
+        f"예상 DB 증가(전부 새 줄일 때의 상한): {mb:.1f}MB "
+        f"(soil_water_daily {n_soil}줄, weather_daily {n_wx}줄)"
+    )
 
 
 CROP_KO = {"apple": "사과", "kimchi_cabbage": "배추"}
@@ -730,7 +1024,10 @@ def brief_text(r: SlotResult) -> str:
         lines += [f"! {x}"[:300] for x in r.problems[:5]]
     if r.warnings:
         lines += [f"? {x}"[:300] for x in r.warnings[:5]]
+    obs = [s for s in r.stations if s.get("obs_only")]
     for s in r.stations:
+        if s.get("obs_only"):  # 97곳이 되면 지점마다 한 줄은 알림 칸(약 4KB)에 안 들어간다 → 한 줄로 모음
+            continue
         last = str(s.get("asos_last") or "")[5:] or "없음"
         parts = [s.get("result", "관측만"), f"ASOS ~{last}"]
         for c in s.get("scenarios", []):
@@ -748,6 +1045,12 @@ def brief_text(r: SlotResult) -> str:
         if s.get("error"):
             head += f" · 오류: {s['error']}"[:200]
         lines.append(head)
+    if obs:
+        bad = sum(1 for s in obs if not s.get("asos_ok", True))
+        lines.append(
+            f"- 관측 전용 {len(obs)}곳: ASOS 성공 {len(obs) - bad} · 실패 {bad} · "
+            f"토양 {sum(s.get('n_soil', 0) for s in obs)}줄"
+        )
     lines.append(
         f"DB 올리기: {'완료' if r.uploaded else '안 함'} · 전망 {len(r.water_outlook)}줄 · "
         f"요약 {len(r.water_outlook_summary)}줄 · 물수지 {len(r.water_balance_daily)}줄"
@@ -786,11 +1089,15 @@ def write_outputs(r: SlotResult, out_dir: Path) -> Path:
 RUN_KEY = ("run_at", "stn_id", "collector")  # water_outlook 줄에 run_id 대신 붙여 둔 회차 열쇠
 
 
-def check_contract(r: SlotResult, taw_by_scenario: dict[str, float]) -> list[str]:
-    """여섯 표를 계약 v1.5로 검사. 어긋난 곳 설명 목록"""
+def check_contract(
+    r: SlotResult, taw_by_scenario: dict[str, float], rs_source_column: bool = True
+) -> list[str]:
+    """여섯 표를 계약 v1.5로 검사. 어긋난 곳 설명 목록.
+    rs_source_column: DB에 weather_daily.rs_source 칸이 있나. 없으면 그 칸은 검사에서 뺀다(올리기 전에
+    빼므로)."""
     return (
         check_rows("forecast_runs", r.forecast_runs)
-        + check_rows("weather_daily", r.weather_daily)
+        + check_rows("weather_daily", r.weather_daily, ignore=() if rs_source_column else ("rs_source",))
         + check_rows("water_balance_daily", r.water_balance_daily, taw_by_scenario)
         + check_rows("soil_water_daily", r.soil_water_daily)
         + check_rows("water_outlook", r.water_outlook, taw_by_scenario, ignore=("run_id",), extra=RUN_KEY)
@@ -808,12 +1115,21 @@ def _run_key(row: dict) -> tuple:
     return (pd.Timestamp(row["run_at"]), str(row["stn_id"]), row["collector"])
 
 
-def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> SlotResult:
+def publish(
+    r: SlotResult,
+    writer: Any,
+    taw_by_scenario: dict[str, float],
+    rs_source_column: bool = True,
+    rs_source_note: str = "",
+) -> SlotResult:
     """계약 검사 → 원자료(Storage) → weather_daily → water_balance_daily → soil_water_daily
     → forecast_runs → water_outlook(·요약).
+    rs_source_column=False(DB에 칸이 없거나 있는지 모름)이면 weather_daily 에서 그 칸만 빼고 올리고
+    경고를 남긴다
+    (칸이 없는 채로 올리면 PostgREST 가 알 수 없는 칸이라며 거절해 weather_daily 쓰기 전체가 실패한다).
     계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 '실패'와 이유를 담아 올린다.
     원자료 올리기가 실패하면 기록에 남기고 raw_path를 비운 채 계속한다(계산 결과가 더 중요)."""
-    problems = check_contract(r, taw_by_scenario)
+    problems = check_contract(r, taw_by_scenario, rs_source_column)
     if problems:
         r.problems += problems
         reason = ("계약 검사: " + problems[0])[:500]
@@ -829,7 +1145,13 @@ def publish(r: SlotResult, writer: Any, taw_by_scenario: dict[str, float]) -> Sl
             for x in r.forecast_runs:
                 if x["raw_path"] == path:
                     x["raw_path"] = None
-    writer.upsert("weather_daily", r.weather_daily, SPECS["weather_daily"].key)
+    weather = r.weather_daily
+    if not rs_source_column:
+        weather = [{k: v for k, v in w.items() if k != "rs_source"} for w in r.weather_daily]
+        r.warnings.append(
+            rs_source_note or "weather_daily.rs_source 칸을 빼고 올림 (DB에 칸이 없다고 알려 줌)"
+        )
+    writer.upsert("weather_daily", weather, SPECS["weather_daily"].key)
     writer.upsert("water_balance_daily", r.water_balance_daily, SPECS["water_balance_daily"].key)
     if r.soil_water_daily:
         writer.upsert("soil_water_daily", r.soil_water_daily, SPECS["soil_water_daily"].key)
@@ -854,7 +1176,9 @@ def taw_map(d: Dictionaries) -> dict[str, float]:
 def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -> bool:
     """이 회차가 이미 '정시 성공'으로 끝났나 (예보 지점 모두).
     예약을 여러 번 걸어 둔 실행이 같은 일을 다시 하지 않게 한다.
-    정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다."""
+    정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다.
+    **관측만 하는 지점(OBS_ALL_STATIONS)은 보지 않는다**(사용자 확정 2026-11-08, 결정 0026): 그 지점의 ASOS가
+    계속 안 돼도 회차를 되풀이하지 않고, 감시의 "N일째" 경고(`obs`)로만 알린다."""
     # 예보를 할 수 있는 지점(격자 있음)만 기다린다. 격자가 비어 있는 지점은 예보를 건너뛰므로 그 지점 때문에
     # 같은 회차가 반복되면 안 된다(#28 문제 ④, 결정 0025).
     stations = [s for s in collect_stations(d) if forecast_ready(d.stations[s])]
@@ -890,14 +1214,45 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--skip-if-done", action="store_true", help="이 회차가 이미 '정시 성공'이면 아무것도 하지 않고 끝내기"
     )
+    p.add_argument(
+        "--event",
+        help="워크플로 실행 방식(github.event_name). 주면 --stations·--soil-backfill·--write·"
+        "--skip-if-done 대신 아래 --input-* 값을 dispatch_options 로 판단한다(schedule 이면 입력은 무시)",
+    )
+    p.add_argument(
+        "--input-stations", default="", help="(--event 와 함께) 수동 실행 입력: 지점 번호 쉼표 목록"
+    )
+    p.add_argument("--input-backfill", default="", help="(--event 와 함께) 수동 실행 입력: 소급(true)")
+    p.add_argument(
+        "--input-dry-run", default="", help="(--event 와 함께) 수동 실행 입력: 시험 실행(true면 DB 안 씀)"
+    )
     a = p.parse_args(argv)
+    if a.event is not None:
+        o = dispatch_options(a.event, a.input_stations, a.input_backfill, a.input_dry_run)
+        stations, soil_backfill, write, skip_if_done = o.stations, o.soil_backfill, o.write, o.skip_if_done
+    else:
+        stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
+        soil_backfill, write, skip_if_done = a.soil_backfill, a.write, a.skip_if_done
     clock = Clock()
     name, issue = parse_slot(a.slot) if a.slot else current_slot(clock.now())
-    d = load_dictionaries(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
-    if a.skip_if_done and slot_done(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), d, issue):
+    base, svc = _env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")
+    d = load_dictionaries(base, svc)
+    obs_all = obs_all_enabled()
+    check_backfill_scope(d, stations, soil_backfill, obs_all)
+    if skip_if_done and slot_done(base, svc, d, issue):
         print(f"{name} {issue:%Y-%m-%d %H:%M} 회차는 이미 정시 성공으로 끝났습니다. 다시 하지 않습니다.")
         return 0
-    stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
+    soil_prior = None
+    if (
+        obs_all and not soil_backfill
+    ):  # 평소 회차: 관측만 하는 지점의 창 시작 전날 Dr 을 DB 줄에서 한 번에 읽는다
+        ids = stations or (collect_stations(d) + observation_only_stations(d))
+        only = set(observation_only_stations(d))
+        obs_ids = [s for s in ids if s in only and has_calc_inputs(d.stations[s])]
+        prev = (issue.normalize() - pd.Timedelta(days=1)).date()
+        win_start = prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1)
+        if obs_ids and d.soils and window_needs_prior(win_start, prev):
+            soil_prior = load_soil_prior(base, svc, obs_ids, win_start - dt.timedelta(days=1))
     r = run_slot(
         name,
         issue,
@@ -906,12 +1261,21 @@ def main(argv: list[str] | None = None) -> int:
         clock=clock,
         stations=stations,
         wait=not a.no_wait,
-        soil_backfill=a.soil_backfill,
+        soil_backfill=soil_backfill,
+        obs_all=obs_all,
+        soil_prior=soil_prior,
     )
-    if a.write:
+    if write:
         from croplib_dp.io.supabase_write import SupabaseWriter
 
-        publish(r, SupabaseWriter(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")), taw_map(d))
+        rs_ok, rs_note = rs_source_state(base, svc)
+        publish(
+            r,
+            SupabaseWriter(base, svc),
+            taw_map(d),
+            rs_source_column=rs_ok,
+            rs_source_note=rs_note,
+        )
     out = write_outputs(r, Path(a.out))
     print(summary_text(r))
     print(f"결과 폴더: {out}")

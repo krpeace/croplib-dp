@@ -9,6 +9,11 @@ error (오류) — 바로 봐야 함
 warn (경고) — 서비스는 되지만 기록해 둘 것
   - late    : 마지막 회차가 '지연 수집' 또는 '백업: 직전 발표'·'백업: S3'
   - asos    : 오후 회차(17시 발표 + 1시간) 뒤에도 어제 ASOS 관측이 DB에 없음 (수집 지점 has_forecast 만)
+  - obs     : 관측만 하는 지점(운영 지점 중 예보 지점이 아닌 곳, OBS_ALL_STATIONS=true 일 때)의
+  `soil_water_daily`
+              어제 줄이 오후 회차 뒤에도 없음. 이런 지점은 forecast_runs 줄이 없어 표 최신성으로
+              본다(결정 D2).
+              지점마다 며칠째 없는지(N일째, 최근 5일 안에 없으면 "5일 넘게")를 같이 적는다
   - grid    : 예보 지점(has_forecast)의 예보 격자 문제 (결정 0025)
               ① DB 격자가 비어 있어 그 지점 예보를 건너뜀(관측은 계속)
               ② DB 격자가 계산값과 다름(DB 값이 기준이라 예보는 계속, 경계 근처 좌표 차이일 수 있음)
@@ -38,12 +43,13 @@ BACKUP_RESULTS = ("지연 수집", "백업: 직전 발표", "백업: S3")
 HEAT_CHECK_AFTER_H = 12  # 적산온도는 09:20 에 한 번 수집 (재시도·늦은 시작 여유)
 KREI_CHECK_AFTER_DAY = 8  # 매달 8일 23:59 KST까지 여유, 9일(now.day > 8)부터 이번 달 원예 4부류 월보 확인
 MAX_NAMED = 10  # 경고 문구에 이름을 다 적는 지점 수의 한도
+OBS_LOOKBACK_DAYS = 5  # 관측만 하는 지점의 표 최신성을 볼 때 읽는 날 수 (어제 포함). 없으면 "5일 넘게"
 
 
 @dataclass(frozen=True)
 class Alert:
     level: str  # "error" | "warn"
-    code: str  # stale | failed | late | asos | heat | krei
+    code: str  # stale | failed | late | asos | obs | grid | heat | krei | dbsize
     text: str
 
     @property
@@ -134,6 +140,7 @@ def check_health(
     db_size: Mapping[str, Any] | None = None,
     db_size_error: str | None = None,
     grid_status: Mapping[str, str] | None = None,
+    obs_last: Mapping[str, dt.date | None] | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
@@ -143,7 +150,9 @@ def check_health(
     db_size: DB 크기 {mb, exact}. exact=False 는 줄 수로 추정한 값. 넘기지 않으면 보지 않는다 (결정 0022).
     db_size_error: 크기를 못 읽은 이유. 있으면 "조회 실패" 경고(조용히 넘어가지 않음).
     grid_status: 예보 지점별 격자 점검 결과(core/grid.check_station_grid 의 status).
-    넘기지 않거나 비면 보지 않는다."""
+    넘기지 않거나 비면 보지 않는다.
+    obs_last: 관측만 하는 지점별 soil_water_daily 가장 최근 날짜(최근 OBS_LOOKBACK_DAYS일 안, 없으면 None).
+    넘기지 않거나(스위치 꺼짐) 비면 보지 않는다."""
     names = station_names or {}
     now = pd.Timestamp(now)
     alerts: list[Alert] = []
@@ -194,6 +203,22 @@ def check_health(
                 Alert("warn", "heat", f"어제({yesterday:%m/%d}) 적산온도 없음 — {named(missing, names)}")
             )
 
+    if obs_last and now.hour >= ASOS_CHECK_AFTER_H:
+        yesterday = (now - pd.Timedelta(days=1)).date()
+        late: dict[str, str] = {}
+        for s, last in obs_last.items():
+            if last is not None and last >= yesterday:
+                continue
+            days = f"{(yesterday - last).days}일째" if last is not None else f"{OBS_LOOKBACK_DAYS}일 넘게"
+            late[s] = f"{names.get(s, '')}({days})".strip()
+        if late:
+            alerts.append(
+                Alert(
+                    "warn",
+                    "obs",
+                    f"관측 물 상태 어제({yesterday:%m/%d}) 값 없음 — {named(sorted(late), late)}",
+                )
+            )
     if grid_status:
         empty = sorted(s for s, v in grid_status.items() if v == "missing")
         differs = sorted(s for s, v in grid_status.items() if v == "differs")

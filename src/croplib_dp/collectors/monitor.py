@@ -13,9 +13,9 @@ from typing import Any
 
 import pandas as pd
 
-from croplib_dp.collectors.water import COLLECTOR, kst_now
+from croplib_dp.collectors.water import COLLECTOR, default_soil_code, kst_now, obs_all_enabled
 from croplib_dp.core.grid import check_station_grid
-from croplib_dp.core.monitor import check_health, report
+from croplib_dp.core.monitor import OBS_LOOKBACK_DAYS, check_health, report
 from croplib_dp.core.retention import COUNT_TABLES, estimate_db_mb
 from croplib_dp.io.db_stats import http_request_h, row_count, rpc_db_size
 from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
@@ -36,10 +36,18 @@ def read_krei_reports(base: str, key: str, http: RestGet = rest_get, now=None) -
 
 
 def read_state(
-    base: str, key: str, http: RestGet = rest_get, now=None, include_krei: bool = False
+    base: str,
+    key: str,
+    http: RestGet = rest_get,
+    now=None,
+    include_krei: bool = False,
+    obs_all: bool = False,
 ) -> dict[str, Any]:
     """최근 서버 회차 기록, 지점 이름, 관측 마지막 날, 적산온도 어제 값 유무(, 선택 시 KREI 발행물 상태).
-    - 관측(weather_daily)은 수집하는 지점(has_forecast)만 지점마다 본다.
+    - 관측(weather_daily)은 수집하는 지점(has_forecast)만, 지점마다 묻지 않고 한 번에 본다
+      (어제 이후 줄 → 지점별 마지막 날, 없으면 None). 호출이 지점 수만큼에서 한 번으로 줄었다(결정 0026).
+    - obs_all(OBS_ALL_STATIONS=true)면 관측만 하는 지점(운영 지점 중 예보 지점이 아닌 곳)을 soil_water_daily
+      (기본 토성 하나, 최근 5일)로 한 번에 본다. forecast_runs 줄이 없는 지점이라 표 최신성으로 본다(D2).
     - 적산온도(heat_daily)는 운영 지점(is_active) 전부를 보되, 지점마다 묻지 않고 한 번에 묻는다
       (어제·작물 공통 값이 있는 지점 목록 → 운영 지점과 비교). 지점이 늘어도 매시간 호출 수가 늘지 않는다."""
     now = pd.Timestamp(now) if now is not None else kst_now()
@@ -63,12 +71,17 @@ def read_state(
     active = read_table(
         base, key, "stations", http, "select=stn_id,name_ko&is_active=eq.true&order=sort_order"
     )
-    last: dict[str, dt.date | None] = {}
-    for st in collected:
-        rows = read_table(
-            base, key, "weather_daily", http, f"select=date&stn_id=eq.{st['stn_id']}&order=date.desc&limit=1"
-        )
-        last[str(st["stn_id"])] = dt.date.fromisoformat(rows[0]["date"][:10]) if rows else None
+    last: dict[str, dt.date | None] = {str(st["stn_id"]): None for st in collected}
+    if collected:
+        # 경고는 "어제 줄이 있나"만 가리므로 어제 이후 줄만 한 번에 읽는다(지점마다 마지막 날을 묻지 않는다)
+        ids = ",".join(str(st["stn_id"]) for st in collected)
+        for r in read_table(
+            base, key, "weather_daily", http, f"select=stn_id,date&date=gte.{yesterday}&stn_id=in.({ids})"
+        ):
+            day = dt.date.fromisoformat(r["date"][:10])
+            s = str(r["stn_id"])
+            if s in last and (last[s] is None or day > last[s]):
+                last[s] = day
     have = {
         str(r["stn_id"])
         for r in read_table(
@@ -90,12 +103,38 @@ def read_state(
         # 답에 격자 칸 자체가 없으면(칸을 고르지 않은 읽기) 점검하지 않는다.
         grid_status={str(st["stn_id"]): check_station_grid(st).status for st in collected if "grid_nx" in st},
     )
+    if obs_all:
+        collected_ids = {str(st["stn_id"]) for st in collected}
+        obs_ids = [str(s["stn_id"]) for s in active if str(s["stn_id"]) not in collected_ids]
+        out["obs_last"] = read_obs_last(base, key, obs_ids, yesterday, http)
     if include_krei:
         try:
             out["krei_reports"] = read_krei_reports(base, key, http, now=now)
         except Exception as e:
             out["krei_reports"] = None
             out["krei_error"] = str(e)
+    return out
+
+
+def read_obs_last(
+    base: str, key: str, obs_ids: list[str], yesterday: dt.date, http: RestGet = rest_get
+) -> dict[str, dt.date | None]:
+    """관측만 하는 지점별 soil_water_daily 가장 최근 날짜(최근 OBS_LOOKBACK_DAYS일 안, 없으면 None).
+    지점마다 묻지 않고 기본 토성 하나로 좁혀 한 번에 읽는다(97곳이어도 최대 약 485줄, 1,000줄 한도 안)."""
+    out: dict[str, dt.date | None] = {s: None for s in obs_ids}
+    if not obs_ids:
+        return out
+    soil = default_soil_code(
+        read_table(base, key, "soil_types", http, "select=soil_code,is_default,sort_order")
+    )
+    if soil is None:
+        raise RuntimeError("토성 사전(soil_types)이 비어 있어 관측 물 상태를 점검하지 못함")
+    since = yesterday - dt.timedelta(days=OBS_LOOKBACK_DAYS - 1)
+    query = f"select=stn_id,date&soil_code=eq.{soil}&date=gte.{since}"
+    for r in read_table(base, key, "soil_water_daily", http, query):
+        s, day = str(r["stn_id"]), dt.date.fromisoformat(r["date"][:10])
+        if s in out and (out[s] is None or day > out[s]):
+            out[s] = day
     return out
 
 
@@ -131,6 +170,7 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         db_size=state.get("db_size"),
         db_size_error=state.get("db_size_error"),
         grid_status=state.get("grid_status"),
+        obs_last=state.get("obs_last"),
     )
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"
@@ -177,7 +217,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"이슈: {action}")
         return 0
     now = kst_now()
-    state = read_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), now=now, include_krei=True)
+    state = read_state(
+        _env("SUPABASE_URL"),
+        _env("SUPABASE_SERVICE_ROLE_KEY"),
+        now=now,
+        include_krei=True,
+        obs_all=obs_all_enabled(),
+    )
     state.update(db_size_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")))
     sink = IssueAlerts(_env("GITHUB_REPOSITORY"), _env("GITHUB_TOKEN"))
     text, action = run_monitor(state, sink, now=now)

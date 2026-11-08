@@ -95,29 +95,60 @@ def days_to_dry(
     return math.ceil(max(0.0, float(raw_mm) - float(dr_mm)) / float(eto_mean_mm))
 
 
+class MissingPrior(ValueError):
+    """창 재계산에 필요한 시작점(창 시작 전날의 Dr)이 없다. 조용히 0으로 시작하지 않고 알린다."""
+
+
+def window_needs_prior(window_start: dt.date, window_end: dt.date) -> bool:
+    """창(window_start~window_end)이 시작점을 필요로 하나. 창 안에 활동기(3~11월) 날이 있고
+    그 첫날이 3/1이 아니면 필요하다(3/1이면 Dr = 0으로 새로 시작, 겨울만 있으면 계산이 없다)."""
+    day = window_start
+    while day <= window_end:
+        if day.month not in WINTER_MONTHS:
+            return day != dt.date(day.year, 3, 1)
+        day += dt.timedelta(days=1)
+    return False
+
+
 def soil_water_rows(
     days: Iterable[Mapping[str, Any]],
     fc: float,
     wp: float,
     zr_m: float = SOIL_ZR_M,
     p: float = SOIL_P,
+    window_start: dt.date | None = None,
+    prior: Mapping[str, Any] | None = None,
 ) -> list[dict]:
     """날짜순 일 기상값(date, eto_mm, rain_mm, filled) → 작물 공통 `soil_water_daily` 줄 목록.
     해마다 3/1에 Dr = 0으로 새로 시작해 11/30까지 `observed_water_balance(crop=None, ...)`로 돌리고,
-    12~2월은 `status = 'winter'`와 빈 물수지 칸으로 둔다."""
+    12~2월은 `status = 'winter'`와 빈 물수지 칸으로 둔다.
+
+    window_start: 주면 그 날짜부터의 줄만 돌려준다(창 재계산, 이슈 #76). 창 앞의 날은 7일 합·평균에만 쓴다.
+    prior: 창 시작 전날의 DB 줄 {dr_mm, dp_mm, filled}. 창이 활동기 한가운데서 시작하면 그 Dr 에서 이어
+    계산하고
+           (채움 표시·전날 DP도 이어받음), 없으면 MissingPrior. 창의 첫 활동일이 3/1이거나 겨울뿐이면
+           쓰지 않는다.
+    창 안의 값은 전체 재계산(window_start 없이)의 같은 날 값과 똑같다."""
     soil = common_soil(fc, wp, zr_m=zr_m, p=p)
     day_list = sorted(days, key=lambda d: d["date"])
     active_by_year: dict[int, list[Mapping[str, Any]]] = {}
     for d in day_list:
         day = d["date"]
-        if day.month not in WINTER_MONTHS:
-            active_by_year.setdefault(day.year, []).append(d)
+        if day.month in WINTER_MONTHS or (window_start is not None and day < window_start):
+            continue
+        active_by_year.setdefault(day.year, []).append(d)
 
     wb_by_date: dict[dt.date, dict] = {}
     dp_prev_by_date: dict[dt.date, float | None] = {}
-    for _, yr_days in sorted(active_by_year.items()):
-        wb = observed_water_balance(yr_days, None, soil)
-        prev_dp: float | None = None
+    for year, yr_days in sorted(active_by_year.items()):
+        seg_soil, taint0, prev_dp = soil, False, None
+        if window_start is not None and yr_days[0]["date"] != dt.date(year, 3, 1):
+            if prior is None or _missing(prior.get("dr_mm")):
+                raise MissingPrior(f"{window_start - dt.timedelta(days=1)}의 Dr 시작점이 없습니다")
+            seg_soil = common_soil(fc, wp, zr_m=zr_m, p=p, dr0_mm=float(prior["dr_mm"]))
+            taint0 = bool(prior.get("filled"))
+            prev_dp = None if _missing(prior.get("dp_mm")) else float(prior["dp_mm"])
+        wb = observed_water_balance(yr_days, None, seg_soil, tainted0=taint0)
         for r in wb:
             wb_by_date[r["date"]] = r
             dp_prev_by_date[r["date"]] = prev_dp
@@ -126,6 +157,8 @@ def soil_water_rows(
     rows: list[dict] = []
     for i, d in enumerate(day_list):
         day = d["date"]
+        if window_start is not None and day < window_start:
+            continue
         win_start = day - dt.timedelta(days=WINDOW_DAYS - 1)
         win = [x for x in day_list[max(0, i - WINDOW_DAYS + 1) : i + 1] if win_start <= x["date"] <= day]
         etos = [float(x["eto_mm"]) for x in win if not _missing(x.get("eto_mm"))]

@@ -211,7 +211,7 @@ class _Db:
             return 200, json.dumps(rows).encode()
         if table == "heat_daily":
             return 200, json.dumps([]).encode()
-        return 200, json.dumps([{"date": "2026-10-25"}]).encode()
+        return 200, json.dumps([{"stn_id": "101", "date": "2026-10-25"}]).encode()
 
 
 STATIONS = [
