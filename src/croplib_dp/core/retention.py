@@ -69,6 +69,13 @@ ROW_BYTES = {
     "forecast_runs": 224,  # 줄 수가 적어 부풀려진 실측(465B) 대신 추정
 }
 SYSTEM_MB = 12.0  # E2: 전체 57MB − 10표 합계 45MB
+EXTRA_MB = 1.0  # 줄 수를 세지 않는 작은 표(krei.report·storage.objects) 약 1MB (E2 2026-11-08)
+COUNT_TABLES = tuple(ROW_BYTES)  # 줄 수를 읽어 크기를 추정하는 표 8개
+
+# 용량 경고선 (#61 Q4, 2026-11-08 승인). DB 한도 500MB, Storage 한도 1GB(가정, 실제 한도 확인되면 고친다)
+DB_WARN_MB, DB_ERR_MB = 400.0, 450.0  # 정확한 크기(CropMon#77 db_size_bytes())를 읽었을 때
+DB_EST_WARN_MB, DB_EST_ERR_MB = 360.0, 405.0  # 추정일 때는 오차 ±10% 를 두고 일찍
+STORAGE_WARN_MB, STORAGE_ERR_MB = 800.0, 950.0
 
 
 # ── 시각·기준 날짜 (모두 한국 시각) ───────────────────────────────────────
@@ -268,3 +275,21 @@ def xz_saving(gz_files: Sequence[bytes]) -> dict:
 def db_bytes_freed(rows_by_table: Mapping[str, int]) -> int:
     """지우는 줄 수 × 줄당 실측 크기 = DB 에서 줄어드는 바이트(근사)"""
     return sum(n * ROW_BYTES[t] for t, n in rows_by_table.items())
+
+
+# ── 용량 추정·경고 단계 (S3-b) ───────────────────────────────────────────
+def estimate_db_mb(counts: Mapping[str, int]) -> float:
+    """표별 줄 수 × 줄당 실측 크기 + 시스템 영역 + 작은 표 = 전체 DB 크기 추정(MB, 1MB = 1,048,576B).
+    E2 줄 수로 계산하면 실측 57MB와 맞는다. 실제 증가가 이 줄당 크기와 다르면 틀리므로 경고를 일찍 낸다."""
+    return sum(counts.get(t, 0) * ROW_BYTES[t] for t in COUNT_TABLES) / 1024 / 1024 + SYSTEM_MB + EXTRA_MB
+
+
+def db_level(mb: float, exact: bool) -> str:
+    """ok / warn / error. 정확한 값은 400·450MB, 추정은 360·405MB 부터."""
+    warn, err = (DB_WARN_MB, DB_ERR_MB) if exact else (DB_EST_WARN_MB, DB_EST_ERR_MB)
+    return "error" if mb >= err else "warn" if mb >= warn else "ok"
+
+
+def storage_level(mb: float) -> str:
+    """ok / warn(800MB) / error(950MB)"""
+    return "error" if mb >= STORAGE_ERR_MB else "warn" if mb >= STORAGE_WARN_MB else "ok"

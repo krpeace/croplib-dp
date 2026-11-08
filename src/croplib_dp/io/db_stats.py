@@ -6,9 +6,11 @@ PostgREST 는 한 번에 최대 1,000줄만 돌려주므로(Supabase 기본) `li
 
 # ruff: noqa: E501  (한글 문장이 많아 ruff 가 전각 문자를 2칸으로 세어 110을 넘는 줄이 많다)
 
+import json
 from collections.abc import Callable
 
 from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
+from croplib_dp.io.supabase_write import Request, http_request
 
 HeadRequest = Callable[
     [str, str, dict, bytes], tuple[int, dict, bytes]
@@ -57,3 +59,19 @@ def read_all(
         if len(part) < page:
             return out
         offset += page
+
+
+def rpc_db_size(base: str, key: str, post: Request = http_request) -> dict | None:
+    """CropMon 함수 `public.db_size_bytes()`(CropMon#77)로 정확한 DB 크기를 읽는다. 돌려주는 값: {db_bytes, tables}.
+    함수가 없거나(404) 이 키로 부를 수 없으면(401·403) None(→ 줄 수로 추정). 그 밖 오류와 엉뚱한 응답은 오류로 올린다."""
+    url = f"{base.rstrip('/')}/rest/v1/rpc/db_size_bytes"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    status, body = post("POST", url, headers, b"{}")
+    if status in (401, 403, 404):
+        return None
+    if status != 200:
+        raise RuntimeError(f"db_size_bytes() 호출 실패: HTTP {status} {body[:200]!r}")
+    out = json.loads(body)
+    if not isinstance(out, dict) or "db_bytes" not in out:
+        raise RuntimeError(f"db_size_bytes() 응답에 db_bytes 가 없습니다: {str(out)[:200]}")
+    return out

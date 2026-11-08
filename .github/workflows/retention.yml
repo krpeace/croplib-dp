@@ -1,20 +1,25 @@
 name: retention
 
-# 전망 표 월 보관·삭제·복원, 대표 밖 예보 원문 90일 정리 (이슈 #61, #28 S3-a, 결정 0022).
-# 사람이 Actions 화면에서 눌렀을 때만 돈다(예약 없음).
-#   mode=plan(기본): 읽기만 하는 dry-run. 지울 줄 수·월별 보관 파일 크기·Storage 사용량을 보고한다. 쓰기·삭제 0.
-#   mode=apply: through 와 confirm_rows 가 dry-run 이 보고한 값과 맞아야 실행한다. 보관 파일을 올리고 다시 내려받아
+# 전망 표 월 보관·삭제·복원, 대표 밖 예보 원문 90일 정리, 주간 용량 점검 (이슈 #61, #28 S3-a·S3-b, 결정 0022).
+#   예약: 매주 월요일 03:30 KST 에 mode=weekly 가 돈다. 기본은 **읽기만 하는 점검 + 경고**(보관 대기 줄 수, Storage 용량 800/950MB).
+#         **자동 삭제는 Actions 변수 RETENTION_AUTO_APPLY=true 를 사용자가 켰을 때만** 한다(첫 실제 삭제를 승인한 뒤에 켜는 스위치,
+#         기본 꺼짐). 켜져 있어도 S3-a 와 같은 확인(보관 파일 다시 내려받기·줄 수·sha256·지울 줄 모두 있음)을 거치고,
+#         한 번에 지울 줄이 상한(--max-rows, 기본 8,000)을 넘으면 삭제하지 않고 오류로 알린다. forecast_runs 는 지우지 않는다.
+#   mode=plan(기본, 수동): 읽기만 하는 dry-run. 지울 줄 수·월별 보관 파일 크기·Storage 사용량을 보고한다. 쓰기·삭제 0.
+#   mode=apply(수동): through 와 confirm_rows 가 dry-run 이 보고한 값과 맞아야 실행한다. 보관 파일을 올리고 다시 내려받아
 #               확인한 뒤 지운다. 하나라도 어긋나면 멈춘다. 첫 실행은 사용자가 승인한 뒤 한 번만 한다.
-#   mode=restore: 보관 파일을 표로 되살린다(restore_apply 를 켜지 않으면 보고만).
-# 서버 키(삭제·쓰기 권한)는 GitHub Secrets 환경변수로만 읽고 기록에 남기지 않는다.
+#   mode=restore(수동): 보관 파일을 표로 되살린다(restore_apply 를 켜지 않으면 보고만).
+# 서버 키(삭제·쓰기 권한)는 GitHub Secrets 환경변수로만 읽고 기록에 남기지 않는다. 경고 이슈는 기본 토큰(issues: write)으로 연다.
 
 on:
+  schedule:
+    - cron: "30 18 * * 0" # 매주 월요일 03:30 KST (UTC 일요일 18:30). collect(02시대)·heat-sun(09:20)과 겹치지 않게
   workflow_dispatch:
     inputs:
       mode:
-        description: "plan = 읽기만(dry-run, 기본) / apply = 실제 보관·삭제(승인 뒤) / restore = 보관 파일에서 되살리기"
+        description: "plan = 읽기만(dry-run, 기본) / apply = 실제 보관·삭제(승인 뒤) / restore = 보관 파일에서 되살리기 / weekly = 주간 점검 한 번(예약과 같음)"
         type: choice
-        options: [plan, apply, restore]
+        options: [plan, apply, restore, weekly]
         default: plan
       through:
         description: "보관·삭제할 마지막 날짜(포함, YYYY-MM-DD, 한국 날짜). plan 은 비우면 가능한 가장 늦은 날(오늘 − 15일). apply 는 필수"
@@ -48,6 +53,7 @@ concurrency:
 
 permissions:
   contents: read
+  issues: write # weekly: [용량·보관 경고] 이슈를 열고 닫는다
 
 jobs:
   retention:
@@ -56,6 +62,8 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -64,18 +72,23 @@ jobs:
           cache: pip
       - name: 설치
         run: pip install .
-      - name: 실행 (기본은 읽기만 하는 dry-run)
+      - name: 실행 (기본은 읽기만 하는 dry-run, 예약은 weekly)
         env:
-          MODE: ${{ inputs.mode }}
+          MODE: ${{ inputs.mode || 'weekly' }}
           THROUGH: ${{ inputs.through }}
           CONFIRM_ROWS: ${{ inputs.confirm_rows }}
           CONFIRM_RAW: ${{ inputs.confirm_raw_files }}
           TABLE: ${{ inputs.table }}
           MONTH: ${{ inputs.month }}
           RESTORE_APPLY: ${{ inputs.restore_apply }}
+          AUTO_APPLY: ${{ vars.RETENTION_AUTO_APPLY }}
         run: |
           args=("$MODE" --out out)
           case "$MODE" in
+            weekly)
+              # 자동 삭제는 사용자가 변수 RETENTION_AUTO_APPLY 를 true 로 켰을 때만
+              if [ "$AUTO_APPLY" = "true" ]; then args+=(--auto); fi
+              ;;
             plan)
               if [ -n "$THROUGH" ]; then args+=(--through "$THROUGH"); fi
               ;;

@@ -35,6 +35,10 @@ class FakeSupabase:
         self.writes: list[tuple[str, str]] = []  # (method, path) — POST·PATCH·DELETE 전부
         self.tamper_on_download: set[str] = set()  # 이 경로를 내려받으면 깨진 바이트를 준다
         self.upload_fail: set[str] = set()
+        self.rpc_result = None  # None=404(함수 없음) / dict=200 / int=그 HTTP 상태
+        self.counts: dict[str, int] = {}  # 줄 수 세기에서 돌려줄 값(표 이름 → 줄 수). 없으면 실제 줄 수
+        self.size_override: dict[str, int] = {}  # Storage 파일 경로 → 크기(큰 파일을 흉내)
+        self.head_calls: list[str] = []
         self.no_embed = False  # True 면 조인(forecast_runs!inner) 조회가 400 으로 실패한다
 
     # ── 표 ────────────────────────────────────────────────────────────
@@ -42,7 +46,7 @@ class FakeSupabase:
         return next((r for r in self.tables["forecast_runs"] if r["run_id"] == run_id), None)
 
     def _select_rows(self, table: str, params: dict) -> list[dict]:
-        rows = [dict(r) for r in self.tables[table]]
+        rows = [dict(r) for r in self.tables.get(table, [])]
         sel = params.get("select", "*")
         embed = "forecast_runs!inner" in sel
         out = []
@@ -85,14 +89,32 @@ class FakeSupabase:
     def head(self, method, url, headers, body):
         path, params = _parse(url)
         table = path.rsplit("/", 1)[-1]
-        n = len(self._select_rows(table, {k: v for k, v in params.items() if k not in ("limit", "offset")}))
+        self.head_calls.append(table)
+        if table in self.counts:
+            n = self.counts[table]
+        else:
+            n = len(
+                self._select_rows(table, {k: v for k, v in params.items() if k not in ("limit", "offset")})
+            )
         return 200, {"Content-Range": f"0-0/{n}" if n else "*/0"}, b"[]"
 
     # ── 쓰기·Storage ───────────────────────────────────────────────────
     def request(self, method, url, headers, body):
         path, params = _parse(url)
-        if method != "GET" and not path.startswith("/storage/v1/object/list/"):  # 목록 조회는 읽기다
+        if method != "GET" and not path.startswith(
+            ("/storage/v1/object/list/", "/rest/v1/rpc/")
+        ):  # 목록·함수 호출은 읽기다
             self.writes.append((method, path))
+        if path == "/storage/v1/bucket" and method == "GET":
+            return 200, json.dumps(
+                [{"name": b} for b in sorted({b for b, _ in self.storage} | {"raw"})]
+            ).encode()
+        if path.startswith("/rest/v1/rpc/"):
+            if self.rpc_result is None:
+                return 404, b'{"code":"PGRST202","message":"Could not find the function"}'
+            if isinstance(self.rpc_result, int):
+                return self.rpc_result, b'{"message":"rpc error"}'
+            return 200, json.dumps(self.rpc_result).encode()
         if path.startswith("/rest/v1/"):
             table = path.rsplit("/", 1)[-1]
             return self._rest_write(method, table, params, body)
@@ -143,7 +165,11 @@ class FakeSupabase:
                 if tail:
                     names.setdefault(head, {"name": head, "id": None, "metadata": None})
                 else:
-                    names[head] = {"name": head, "id": f"id-{p}", "metadata": {"size": len(data)}}
+                    names[head] = {
+                        "name": head,
+                        "id": f"id-{p}",
+                        "metadata": {"size": self.size_override.get(p, len(data))},
+                    }
             items = list(names.values())
             off, lim = req.get("offset", 0), req.get("limit", 100)
             return 200, json.dumps(items[off : off + lim]).encode()
@@ -200,3 +226,40 @@ class FakeSupabase:
                 rain_expected_sum_mm=0.3, calc_version="v1.5",
             )
         )  # fmt: skip
+
+
+class FakeIssues:
+    """가짜 GitHub 이슈(라벨·제목이 달라도 되는 알림 창구). IssueAlerts 가 쓰는 호출만 흉내 낸다."""
+
+    def __init__(self):
+        self.issues: list[dict] = []
+        self.comments: list[tuple[int, str]] = []
+        self.labels: set[str] = set()
+
+    def __call__(self, method, url, headers, body):
+        u = urllib.parse.urlparse(url)
+        path = u.path.split("/repos/o/r", 1)[1]
+        q = dict(urllib.parse.parse_qsl(u.query))
+        data = json.loads(body) if body else None
+        if path.startswith("/labels/") and method == "GET":
+            return (
+                (200, b"{}")
+                if urllib.parse.unquote(path.split("/labels/")[1]) in self.labels
+                else (404, b"{}")
+            )
+        if path == "/labels":
+            self.labels.add(data["name"])
+            return 201, b"{}"
+        if path == "/issues" and method == "GET":
+            found = [i for i in self.issues if i["state"] == "open" and q.get("labels") in i["labels"]]
+            return 200, json.dumps(found).encode()
+        if path == "/issues" and method == "POST":
+            i = dict(number=len(self.issues) + 1, state="open", **data)
+            self.issues.append(i)
+            return 201, json.dumps(i).encode()
+        n = int(path.split("/")[2])
+        if path.endswith("/comments"):
+            self.comments.append((n, data["body"]))
+            return 201, b"{}"
+        self.issues[n - 1].update(data)
+        return 200, json.dumps(self.issues[n - 1]).encode()

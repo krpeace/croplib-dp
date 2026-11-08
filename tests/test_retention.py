@@ -258,3 +258,45 @@ def test_xz_estimate_shows_how_much_recompressing_would_save():
 def test_db_bytes_freed_uses_the_measured_row_sizes():
     assert R.ROW_BYTES["water_outlook"] == 247 and R.ROW_BYTES["water_outlook_summary"] == 245
     assert R.db_bytes_freed({"water_outlook": 1000, "water_outlook_summary": 200}) == 1000 * 247 + 200 * 245
+
+
+# ── 용량 경고선·DB 크기 추정 (S3-b) ────────────────────────────────────
+def test_db_thresholds_exact_400_450_and_estimate_360_405():
+    assert (R.DB_WARN_MB, R.DB_ERR_MB) == (400.0, 450.0)
+    assert (R.DB_EST_WARN_MB, R.DB_EST_ERR_MB) == (360.0, 405.0)  # 추정은 오차 ±10% 여유로 일찍
+    assert [R.db_level(mb, exact=True) for mb in (399.9, 400.0, 449.9, 450.0)] == [
+        "ok",
+        "warn",
+        "warn",
+        "error",
+    ]
+    assert [R.db_level(mb, exact=False) for mb in (359.9, 360.0, 404.9, 405.0)] == [
+        "ok",
+        "warn",
+        "warn",
+        "error",
+    ]
+
+
+def test_storage_thresholds_800_and_950():
+    assert (R.STORAGE_WARN_MB, R.STORAGE_ERR_MB) == (800.0, 950.0)
+    assert [R.storage_level(mb) for mb in (799.9, 800.0, 949.9, 950.0)] == ["ok", "warn", "warn", "error"]
+
+
+E2_COUNTS = {
+    "heat_daily": 114_975, "soil_water_daily": 37_200, "sun_daily": 26_280, "water_balance_daily": 10_140,
+    "water_outlook": 5_640, "weather_daily": 3_187, "water_outlook_summary": 1_405, "forecast_runs": 282,
+}  # fmt: skip
+
+
+def test_estimate_reproduces_the_measured_57mb_from_the_e2_row_counts():
+    assert set(R.COUNT_TABLES) == set(E2_COUNTS)  # 줄 수를 읽는 표 8개
+    assert R.estimate_db_mb(E2_COUNTS) == pytest.approx(57.0, abs=1.0)  # E2 실측 전체 57MB
+
+
+def test_estimate_grows_with_rows_and_has_a_floor_of_system_and_small_tables():
+    empty = R.estimate_db_mb({t: 0 for t in R.COUNT_TABLES})
+    assert empty == pytest.approx(R.SYSTEM_MB + R.EXTRA_MB)
+    assert R.estimate_db_mb({**{t: 0 for t in R.COUNT_TABLES}, "heat_daily": 1_000_000}) == pytest.approx(
+        empty + 1_000_000 * 219 / 1024 / 1024
+    )

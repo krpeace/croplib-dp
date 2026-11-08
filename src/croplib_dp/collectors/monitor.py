@@ -15,8 +15,11 @@ import pandas as pd
 
 from croplib_dp.collectors.water import COLLECTOR, kst_now
 from croplib_dp.core.monitor import check_health, report
+from croplib_dp.core.retention import COUNT_TABLES, estimate_db_mb
+from croplib_dp.io.db_stats import http_request_h, row_count, rpc_db_size
 from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
 from croplib_dp.io.github_issue import IssueAlerts, Request, http_request
+from croplib_dp.io.supabase_write import http_request as supabase_http_request
 
 DRILL_TITLE = "[수집 경고] 알림 연습 (실제 문제 아님)"
 DRILL_LABEL = "수집 경고 연습"
@@ -88,6 +91,24 @@ def read_state(
     return out
 
 
+def read_db_size(base: str, key: str, post=supabase_http_request, head=http_request_h) -> dict:
+    """DB 크기(MB). CropMon 함수 db_size_bytes()가 있으면 정확한 값(exact=True), 없으면 표 8개의 줄 수
+    (HEAD, 응답 본문 없음) × 줄당 실측 크기로 추정(exact=False). 읽지 못하면 오류를 올린다 (결정 0022)."""
+    rpc = rpc_db_size(base, key, post)
+    if rpc is not None:
+        return dict(mb=float(rpc["db_bytes"]) / 1024 / 1024, exact=True, source="rpc")
+    counts = {t: row_count(base, key, t, "", head) for t in COUNT_TABLES}
+    return dict(mb=estimate_db_mb(counts), exact=False, source="estimate", counts=counts)
+
+
+def db_size_state(base: str, key: str, post=supabase_http_request, head=http_request_h) -> dict:
+    """감시 상태에 더할 DB 크기. 못 읽으면 db_size_error 로 남겨 "조회 실패" 경고가 나게 한다."""
+    try:
+        return dict(db_size=read_db_size(base, key, post, head))
+    except Exception as e:
+        return dict(db_size_error=f"{type(e).__name__}: {str(e)[:200]}")
+
+
 def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None) -> tuple[str, str]:
     now = now if now is not None else kst_now()
     alerts = check_health(
@@ -99,6 +120,8 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         collect_count=len(state["weather_last"]),
         krei_reports=state.get("krei_reports"),
         krei_error=state.get("krei_error"),
+        db_size=state.get("db_size"),
+        db_size_error=state.get("db_size_error"),
     )
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"
@@ -146,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     now = kst_now()
     state = read_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"), now=now, include_krei=True)
+    state.update(db_size_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")))
     sink = IssueAlerts(_env("GITHUB_REPOSITORY"), _env("GITHUB_TOKEN"))
     text, action = run_monitor(state, sink, now=now)
     print(text)

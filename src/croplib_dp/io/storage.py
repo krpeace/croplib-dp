@@ -56,6 +56,14 @@ class Storage:
                 return out
             offset += LIST_PAGE
 
+    def list_buckets(self) -> list[str]:
+        """Storage 버킷 이름 목록(용량을 모든 버킷에서 합치려고)"""
+        status, resp = self.http("GET", f"{self.base}/storage/v1/bucket", self._headers(), b"")
+        self.calls += 1
+        if status != 200:
+            raise RuntimeError(f"Storage 버킷 목록 조회 실패: HTTP {status} {_text(resp)}")
+        return sorted(b["name"] for b in json.loads(resp))
+
     def list_files(self, bucket: str, prefix: str = "") -> list[dict]:
         """버킷 안(prefix 아래) 모든 파일: [{path, size}]. 폴더는 따라 내려가고 파일만 돌려준다."""
         files: list[dict] = []
