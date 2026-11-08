@@ -1212,7 +1212,10 @@ def test_rerun_collection_preserves_parse_status():
     def fake_sb(method, url, headers, body):
         if "/rest/v1/report" in url and method in ("POST", "PUT"):
             upserted_rows.extend(json.loads(body.decode("utf-8")))
-        return 201, b""
+            return 201, b""
+        if method == "PATCH":
+            return 200, b"[]"
+        return 200, b""
 
     writer = SupabaseWriter("https://x.supabase.co", "srv", http=fake_sb)
 
@@ -1273,3 +1276,48 @@ def test_brief_text_problem_count_formatting():
     r2.problems = [f"오류_{i}" for i in range(5)]
     text2 = K.brief_text(r2)
     assert "## 문제 5건" in text2
+
+
+def test_step5_skipped_patch_failure_records_problem():
+    """Step 5에서 skipped 패치가 실패할 때 r.problems에 '#{fid} skipped 기록 실패: ...'가 기록된다."""
+    clock = FakeClock("2026-11-08 10:00:00")
+    http = FakeKreiHttp()
+
+    existing_rep = {
+        8780: dict(
+            file_id=8780,
+            api="monthly",
+            report_type="월보",
+            yyyy=2026,
+            mm=11,
+            ovr_item_code="OVR0000000036",
+            prt_ovr_item_code="OVR0000000093",
+            item_name="양념채소",
+            pdf_link="https://aglook.krei.re.kr/main/uObserveMonth/OVR0000000036/download/8780/ORGTEXT_FILE",
+            first_seen_at="2026-11-07T20:40:00+09:00",
+            text_path="text/OVR0000000036/2026/11/8780.pages.json.gz",
+            text_chars=500,
+            no_text_pages=0,
+            text_status="ok",
+            fetch_status="fetched",
+            parse_status="pending",
+            updated_at="2026-11-07T20:40:00+09:00",
+        )
+    }
+
+    def fake_sb_patch_fail(method, url, headers, body):
+        if method == "PATCH":
+            return 500, b"Internal Server Error"
+        return 201, b""
+
+    writer = SupabaseWriter("https://x.supabase.co", "srv", http=fake_sb_patch_fail)
+    r = K.run(
+        months=[(2026, 11)],
+        existing_reports=existing_rep,
+        http=http,
+        clock=clock,
+        write=True,
+        writer=writer,
+        reparse=True,
+    )
+    assert any("#8780 skipped 기록 실패" in p for p in r.problems)

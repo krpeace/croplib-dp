@@ -585,8 +585,8 @@ def parse_period_dates(label: str, issue_y: int, issue_m: int) -> tuple[dt.date 
     m_range = re.match(r"(\d+)월\s*~\s*익년\s*(\d+)월", lbl)
     if m_range:
         m1, m2 = int(m_range.group(1)), int(m_range.group(2))
-        y1 = issue_y
-        y2 = issue_y + 1
+        y1 = issue_y if m1 <= issue_m else issue_y - 1
+        y2 = y1 + 1
         last_d = calendar.monthrange(y2, m2)[1]
         return dt.date(y1, m1, 1), dt.date(y2, m2, last_d)
 
@@ -757,27 +757,30 @@ def parse_shipment_outlook(
     if len(rows) < 2:
         return obs, [{"check": "shape", "error": "데이터 행 부족"}]
 
-    # 머리글에서 기간 라벨 추출 (table.header 의 innermost 줄 사용)
+    # 머리글에서 기간 라벨 추출 (다단 머리글의 경우 열별 텍스트 합성)
     period_labels: list[str] = []
     if table.header:
-        innermost = table.header[-1]
-        for cell in innermost[1:]:
-            txt = str(cell.get("text", "")).strip() if isinstance(cell, dict) else str(cell).strip()
-            if txt:
-                period_labels.append(txt)
+        n_cols = len(table.rows[0]) if table.rows else max(len(h) for h in table.header)
+        for col_idx in range(1, n_cols):
+            texts = []
+            for h_row in table.header:
+                if col_idx < len(h_row):
+                    cell = h_row[col_idx]
+                    txt = str(cell.get("text", "")).strip() if isinstance(cell, dict) else str(cell).strip()
+                    if txt and txt not in texts:
+                        texts.append(txt)
+            period_labels.append(" ".join(texts))
 
     if not period_labels:
         return obs, [{"check": "shape", "error": "기간 머리글 누락"}]
 
     row_map: dict[str, list[str]] = {}
+    year_rows: list[tuple[int, list[str]]] = []
     for r in rows:
         label = r[0].strip()
-        if re.search(r"\d{4}년", label) and "대비" not in label:
-            yr = int(re.search(r"(\d{4})년", label).group(1))
-            if yr == yyyy:
-                row_map["current"] = r
-            elif yr == yyyy - 1:
-                row_map["prev"] = r
+        m = re.search(r"(\d{4})년", label)
+        if m and "대비" not in label:
+            year_rows.append((int(m.group(1)), r))
         elif "전년" in label and "대비" in label:
             row_map["yoy_pct"] = r
         elif "평년" in label and "대비" in label:
@@ -785,8 +788,12 @@ def parse_shipment_outlook(
         elif "평년" in label:
             row_map["normal"] = r
 
-    if "current" not in row_map or "prev" not in row_map:
+    if len(year_rows) < 2:
         return obs, [{"check": "shape", "error": "필수 행(당해년, 전년) 누락"}]
+
+    year_rows.sort(key=lambda x: x[0], reverse=True)
+    current_year, row_map["current"] = year_rows[0]
+    prev_year, row_map["prev"] = year_rows[1]
 
     c_row = row_map["current"]
     prev_row = row_map["prev"]
@@ -839,8 +846,8 @@ def parse_shipment_outlook(
         unit_str = "천 톤" if "천 톤" in table.unit else "톤"
 
     basis_rows = [
-        ("current", yyyy, row_map["current"]),
-        ("prev", yyyy - 1, row_map["prev"]),
+        ("current", current_year, row_map["current"]),
+        ("prev", prev_year, row_map["prev"]),
     ]
     if "normal" in row_map:
         basis_rows.append(("normal", None, row_map["normal"]))
