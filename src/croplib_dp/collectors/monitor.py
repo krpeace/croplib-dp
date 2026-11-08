@@ -14,6 +14,7 @@ from typing import Any
 import pandas as pd
 
 from croplib_dp.collectors.water import COLLECTOR, kst_now
+from croplib_dp.core.grid import check_station_grid
 from croplib_dp.core.monitor import check_health, report
 from croplib_dp.core.retention import COUNT_TABLES, estimate_db_mb
 from croplib_dp.io.db_stats import http_request_h, row_count, rpc_db_size
@@ -53,7 +54,11 @@ def read_state(
     # 수집하는 지점(has_forecast)만 본다. 수집하지 않는 지점은 관측이 없는 게 정상이다 (#33).
     # 전 지점으로 넓힐 때(#28)는 has_forecast 만 켜면 감시가 따라간다.
     collected = read_table(
-        base, key, "stations", http, "select=stn_id,name_ko&has_forecast=eq.true&order=sort_order"
+        base,
+        key,
+        "stations",
+        http,
+        "select=stn_id,name_ko,lat,lon,grid_nx,grid_ny&has_forecast=eq.true&order=sort_order",
     )
     active = read_table(
         base, key, "stations", http, "select=stn_id,name_ko&is_active=eq.true&order=sort_order"
@@ -81,6 +86,9 @@ def read_state(
         names={str(s["stn_id"]): s["name_ko"] for s in [*active, *collected]},
         weather_last=last,
         heat_last=heat,
+        # 예보 지점의 격자 점검(결정 0025). 같은 stations 읽기에 칸만 더했으므로 호출 수는 그대로다.
+        # 답에 격자 칸 자체가 없으면(칸을 고르지 않은 읽기) 점검하지 않는다.
+        grid_status={str(st["stn_id"]): check_station_grid(st).status for st in collected if "grid_nx" in st},
     )
     if include_krei:
         try:
@@ -122,6 +130,7 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         krei_error=state.get("krei_error"),
         db_size=state.get("db_size"),
         db_size_error=state.get("db_size_error"),
+        grid_status=state.get("grid_status"),
     )
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"

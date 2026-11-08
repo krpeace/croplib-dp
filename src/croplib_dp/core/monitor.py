@@ -9,6 +9,9 @@ error (오류) — 바로 봐야 함
 warn (경고) — 서비스는 되지만 기록해 둘 것
   - late    : 마지막 회차가 '지연 수집' 또는 '백업: 직전 발표'·'백업: S3'
   - asos    : 오후 회차(17시 발표 + 1시간) 뒤에도 어제 ASOS 관측이 DB에 없음 (수집 지점 has_forecast 만)
+  - grid    : 예보 지점(has_forecast)의 예보 격자 문제 (결정 0025)
+              ① DB 격자가 비어 있어 그 지점 예보를 건너뜀(관측은 계속)
+              ② DB 격자가 계산값과 다름(DB 값이 기준이라 예보는 계속, 경계 근처 좌표 차이일 수 있음)
   - heat    : 낮 12시 뒤에도 적산온도(heat_daily)에 어제 값이 없음 (하루 한 번 09:20 수집, 온1).
               대상은 운영 지점(is_active) 전부 — 물 수집 지점보다 넓다 (결정 0017)
   - krei    : 매달 8일 23:59 KST 뒤(9일 00:00~)에도 원예 4부류(과일·과채·엽근채소·양념채소)의 이번 달 월보가
@@ -130,6 +133,7 @@ def check_health(
     krei_error: str | None = None,
     db_size: Mapping[str, Any] | None = None,
     db_size_error: str | None = None,
+    grid_status: Mapping[str, str] | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
@@ -137,7 +141,9 @@ def check_health(
     collect_count: 수집 지점 수. 0 이면 오류 (넘기지 않으면 보지 않는다 — 알림 연습 등).
     krei_reports: krei.report 행 목록 (이번 달 행 + failed 행). 넘기지 않으면 보지 않는다.
     db_size: DB 크기 {mb, exact}. exact=False 는 줄 수로 추정한 값. 넘기지 않으면 보지 않는다 (결정 0022).
-    db_size_error: 크기를 못 읽은 이유. 있으면 "조회 실패" 경고(조용히 넘어가지 않음)."""
+    db_size_error: 크기를 못 읽은 이유. 있으면 "조회 실패" 경고(조용히 넘어가지 않음).
+    grid_status: 예보 지점별 격자 점검 결과(core/grid.check_station_grid 의 status).
+    넘기지 않거나 비면 보지 않는다."""
     names = station_names or {}
     now = pd.Timestamp(now)
     alerts: list[Alert] = []
@@ -188,6 +194,27 @@ def check_health(
                 Alert("warn", "heat", f"어제({yesterday:%m/%d}) 적산온도 없음 — {named(missing, names)}")
             )
 
+    if grid_status:
+        empty = sorted(s for s, v in grid_status.items() if v == "missing")
+        differs = sorted(s for s, v in grid_status.items() if v == "differs")
+        if empty:
+            alerts.append(
+                Alert(
+                    "warn",
+                    "grid",
+                    f"예보 격자 비어 있음 — {named(empty, names)}: 예보를 건너뜁니다(관측은 계속). "
+                    "CropMon 격자 시드가 필요합니다",
+                )
+            )
+        if differs:
+            alerts.append(
+                Alert(
+                    "warn",
+                    "grid",
+                    f"예보 격자가 계산값과 다름 — {named(differs, names)}: DB 값으로 예보는 계속합니다"
+                    "(경계 근처 좌표 차이일 수 있음)",
+                )
+            )
     if krei_error:
         first_line = (str(krei_error).strip().splitlines() or ["이유 없음"])[0]
         alerts.append(Alert("warn", "krei", f"KREI 상태 조회 실패 — {first_line}"))
