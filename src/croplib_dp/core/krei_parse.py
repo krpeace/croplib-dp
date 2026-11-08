@@ -608,7 +608,14 @@ def parse_period_dates(label: str, issue_y: int, issue_m: int) -> tuple[dt.date 
 
 def parse_clean_float(val_str: str) -> float | None:
     """쉼표 제거 후 float 변환. '-', 빈칸은 None."""
-    s = val_str.replace(",", "").replace("%", "").strip()
+    s = (
+        val_str.replace(",", "")
+        .replace("%", "")
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+        .strip()
+    )
     if not s or s == "-":
         return None
     try:

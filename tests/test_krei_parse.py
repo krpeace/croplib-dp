@@ -18,6 +18,7 @@ from croplib_dp.collectors.krei import KreiResult, parse_one_report
 from croplib_dp.core.krei import parse_report_items
 from croplib_dp.core.krei_check import (
     check_yoy_recalc,
+    interval_for_num,
 )
 from croplib_dp.core.krei_parse import (
     parse_report_pages,
@@ -53,6 +54,34 @@ def test_yoy_recalc_rounding_bounds():
 
     # 반올림 구간 벗어난 경우 실패 확인
     bad_ok, _ = check_yoy_recalc("4.7", "7.6", "-30.0")
+    assert not bad_ok
+
+
+def test_yoy_recalc_integer_inputs_and_unicode_minus():
+    """표기 자릿수 기준 불확실성 구간 계산:
+    - 정수(12, 15): ±0.5 구간([11.5, 12.5], [14.5, 15.5])
+    - 소수 1자리(4.7): ±0.05 구간([4.65, 4.75])
+    - 소수 2자리(1.25): ±0.005 구간([1.245, 1.255])
+    정수 12 / 15 -> 표기 -20.0 및 유니코드 마이너스(−20.0) 통과 확인.
+    """
+    assert interval_for_num("12") == (12.0, 11.5, 12.5)
+    assert interval_for_num("4.7") == (4.7, 4.65, 4.75)
+    assert interval_for_num("1.25") == (1.25, 1.245, 1.255)
+
+    # 1. 12 / 15, 표기 -20.0 (ASCII 마이너스)
+    ok, msg = check_yoy_recalc("12", "15", "-20.0")
+    assert ok, f"12/15 -> -20.0 통과 실패: {msg}"
+
+    # 2. 12 / 15, 표기 −20.0 (유니코드 마이너스 U+2212)
+    ok_uni, msg_uni = check_yoy_recalc("12", "15", "−20.0")
+    assert ok_uni, f"12/15 -> −20.0 (유니코드) 통과 실패: {msg_uni}"
+
+    # 3. int 타입 입력 (12, 15, -20.0)
+    ok_num, msg_num = check_yoy_recalc(12, 15, -20.0)
+    assert ok_num, f"12, 15 -> -20.0 (숫자형) 통과 실패: {msg_num}"
+
+    # 4. 정수 구간([-25.8%, -13.8%])을 벗어난 표기(-30.0)는 실패
+    bad_ok, _ = check_yoy_recalc("12", "15", "-30.0")
     assert not bad_ok
 
 

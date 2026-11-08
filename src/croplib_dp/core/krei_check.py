@@ -18,7 +18,14 @@ def interval_for_num(val_input: str | float | int) -> tuple[float, float, float]
     else:
         val_str = str(val_input)
 
-    clean = val_str.replace(",", "").replace("%", "").strip()
+    clean = (
+        val_str.replace(",", "")
+        .replace("%", "")
+        .replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+        .strip()
+    )
     val = float(clean)
     if "." in clean:
         decimals = len(clean.split(".")[1])
