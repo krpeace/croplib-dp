@@ -1,0 +1,71 @@
+name: radiation-audit
+
+# 일사 점검 (이슈 #48, #28 S0-b): 사람이 Actions 화면에서 눌렀을 때만 돈다 (예약 없음).
+# 운영 지점(is_active)마다 지난 365일 ASOS 일자료를 받아(해가 바뀌면 지점당 2번 = 약 194번 호출)
+# 일사 분류·실측 kRs·ETo 오차·의심 일조를 계산하고, 결과 파일을 이 실행의 Artifacts(30일 보관)에 올린다.
+# **DB에는 쓰지 않는다.** 지점 목록만 읽는다. 키는 GitHub Secrets 환경변수로만 읽고 기록에 남기지 않는다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "조회 일수 (어제까지, 기본 365)"
+        required: false
+        default: "365"
+      stations:
+        description: "지점 번호 쉼표 목록 (예: 101). 비우면 운영 지점 전부"
+        required: false
+        default: ""
+
+concurrency:
+  group: radiation-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  radiation-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 받기·계산 (DB 쓰기 없음)
+        env:
+          DAYS: ${{ inputs.days }}
+          STATIONS: ${{ inputs.stations }}
+        run: |
+          args=(--out out --days "${DAYS:-365}")
+          if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
+          set +e
+          python -m croplib_dp.collectors.radiation_audit "${args[@]}" 2> err.txt
+          code=$?
+          cat err.txt >&2
+          exit $code
+      - name: 요약을 실행 화면과 알림(annotation)에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -s err.txt ]; then echo "::error title=수집기 오류::$(tail -n 40 err.txt | esc)"; fi
+          if [ -f out/radiation_audit/summary.md ]; then cat out/radiation_audit/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f out/radiation_audit/brief.md ]; then
+            echo "::notice title=일사 점검 요약::$(cat out/radiation_audit/brief.md | esc)"
+          fi
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: radiation-audit
+          path: out/
+          retention-days: 30
+          if-no-files-found: warn
