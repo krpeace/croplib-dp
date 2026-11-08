@@ -591,3 +591,150 @@ def test_multilevel_header_shipment_outlook():
     assert errors == []
     labels = sorted({o.period_label for o in obs})
     assert labels == ["10월", "9월", "추석 성수기"]
+
+
+def test_parse_period_dates_crop_year():
+    """'N월 ~ 익년 M월'의 시작 연도를 발행월이 아니라 그 행의 산(crop_year) 기준으로 계산.
+    - 2026-11 발행, 2026년산, '12월 ~ 익년 3월' -> 2026-12-01 ~ 2027-03-31
+    - 2026-04 발행, 2025년산, '7월~익년 3월' -> 2025-07-01 ~ 2026-03-31
+    """
+    from croplib_dp.core.krei_parse import parse_period_dates
+
+    # 1. 2026-11 발행, 2026년산, 12월 ~ 익년 3월
+    s1, e1 = parse_period_dates("12월 ~ 익년 3월", issue_y=2026, issue_m=11, crop_year=2026)
+    assert s1 == dt.date(2026, 12, 1)
+    assert e1 == dt.date(2027, 3, 31)
+
+    # 2. 2026-04 발행, 2025년산, 7월~익년 3월
+    s2, e2 = parse_period_dates("7월~익년 3월", issue_y=2026, issue_m=4, crop_year=2025)
+    assert s2 == dt.date(2025, 7, 1)
+    assert e2 == dt.date(2026, 3, 31)
+
+
+def test_manual_approval_overrides_check_and_loads_obs(pages_8778):
+    """원문 자체가 안 맞는 표를 승인 목록에 등록하면 check_status='pass'로 보고 숫자를 적재함."""
+    from croplib_dp.core.krei_parse import find_table_approval, load_approved_tables
+
+    # 1. 8723 기본 승인 목록 로드 확인
+    approved = load_approved_tables()
+    assert any(str(a.get("file_id")) == "8723" for a in approved)
+    app_8723 = find_table_approval(8723, "2026년 복숭아 생산량 전망", approved)
+    assert app_8723 is not None
+    assert "183.2 기준이면 12.61%" in app_8723.get("reason", "")
+    assert app_8723.get("approver") == "peace"
+    assert app_8723.get("approved_at") == "2026-11-09"
+
+    # 2. 8778 의도적 오류 주입 표본을 custom approval로 승인하여 관측치 적재 및 parsed 확인
+    corrupted_pages = copy.deepcopy(pages_8778)
+    for w in corrupted_pages[2]["words"]:
+        if w[4] == "496.1":
+            w[4] = "520.0"
+
+    # 승인 목록 없음 -> needs_review, observation 미적재
+    unapproved_parsed = parse_report_pages(
+        file_id=8778,
+        yyyy=2026,
+        mm=11,
+        ovr_item_code="OVR0000000013",
+        pages=corrupted_pages,
+        items=ITEMS,
+        text_status="ok",
+        approved_tables=[],
+    )
+    assert unapproved_parsed.parse_status == "needs_review"
+    unapp_t = next(t for t in unapproved_parsed.raw_tables if "사과 생산량 전망" in t.title)
+    assert unapp_t.check_status == "fail"
+    assert not any(
+        o.item_label == "사과" and o.metric == "production" for o in unapproved_parsed.observations
+    )
+
+    # 승인 목록 있음 -> pass, observation 적재, parsed
+    custom_approvals = [
+        {
+            "file_id": 8778,
+            "title": "2026년 사과 생산량 전망",
+            "reason": "테스트 수동 승인: 오차 허용",
+            "approved_at": "2026-11-09",
+        }
+    ]
+    approved_parsed = parse_report_pages(
+        file_id=8778,
+        yyyy=2026,
+        mm=11,
+        ovr_item_code="OVR0000000013",
+        pages=corrupted_pages,
+        items=ITEMS,
+        text_status="ok",
+        approved_tables=custom_approvals,
+    )
+    assert approved_parsed.parse_status == "parsed"
+    app_t = next(t for t in approved_parsed.raw_tables if "사과 생산량 전망" in t.title)
+    assert app_t.check_status == "pass"
+    assert app_t.check_log is not None
+    assert "수동 승인: 테스트 수동 승인: 오차 허용" in app_t.check_log[0]["message"]
+    # 관측치가 정상 적재되었는지 확인
+    prod_obs = [
+        o for o in approved_parsed.observations if o.item_label == "사과" and o.metric == "production"
+    ]
+    assert len(prod_obs) > 0
+
+
+def test_manual_approval_exact_title_match():
+    """공백 정리 후 정확히 같을 때만 승인되고, 비슷한 제목의 다른 표는 승인되지 않음."""
+    from croplib_dp.core.krei_parse import find_table_approval
+
+    approvals = [
+        {
+            "file_id": 8723,
+            "title": "2026년 복숭아 생산량 전망",
+            "reason": "사유",
+            "approver": "peace",
+            "approved_at": "2026-11-09",
+        }
+    ]
+
+    # 1. 정확히 일치: 승인
+    assert find_table_approval(8723, "2026년 복숭아 생산량 전망", approvals) is not None
+
+    # 2. 공백 차이: 공백 정규화 후 일치하므로 승인
+    assert find_table_approval(8723, "2026년  복숭아   생산량 전망", approvals) is not None
+
+    # 3. 비슷한 제목(접두사/접미사/포함): 부분 포함 매칭 제거로 승인 불가
+    assert find_table_approval(8723, "복숭아 생산량 전망", approvals) is None
+    assert find_table_approval(8723, "2026년 복숭아 품종별 생산량 전망", approvals) is None
+    assert find_table_approval(8723, "2026년 사과 생산량 전망", approvals) is None
+    assert find_table_approval(8723, "2026년 복숭아 생산량 전망 요약", approvals) is None
+
+    # 4. 다른 file_id: 승인 불가
+    assert find_table_approval(8778, "2026년 복숭아 생산량 전망", approvals) is None
+
+
+def test_approved_tables_csv_missing_or_corrupt_warns(tmp_path):
+    """승인 목록 파일을 못 읽거나 필수 열이 누락되면 경고를 반환한다."""
+    from croplib_dp.core.krei_parse import load_approved_tables_with_warnings
+
+    # 1. 존재하지 않는 파일
+    non_existent = tmp_path / "non_existent.csv"
+    rows, errs = load_approved_tables_with_warnings(non_existent)
+    assert rows == []
+    assert any("승인 목록 파일 없음" in e for e in errs)
+
+    # 2. 필수 열 누락 (approver 누락)
+    missing_col_csv = tmp_path / "missing_col.csv"
+    missing_col_csv.write_text(
+        "file_id,title,reason,approved_at\n8723,표,사유,2026-11-09\n",
+        encoding="utf-8",
+    )
+    rows, errs = load_approved_tables_with_warnings(missing_col_csv)
+    assert rows == []
+    assert any("필수 열 누락" in e and "approver" in e for e in errs)
+
+    # 3. 유효하지 않은 file_id (숫자 아님)
+    invalid_fid_csv = tmp_path / "invalid_fid.csv"
+    invalid_fid_csv.write_text(
+        "file_id,title,reason,approver,approved_at\nabc,표,사유,peace,2026-11-09\n",
+        encoding="utf-8",
+    )
+    rows, errs = load_approved_tables_with_warnings(invalid_fid_csv)
+    assert rows == []
+    assert any("file_id 유효하지 않음" in e for e in errs)

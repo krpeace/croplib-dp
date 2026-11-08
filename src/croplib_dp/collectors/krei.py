@@ -49,6 +49,7 @@ from croplib_dp.core.krei_parse import (
     PREP_SCOPE,
     STRUCTURED_NUM_SCOPE,
     ParsedReport,
+    load_approved_tables_with_warnings,
     parse_report_pages,
 )
 from croplib_dp.io.contract import SPECS, check_rows
@@ -98,6 +99,7 @@ class KreiResult:
     observation_count: int = 0
     survey_dist_count: int = 0
     section_count: int = 0
+    approved_tables: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
@@ -305,6 +307,11 @@ def parse_one_report(
     ovr_item_code = str(rep["ovr_item_code"])
     text_status = rep.get("text_status")
 
+    _, load_errs = load_approved_tables_with_warnings()
+    for err in load_errs:
+        if err not in r.problems:
+            r.problems.append(err)
+
     pages_data = decompress_pages_json(gz_bytes)
     parsed = parse_report_pages(
         file_id=file_id,
@@ -332,6 +339,13 @@ def parse_one_report(
         r.table_counts_by_type[t.table_type] = r.table_counts_by_type.get(t.table_type, 0) + 1
         if t.check_status == "pass":
             r.table_pass_count += 1
+            if t.check_log and any(err.get("check") == "manual_approval" for err in t.check_log):
+                r.approved_tables.append(
+                    dict(
+                        file_id=file_id,
+                        title=t.title,
+                    )
+                )
         elif t.check_status == "fail":
             r.table_fail_count += 1
             r.needs_review.append(
@@ -771,6 +785,11 @@ def run(
             write_outputs(r, out_dir)
 
     # 5. 표·헤드라인 파싱 (시간 예산 공유)
+    _, load_errs = load_approved_tables_with_warnings()
+    for err in load_errs:
+        if err not in r.problems:
+            r.problems.append(err)
+
     b_url = base_url or (getattr(writer, "base", None) if writer else None)
     b_key = key or (getattr(writer, "key", None) if writer else None)
 
@@ -1097,6 +1116,9 @@ def brief_text(r: KreiResult) -> str:
             f"- 추출 건수: 관측치 {r.observation_count:,}줄 · "
             f"생육분포 {r.survey_dist_count:,}줄 · 헤드라인 {r.section_count:,}건"
         )
+        if r.approved_tables:
+            app_list_str = ", ".join(f"#{a['file_id']} {a['title']}" for a in r.approved_tables)
+            lines.append(f"- 수동 승인 {len(r.approved_tables)}건({app_list_str})")
     if r.needs_review:
         lines.append("\n### 검토 필요(needs_review) 목록")
         for nr in r.needs_review:

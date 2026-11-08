@@ -1321,3 +1321,15 @@ def test_step5_skipped_patch_failure_records_problem():
         reparse=True,
     )
     assert any("#8780 skipped 기록 실패" in p for p in r.problems)
+
+
+def test_brief_text_manual_approval_display():
+    """실행 요약에 '수동 승인 N건(file_id·제목)'이 표시된다."""
+    r = K.KreiResult()
+    r.parsed = [dict(parse_status="parsed")]
+    r.table_counts_by_type = {"production_outlook": 1}
+    r.table_pass_count = 1
+    r.approved_tables = [{"file_id": 8723, "title": "2026년 복숭아 생산량 전망"}]
+
+    summary = K.brief_text(r)
+    assert "- 수동 승인 1건(#8723 2026년 복숭아 생산량 전망)" in summary
