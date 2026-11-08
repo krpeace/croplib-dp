@@ -45,6 +45,12 @@ from croplib_dp.core.krei import (
     sync_items,
     text_storage_path,
 )
+from croplib_dp.core.krei_parse import (
+    PREP_SCOPE,
+    STRUCTURED_NUM_SCOPE,
+    ParsedReport,
+    parse_report_pages,
+)
 from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
 from croplib_dp.io.github_issue import IssueAlerts
@@ -82,6 +88,14 @@ class KreiResult:
     uploaded: bool = False
     issue_action: str | None = None
     _persisted_incrementally: bool = False
+    parsed: list[dict[str, Any]] = field(default_factory=list)
+    needs_review: list[dict[str, Any]] = field(default_factory=list)
+    table_counts_by_type: dict[str, int] = field(default_factory=dict)
+    table_pass_count: int = 0
+    table_fail_count: int = 0
+    observation_count: int = 0
+    survey_dist_count: int = 0
+    section_count: int = 0
 
     @property
     def failed(self) -> bool:
@@ -257,6 +271,182 @@ def notify_unreadable_issue(r: KreiResult, issue_sink: Any | None) -> str:
         return "error"
 
 
+def parse_one_report(
+    r: KreiResult,
+    rep: dict[str, Any],
+    items: list[dict[str, Any]],
+    gz_bytes: bytes,
+    writer: Any | None = None,
+    write: bool = True,
+    clock: Clock | None = None,
+) -> ParsedReport:
+    """단일 보고서의 글자 좌표에서 표·헤드라인을 파싱하고 DB에 반영."""
+    clock = clock or Clock()
+    file_id = int(rep["file_id"])
+    yyyy = int(rep["yyyy"])
+    mm = int(rep["mm"])
+    ovr_item_code = str(rep["ovr_item_code"])
+    text_status = rep.get("text_status")
+
+    pages_data = decompress_pages_json(gz_bytes)
+    parsed = parse_report_pages(
+        file_id=file_id,
+        yyyy=yyyy,
+        mm=mm,
+        ovr_item_code=ovr_item_code,
+        pages=pages_data,
+        items=items,
+        text_status=text_status,
+    )
+
+    r.parsed.append(
+        dict(
+            file_id=file_id,
+            item_name=rep.get("item_name"),
+            report_type=rep.get("report_type"),
+            parse_status=parsed.parse_status,
+            tables=len(parsed.raw_tables),
+            observations=len(parsed.observations),
+            survey_dists=len(parsed.survey_dists),
+            sections=len(parsed.section_texts),
+        )
+    )
+    for t in parsed.raw_tables:
+        r.table_counts_by_type[t.table_type] = r.table_counts_by_type.get(t.table_type, 0) + 1
+        if t.check_status == "pass":
+            r.table_pass_count += 1
+        elif t.check_status == "fail":
+            r.table_fail_count += 1
+            r.needs_review.append(
+                dict(
+                    file_id=file_id,
+                    item_name=rep.get("item_name"),
+                    title=t.title,
+                    errors=t.check_log or [],
+                )
+            )
+
+    r.observation_count += len(parsed.observations)
+    r.survey_dist_count += len(parsed.survey_dists)
+    r.section_count += len(parsed.section_texts)
+
+    now_iso = _iso(clock.now()) or ""
+    rep["parse_status"] = parsed.parse_status
+    rep["parser_version"] = parsed.parser_version
+    rep["parsed_at"] = now_iso
+    rep["updated_at"] = now_iso
+
+    if write and writer is not None:
+        try:
+            writer.delete("section_text", f"file_id=eq.{file_id}", select="id", schema=KREI_SCHEMA)
+            writer.delete("table_raw", f"file_id=eq.{file_id}", select="id", schema=KREI_SCHEMA)
+        except Exception:
+            pass
+
+        if parsed.section_texts:
+            sec_rows = [
+                dict(
+                    file_id=file_id,
+                    page=s.page,
+                    item_code=s.item_code,
+                    item_label=s.item_label,
+                    section=s.section,
+                    headline=s.headline,
+                    direction=s.direction,
+                    bullets=s.bullets,
+                )
+                for s in parsed.section_texts
+            ]
+            probs = check_rows("krei.section_text", sec_rows, ignore=("id",))
+            if not probs:
+                writer.upsert("section_text", sec_rows, on_conflict=("id",), schema=KREI_SCHEMA)
+            else:
+                r.problems += probs
+
+        seq_to_id: dict[int, int] = {}
+        if parsed.raw_tables:
+            table_rows = [
+                dict(
+                    file_id=file_id,
+                    page=t.page,
+                    seq=t.seq,
+                    item_code=t.item_code,
+                    item_label=t.item_label,
+                    title=t.title,
+                    unit=t.unit,
+                    header=t.header,
+                    rows=t.rows,
+                    note=t.note,
+                    source=t.source,
+                    table_type=t.table_type,
+                    check_status=t.check_status,
+                    check_log=t.check_log,
+                )
+                for t in parsed.raw_tables
+            ]
+            probs = check_rows("krei.table_raw", table_rows, ignore=("id",))
+            if not probs:
+                saved = writer.upsert(
+                    "table_raw",
+                    table_rows,
+                    on_conflict=("file_id", "seq"),
+                    returning=True,
+                    schema=KREI_SCHEMA,
+                )
+                seq_to_id = {int(st["seq"]): int(st["id"]) for st in saved if "id" in st and "seq" in st}
+            else:
+                r.problems += probs
+
+        if parsed.observations:
+            obs_rows = [
+                dict(
+                    file_id=file_id,
+                    table_raw_id=seq_to_id.get(o.table_seq, o.table_raw_id),
+                    item_code=o.item_code,
+                    item_label=o.item_label,
+                    variety=o.variety,
+                    metric=o.metric,
+                    basis=o.basis,
+                    crop_year=o.crop_year,
+                    period_label=o.period_label,
+                    period_start=o.period_start.isoformat() if o.period_start else None,
+                    period_end=o.period_end.isoformat() if o.period_end else None,
+                    value=o.value,
+                    unit=o.unit,
+                )
+                for o in parsed.observations
+            ]
+            probs = check_rows("krei.observation", obs_rows, ignore=("id",))
+            if not probs:
+                writer.upsert("observation", obs_rows, on_conflict=("id",), schema=KREI_SCHEMA)
+            else:
+                r.problems += probs
+
+        if parsed.survey_dists:
+            dist_rows = [
+                dict(
+                    file_id=file_id,
+                    table_raw_id=seq_to_id.get(d.table_seq, d.table_raw_id),
+                    item_code=d.item_code,
+                    item_label=d.item_label,
+                    aspect=d.aspect,
+                    good=d.good,
+                    same=d.same,
+                    bad=d.bad,
+                )
+                for d in parsed.survey_dists
+            ]
+            probs = check_rows("krei.survey_dist", dist_rows, ignore=("id",))
+            if not probs:
+                writer.upsert("survey_dist", dist_rows, on_conflict=("id",), schema=KREI_SCHEMA)
+            else:
+                r.problems += probs
+
+        writer.upsert("report", [rep], on_conflict=REPORT_KEY, schema=KREI_SCHEMA)
+
+    return parsed
+
+
 def run(
     months: list[tuple[int, int]] | None = None,
     existing_items: Iterable[Mapping[str, Any]] = (),
@@ -270,7 +460,10 @@ def run(
     issue_sink: Any | None = None,
     budget_minutes: float | None = DEFAULT_BUDGET_MINUTES,
     max_pdfs: int | None = None,
+    reparse: bool = False,
     out_dir: Path | None = None,
+    base_url: str | None = None,
+    key: str | None = None,
 ) -> KreiResult:
     """KREI 목록·원문 수집 1회 실행.
     - `write=False`(시험 실행)이면 목록은 모두 조회하되 PDF 는 최대 1건(표본)만 받는다.
@@ -370,6 +563,8 @@ def run(
                     fetch_status="fetched",
                     fetch_error=None,
                     parse_status=prev.get("parse_status") or "pending",
+                    parser_version=prev.get("parser_version"),
+                    parsed_at=prev.get("parsed_at"),
                     updated_at=updated_at,
                 )
             )
@@ -430,6 +625,8 @@ def run(
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
                 parse_status="pending",
+                parser_version=None,
+                parsed_at=None,
                 updated_at=updated_at,
             )
             r.reports.append(rep_row)
@@ -478,6 +675,8 @@ def run(
                 fetch_status="failed",
                 fetch_error=err_msg[:500],
                 parse_status="pending",
+                parser_version=None,
+                parsed_at=None,
                 updated_at=updated_at,
             )
             r.reports.append(rep_row)
@@ -540,11 +739,86 @@ def run(
             fetch_status="fetched",
             fetch_error=None,
             parse_status="pending",
+            parser_version=None,
+            parsed_at=None,
             updated_at=updated_at,
         )
         r.reports.append(rep_row)
         if writer is not None:
             _persist_one_report(r, writer, rep_row, gz_bytes=gz_bytes)
+        if out_dir is not None:
+            write_outputs(r, out_dir)
+
+    # 5. 표·헤드라인 파싱 (시간 예산 공유)
+    b_url = base_url or (getattr(writer, "base", None) if writer else None)
+    b_key = key or (getattr(writer, "key", None) if writer else None)
+
+    report_by_id = {int(rep["file_id"]): rep for rep in r.reports}
+    for fid, rep in existing_by_id.items():
+        if fid not in report_by_id:
+            report_by_id[fid] = dict(rep)
+
+    target_months_set = set(target_months)
+    to_parse: list[dict[str, Any]] = []
+
+    for fid in sorted(report_by_id):
+        rep = report_by_id[fid]
+        ym = (int(rep.get("yyyy") or 0), int(rep.get("mm") or 0))
+        if ym not in target_months_set:
+            continue
+        if rep.get("fetch_status") != "fetched":
+            continue
+
+        p_status = rep.get("parse_status") or "pending"
+        ovr_code = str(rep.get("ovr_item_code") or "")
+        t_status = rep.get("text_status")
+
+        if t_status == "no_text" or (ovr_code not in STRUCTURED_NUM_SCOPE and ovr_code not in PREP_SCOPE):
+            if p_status != "skipped":
+                rep["parse_status"] = "skipped"
+                if writer is not None and write:
+                    try:
+                        writer.patch(
+                            "report",
+                            f"file_id=eq.{fid}",
+                            {"parse_status": "skipped"},
+                            select="file_id",
+                            schema=KREI_SCHEMA,
+                        )
+                    except Exception:
+                        pass
+            continue
+
+        if reparse or p_status == "pending":
+            to_parse.append(rep)
+
+    for rep in to_parse:
+        elapsed_s = (clock.now() - started_at).total_seconds()
+        if budget_s is not None and elapsed_s >= budget_s:
+            break
+
+        fid = int(rep["file_id"])
+        t_path = rep.get("text_path")
+        gz_bytes = r.text_files.get(t_path) if t_path else None
+        if gz_bytes is None and t_path and b_url and b_key:
+            try:
+                gz_bytes = read_storage_bytes(b_url, b_key, STORAGE_BUCKET, str(t_path), http=http)
+            except Exception as e:
+                r.problems.append(f"#{fid} Storage 읽기 실패: {e}")
+                continue
+
+        if gz_bytes is None:
+            continue
+
+        parse_one_report(
+            r=r,
+            rep=rep,
+            items=r.items,
+            gz_bytes=gz_bytes,
+            writer=writer,
+            write=write,
+            clock=clock,
+        )
         if out_dir is not None:
             write_outputs(r, out_dir)
 
@@ -609,6 +883,8 @@ def backfill_text_status(
             r.reports.append(rep)
             continue
 
+        rep.setdefault("parser_version", None)
+        rep.setdefault("parsed_at", None)
         rep["text_chars"] = text_chars
         rep["no_text_pages"] = no_text_pages
         rep["text_status"] = text_status
@@ -759,6 +1035,31 @@ def brief_text(r: KreiResult) -> str:
         for fl in r.failed_reports:
             fid = f"#{fl['file_id']}" if fl.get("file_id") is not None else "번호없음"
             lines.append(f"- {fl['item_name']} ({fl['report_type']}) {fid}: {fl['error']}")
+    if r.parsed:
+        lines.append("\n## 표·헤드라인 파싱")
+        ok_cnt = sum(1 for p in r.parsed if p.get("parse_status") == "parsed")
+        rev_cnt = sum(1 for p in r.parsed if p.get("parse_status") == "needs_review")
+        skip_cnt = sum(1 for p in r.parsed if p.get("parse_status") == "skipped")
+        lines.append(
+            f"- 대상 발행호: {len(r.parsed)}건 (완료 {ok_cnt}건 · 검토 필요 {rev_cnt}건 · 제외 {skip_cnt}건)"
+        )
+        if r.table_counts_by_type:
+            types_str = ", ".join(f"{k}: {v}개" for k, v in sorted(r.table_counts_by_type.items()))
+            lines.append(
+                f"- 표 종류별: {types_str} (통과 {r.table_pass_count}개 · 실패 {r.table_fail_count}개)"
+            )
+        lines.append(
+            f"- 추출 건수: 관측치 {r.observation_count:,}줄 · "
+            f"생육분포 {r.survey_dist_count:,}줄 · 헤드라인 {r.section_count:,}건"
+        )
+    if r.needs_review:
+        lines.append("\n### 검토 필요(needs_review) 목록")
+        for nr in r.needs_review:
+            fid = nr.get("file_id")
+            title = nr.get("item_name") or nr.get("title") or ""
+            errs = nr.get("errors") or []
+            err_summary = "; ".join(str(e.get("error") or e) for e in errs[:2])
+            lines.append(f"- #{fid} {title}: {err_summary}")
     if r.problems:
         lines.append("\n## 문제")
         for p in r.problems[:10]:
@@ -823,6 +1124,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="--backfill-text-status 실행 시 이미 값이 채워진 행도 전체 다시 계산",
     )
+    p.add_argument("--reparse", action="store_true", help="기존 수집된 보고서들을 Storage에서 읽어 다시 파싱")
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase DB·Storage에 쓰기")
     a = p.parse_args(argv)
@@ -884,7 +1186,10 @@ def main(argv: list[str] | None = None) -> int:
         writer=writer,
         issue_sink=issue_sink,
         budget_minutes=budget_minutes,
+        reparse=a.reparse,
         out_dir=out_path,
+        base_url=sb_url or None,
+        key=sb_key or None,
     )
     if not a.write:
         r.problems += check(r)

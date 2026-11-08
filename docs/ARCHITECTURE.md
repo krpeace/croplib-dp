@@ -26,6 +26,8 @@
 | `core/radiation_report.py` | 일사 점검 결과 + 해안선 거리 → 실태표 csv·보고서 md·관계 그림 svg(문자열 생성) (결정 0021) | 새로 만듦 |
 | `core/radiation_audit.py` | 일사 점검 계산(순수 함수): 분류·실측 kRs(전체·계절별)·ETo 오차(관측 일사 대비 기온차식 kRs 0.16·0.19)·의심 일조·해안 경계 후보 비교 (결정 0021) | 새로 만듦 (cropwater 원본 없음) |
 | `core/krei.py` | KREI 농업관측 XML 파싱(`reportItem`·`montlyReport`·`newsReport`), 품목 동기화(`is_listed`), `pdf_link` 파일번호 추출, 이번 달+다음 달·기간 계산, 재수집 판정(`mod_date`), 1쪽 통권·발행일 추출, 글자 좌표(`pages.json.gz`) 반올림·압축 (`krei.item`·`krei.report`, 결정 0019) | 신규 |
+| `core/krei_parse.py` | KREI 농업관측 2단계 표·헤드라인 파서(순수 함수): 글자 좌표 단어 재구성, 중점 기반 열 격자 분할, 생산/출하/가격/생육 4대 표 정형화 (결정 0023) | 신규 |
+| `core/krei_check.py` | KREI 농업관측 통계 정합성 검사(순수 함수): 구간 연산 기반 YoY% 증감률 재계산, 면적×단수≈생산량 1% 오차 검증, 생육분포 합 100±0.3% 검증 (결정 0023) | 신규 |
 
 `io/coefficients.py`는 패키지 안 `data/`의 춘천 계수 파일(S3·S4 일사 계수, 예보 ETo 오차표)을 읽는다.
 
@@ -112,15 +114,18 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 
 알림은 GitHub 이슈로 한다. 저장소 주인에게 이슈·댓글이 메일로 가므로 메일 서버 키가 필요 없다. 다른 주소로 받으려면 메일 발송 서비스를 따로 붙인다(지금은 안 함).
 
-## KREI 농업관측 수집기 (1단계: 품목·목록·글자 좌표, 결정 0019)
+## KREI 농업관측 수집기 (1단계: 품목·목록·글자 좌표, 2단계: 표·헤드라인 파싱 및 정합성 검사, 결정 0019, 0023)
 | 모듈 | 하는 일 |
 |---|---|
 | `supabase/migrations/20261108000000_krei_schema.sql` | `krei.item`, `krei.report` 표(RLS: 누구나 읽기, 쓰기는 `service_role`), 공개 뷰 `krei_api.reports`(`fetch_status = 'fetched'`, `security_invoker = true`), 비공개 Storage 버킷 `krei-raw` |
+| `supabase/migrations/20261108030000_krei_parse.sql` | 2단계 스키마: `krei.section_text`, `krei.table_raw`, `krei.observation`, `krei.survey_dist` 및 `krei.report` 상태 열(`parser_version`, `parsed_at`, `needs_review`), 공개 뷰 `krei_api.latest_outlook`, `outlook_history`, `headlines`, `growth_survey` |
 | `core/krei.py` | `reportItem`·`montlyReport`·`newsReport` XML 파싱, 빠진 품목 `is_listed = false` 전환, `/download/(\d+)/` 파일번호 추출, 이번 달+다음 달·기간 계산, `mod_date` 재수집 판정, 1쪽 통권·발행일 추출, 쪽별 글자 좌표 반올림·gzip 압축 |
+| `core/krei_parse.py` | 글자 좌표 단어 줄 재구성, 섹션 헤드라인/방향성/불릿 추출, 중점 기반 열 격자 분할, 4대 표(생산·출하·도매가격·생육조사) 파싱 및 observation 생성 |
+| `core/krei_check.py` | 구간 연산 YoY% 증감률 재계산 검증, 면적×단수≈생산량 1% 오차 검증, 생육분포 합 100±0.3% 검증 (불합격 시 observation 0줄 + `needs_review`) |
 | `io/krei.py` | KREI API 요청기(요청 사이 1초 쉼, `User-Agent: croplib-dp/<버전>`, 타임아웃 60초·PDF 120초, 실패 시 5초 뒤 1회 재시도), 임시 폴더에 PDF를 받아 `pdfplumber`로 글자 좌표 추출 후 원본 즉시 삭제 |
-| `collectors/krei.py` | `reportItem` → `krei.item` 덮어쓰기, 이번 달+다음 달(또는 `--yyyy --mm`, `--from --to`) 목록 조회 및 원문 XML 보관(`krei-raw/list/{api}/{yyyy}-{mm}.xml`), 새 건·`mod_date` 변경 건만 PDF → `pages.json.gz`(`krei-raw/text/{ovr_item_code}/{yyyy}/{mm}/{file_id}.pages.json.gz`) 추출·보관 및 `krei.report` 기록 |
+| `collectors/krei.py` | `reportItem` → `krei.item` 덮어쓰기, 이번 달+다음 달(또는 `--yyyy --mm`, `--from --to`) 목록 조회 및 원문 XML 보관(`krei-raw/list/{api}/{yyyy}-{mm}.xml`), 새 건·`mod_date` 변경 건만 PDF → `pages.json.gz`(`krei-raw/text/{ovr_item_code}/{yyyy}/{mm}/{file_id}.pages.json.gz`) 추출·보관 및 `krei.report` 기록, 5단계 표·헤드라인 파싱(25분 예산 공유, `--reparse` 완전 교체 멱등성 보장) |
 
-- 실행: `python -m croplib_dp.collectors.krei [--yyyy 2026 --mm 11] [--from 2026-01 --to 2026-12] [--out out] [--write]`. 환경변수 `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`(KREI API는 별도 인증키 불필요).
+- 실행: `python -m croplib_dp.collectors.krei [--yyyy 2026 --mm 11] [--from 2026-01 --to 2026-12] [--reparse] [--out out] [--write]`. 환경변수 `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`(KREI API는 별도 인증키 불필요).
 
 ## 지점 목록 현행화 (이슈 #27, 결정 0016)
 | 모듈 | 하는 일 |

@@ -823,6 +823,8 @@ def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Pa
             fetch_status="fetched",
             fetch_error=None,
             parse_status="pending",
+            parser_version=None,
+            parsed_at=None,
             updated_at="2026-11-07T20:40:00+09:00",
         ),
         dict(
@@ -851,6 +853,8 @@ def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Pa
             fetch_status="fetched",
             fetch_error=None,
             parse_status="pending",
+            parser_version=None,
+            parsed_at=None,
             updated_at="2026-11-07T20:40:00+09:00",
         ),
         dict(
@@ -879,6 +883,8 @@ def test_backfill_text_status_reads_storage_without_downloading_pdf(tmp_path: Pa
             fetch_status="fetched",
             fetch_error=None,
             parse_status="pending",
+            parser_version=None,
+            parsed_at=None,
             updated_at="2026-11-07T20:40:00+09:00",
         ),
     ]
