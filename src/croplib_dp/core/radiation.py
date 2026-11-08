@@ -22,7 +22,9 @@ from collections.abc import Mapping
 from croplib_dp.core.fao56 import extra_radiation, rs_from_sunshine
 from croplib_dp.core.solar import KRS_FAO, ra_rso, rs_s1
 
-KRS_INLAND = KRS_FAO  # 식50 kRs 기본값(내륙). 해안 값(0.19)은 지점별로 StationMeta.krs 에 넣는다 (S0-b)
+KRS_INLAND = KRS_FAO  # 식50 kRs 기본값(내륙). 해안 값은 지점별로 StationMeta.krs 에 넣는다 (io/coastal.py)
+KRS_COASTAL = 0.19  # 해안 지점(해안선 10 km 이하) 식50 kRs (#48 승인 2026-11-08, 결정 0021)
+COASTAL_MAX_KM = 10.0  # 해안선까지 이 거리 이하(같으면 포함)이면 해안
 MIN_RS_RATIO = 0.01  # 일사 하한 = 0.01 × Ra (결정 0020: 정상 지점에서 무효가 되는 날 0.01%)
 MONTH_MIN_DAYS = 10  # 이 일수 이상 자료가 있는 달만 월 단위로 판단한다
 MONTH_INVALID_RATIO = 0.9  # 자료 중 무효가 이 비율 이상이면 그 달 전체 무효

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from croplib_dp.core.coast import Point, Polygon, classify_station
 from croplib_dp.core.radiation_audit import compare_boundaries
-from croplib_dp.core.radiation_report import markdown_report, merge_geo, svg_scatter, to_csv
+from croplib_dp.core.radiation_report import coastal_csv, markdown_report, merge_geo, svg_scatter, to_csv
 from croplib_dp.io import coast_data
 
 
@@ -40,6 +40,7 @@ def build_report(
     out_dir: Path,
     stamp: str,
     sources: str = "",
+    coastal_csv_path: Path | None = None,
 ) -> dict[str, Path]:
     """지점별 해안선 거리·섬 판정 → 경계 후보 비교 → csv·md·svg 쓰기. 쓴 파일 경로를 돌려준다."""
     geo = {
@@ -62,6 +63,10 @@ def build_report(
     paths["csv"].write_text(to_csv(stations), encoding="utf-8-sig")  # 엑셀에서 한글이 깨지지 않게 BOM
     paths["md"].write_text(markdown_report(stations, comparison, meta, stamp, sources), encoding="utf-8")
     paths["svg"].write_text(svg_scatter(stations), encoding="utf-8")
+    if coastal_csv_path is not None:  # 승인된 경계(10 km)로 지점별 kRs 목록 만들기 → io/coastal.py 가 읽는다
+        coastal_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        coastal_csv_path.write_text(coastal_csv(stations, stamp), encoding="utf-8")
+        paths["coastal"] = coastal_csv_path
     return paths
 
 
@@ -81,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         "--coast-dir", default=".cache/natural_earth", help="해안선 자료를 내려받아 두는 폴더(저장소 밖 권장)"
     )
     p.add_argument("--out", default="docs/data", help="결과를 쓸 폴더")
+    p.add_argument("--coastal-csv", help="승인된 경계(해안선 10 km 이하 0.19)로 지점별 kRs 목록을 쓸 경로")
     p.add_argument("--stamp", help="파일 이름의 날짜(YYYYMMDD). 기본은 점검 기간 마지막 날")
     a = p.parse_args(argv)
     audit, meta = load_audit(Path(a.audit_dir))
@@ -88,7 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     coast_dir = Path(a.coast_dir)
     lines = coast_data.load_lines(coast_data.ensure_file(coast_dir, coast_data.SOURCES["coastline"]))
     polygons = coast_data.load_polygons(coast_data.ensure_file(coast_dir, coast_data.SOURCES["land"]))
-    paths = build_report(audit, meta, lines, polygons, Path(a.out), stamp, _sources_text())
+    coastal = Path(a.coastal_csv) if a.coastal_csv else None
+    paths = build_report(audit, meta, lines, polygons, Path(a.out), stamp, _sources_text(), coastal)
     for k, v in paths.items():
         print(f"{k}: {v}")
     return 0

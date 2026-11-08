@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape
 
 import numpy as np
 
+from croplib_dp.core.radiation import COASTAL_MAX_KM, KRS_COASTAL, KRS_INLAND
 from croplib_dp.core.radiation_audit import (
     CLASS_NORMAL,
     CLASSES,
@@ -34,6 +35,7 @@ CSV_COLUMNS = (
     "krs_n", "krs_median", "krs_q1", "krs_q3", "krs_3_5", "krs_6_8", "krs_9_11", "krs_12_2",
     "eto_n", "eto_bias_016", "eto_mae_016", "eto_bias_019", "eto_mae_019", "eto_best_krs",
 )  # fmt: skip
+COASTAL_CSV_COLUMNS = ("stn_id", "name_ko", "coast_km", "island", "resolution_corrected", "krs", "basis")
 FAILED = "수신 실패"
 INF = float("inf")
 BANDS = ((0, 10, "0~10 km"), (10, 30, "10~30 km"), (30, 60, "30~60 km"), (60, INF, "60 km 이상"))
@@ -90,6 +92,30 @@ def to_csv(stations: Sequence[Station]) -> str:
     for s in stations:
         f = _flat(s)
         w.writerow([_cell(f.get(c)) for c in CSV_COLUMNS])
+    return buf.getvalue()
+
+
+def coastal_csv(stations: Sequence[Station], basis: str) -> str:
+    """지점별 kRs 목록(`data/coastal_stations.csv`): 해안선 거리 10 km 이하(같으면 포함) 0.19, 아니면 0.16.
+    거리가 있는 지점만 넣는다(수신 실패 지점은 목록에 없으면 내륙 0.16으로 읽힌다). basis = 점검 기준 날짜."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator=chr(10))
+    w.writerow(COASTAL_CSV_COLUMNS)
+    for s in stations:
+        if s.get("error") or s.get("coast_km") is None:
+            continue
+        krs = KRS_COASTAL if s["coast_km"] <= COASTAL_MAX_KM else KRS_INLAND
+        w.writerow(
+            [
+                s["stn_id"],
+                s.get("name", ""),
+                _cell(s["coast_km"]),
+                _cell(bool(s.get("island"))),
+                _cell(bool(s.get("resolution_corrected"))),
+                krs,
+                basis,
+            ]
+        )
     return buf.getvalue()
 
 

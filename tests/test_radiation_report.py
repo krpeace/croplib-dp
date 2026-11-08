@@ -15,7 +15,9 @@ import pytest
 from croplib_dp.collectors import radiation_report as RR
 from croplib_dp.core.radiation_audit import compare_boundaries
 from croplib_dp.core.radiation_report import (
+    COASTAL_CSV_COLUMNS,
     CSV_COLUMNS,
+    coastal_csv,
     krs_groups,
     markdown_report,
     merge_geo,
@@ -196,3 +198,44 @@ def test_audit_files_roundtrip_through_json(tmp_path):
     (d / "meta.json").write_text(json.dumps(META), encoding="utf-8")
     stations, meta = RR.load_audit(d)
     assert len(stations) == 6 and meta["calls"] == 194
+
+
+# ── 해안 목록(coastal_stations.csv) 만들기 ─────────────────────────────────
+def test_coastal_csv_applies_the_approved_boundary_with_ten_km_inclusive():
+    aud = [_aud(str(i), f"S{i}") for i in range(1, 6)]
+    km = {"1": 0.0, "2": 9.99, "3": 10.0, "4": 10.01, "5": 80.0}
+    geo = {
+        k: dict(status="inside", coast_km=v, island=k == "2", corrected=k == "1", polygon_dist_km=0.0)
+        for k, v in km.items()
+    }
+    text = coastal_csv(merge_geo(aud + [dict(stn_id="9", name="실패", error="ASOS 실패")], geo), "20261107")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    assert list(rows[0].keys()) == list(COASTAL_CSV_COLUMNS)
+    assert [(r["stn_id"], r["krs"]) for r in rows] == [
+        ("1", "0.19"),
+        ("2", "0.19"),
+        ("3", "0.19"),
+        ("4", "0.16"),
+        ("5", "0.16"),
+    ]
+    assert (
+        rows[0]["resolution_corrected"] == "true"
+        and rows[1]["island"] == "true"
+        and rows[0]["basis"] == "20261107"
+    )
+    assert all(
+        r["stn_id"] != "9" for r in rows
+    )  # 수신 실패 지점은 목록에 넣지 않는다(목록에 없으면 내륙 0.16)
+
+
+def test_build_report_can_also_write_the_coastal_list(tmp_path):
+    audit = [_aud("1", "육지", krs=0.17), _aud("2", "섬", krs=0.21)]
+    audit[0].update(lat=36.0, lon=128.0)
+    audit[1].update(lat=36.25, lon=131.02)  # 섬 서쪽 해안 가까이(약 2 km)
+    lines = [_sq(126, 34, 130, 39), _sq(131, 36, 131.5, 36.5)]
+    polys = [[_sq(126, 34, 130, 39)], [_sq(131, 36, 131.5, 36.5)]]
+    target = tmp_path / "coastal_stations.csv"
+    paths = RR.build_report(audit, META, lines, polys, tmp_path, "20261108", coastal_csv_path=target)
+    assert paths["coastal"] == target
+    rows = {r["stn_id"]: r for r in csv.DictReader(io.StringIO(target.read_text(encoding="utf-8-sig")))}
+    assert rows["1"]["krs"] == "0.16" and rows["2"]["krs"] == "0.19"

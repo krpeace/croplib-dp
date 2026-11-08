@@ -3,7 +3,8 @@ name: radiation-audit
 # 일사 점검 (이슈 #48, #28 S0-b): 사람이 Actions 화면에서 눌렀을 때만 돈다 (예약 없음).
 # 운영 지점(is_active)마다 지난 365일 ASOS 일자료를 받아(해가 바뀌면 지점당 2번 = 약 194번 호출)
 # 일사 분류·실측 kRs·ETo 오차·의심 일조를 계산하고, 결과 파일을 이 실행의 Artifacts(30일 보관)에 올린다.
-# **DB에는 쓰지 않는다.** 지점 목록만 읽는다. 키는 GitHub Secrets 환경변수로만 읽고 기록에 남기지 않는다.
+# **DB에는 쓰지 않는다.** 지점 목록(`stations` 표)만 읽으므로 서버 키가 아니라 **읽기 전용 키**(Secrets `SUPABASE_READ_KEY`)를
+# 쓴다. 키는 GitHub Secrets 환경변수로만 읽고 기록에 남기지 않는다.
 
 on:
   workflow_dispatch:
@@ -31,7 +32,7 @@ jobs:
     env:
       DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_READ_KEY: ${{ secrets.SUPABASE_READ_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
