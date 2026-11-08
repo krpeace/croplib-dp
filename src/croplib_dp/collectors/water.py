@@ -639,7 +639,7 @@ def has_calc_inputs(st: Mapping[str, Any]) -> bool:
 
 
 def default_soil_code(soils: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]]) -> str | None:
-    """감시·slot_done 이 "어제 줄이 있나"를 볼 때 쓰는 토성 하나: 기본(is_default) 토성, 없으면 정렬 첫
+    """감시가 "어제 줄이 있나"를 볼 때 쓰는 토성 하나: 기본(is_default) 토성, 없으면 정렬 첫
     토성."""
     rows = list(soils.values() if isinstance(soils, Mapping) else soils)
     if not rows:
@@ -1173,13 +1173,12 @@ def taw_map(d: Dictionaries) -> dict[str, float]:
     return {s["scenario_id"]: float(s["taw_mm"]) for s in d.scenarios}
 
 
-def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get, obs_all: bool = False) -> bool:
+def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -> bool:
     """이 회차가 이미 '정시 성공'으로 끝났나 (예보 지점 모두).
     예약을 여러 번 걸어 둔 실행이 같은 일을 다시 하지 않게 한다.
     정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다.
-    obs_all(OBS_ALL_STATIONS=true)면 관측만 하는 지점(계산 입력이 있는 곳)의 어제 soil_water_daily 줄도
-    모두 있어야
-    끝난 회차로 본다(기본 토성 하나로 좁혀 한 번 조회). 빠진 지점이 있으면 다음 예약 실행이 다시 받는다."""
+    **관측만 하는 지점(OBS_ALL_STATIONS)은 보지 않는다**(사용자 확정 2026-11-08, 결정 0026): 그 지점의 ASOS가
+    계속 안 돼도 회차를 되풀이하지 않고, 감시의 "N일째" 경고(`obs`)로만 알린다."""
     # 예보를 할 수 있는 지점(격자 있음)만 기다린다. 격자가 비어 있는 지점은 예보를 건너뛰므로 그 지점 때문에
     # 같은 회차가 반복되면 안 된다(#28 문제 ④, 결정 0025).
     stations = [s for s in collect_stations(d) if forecast_ready(d.stations[s])]
@@ -1190,22 +1189,7 @@ def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get, o
         base, key, "forecast_runs", http, f"select=stn_id,result&run_at=eq.{run_at}&collector=eq.{COLLECTOR}"
     )
     ok = {str(r["stn_id"]) for r in rows if r["result"] == "정시 성공"}
-    if not set(stations) <= ok:
-        return False
-    if obs_all:
-        obs = [s for s in observation_only_stations(d) if has_calc_inputs(d.stations[s])]
-        soil = default_soil_code(d.soils)
-        if obs and soil:
-            yesterday = (pd.Timestamp(issue).normalize() - pd.Timedelta(days=1)).date()
-            got = read_table(
-                base,
-                key,
-                "soil_water_daily",
-                http,
-                f"select=stn_id&date=eq.{yesterday}&soil_code=eq.{soil}",
-            )
-            return set(obs) <= {str(r["stn_id"]) for r in got}
-    return True
+    return set(stations) <= ok
 
 
 def _env(name: str) -> str:
@@ -1255,7 +1239,7 @@ def main(argv: list[str] | None = None) -> int:
     d = load_dictionaries(base, svc)
     obs_all = obs_all_enabled()
     check_backfill_scope(d, stations, soil_backfill, obs_all)
-    if skip_if_done and slot_done(base, svc, d, issue, obs_all=obs_all):
+    if skip_if_done and slot_done(base, svc, d, issue):
         print(f"{name} {issue:%Y-%m-%d %H:%M} 회차는 이미 정시 성공으로 끝났습니다. 다시 하지 않습니다.")
         return 0
     soil_prior = None

@@ -425,54 +425,67 @@ def test_load_soil_prior_reads_the_day_before_the_window_in_pages():
     assert "date=eq.2026-05-26" in q and "stn_id=in.(100," in q and "order=" in q
 
 
-# ── slot_done 이 관측 지점의 어제 줄도 본다 ─────────────────────────────────
-def _slot_db(soil_rows, runs=None):
+# ── slot_done 은 예보 지점만 본다 (사용자 확정 2026-11-08: 관측만 하는 지점은 회차 재실행 없이 감시 경고로만) ──
+def _slot_db(runs=None):
     runs = [{"stn_id": "101", "result": "정시 성공"}] if runs is None else runs
 
     def db(url, headers):
         table = urllib.parse.urlparse(url).path.split("/rest/v1/")[1]
         if table == "forecast_runs":
             return 200, json.dumps(runs).encode()
-        if table == "soil_water_daily":
-            q = urllib.parse.unquote(url)
-            assert "date=eq.2026-06-09" in q and "soil_code=eq.loam" in q  # 기본 토성 하나로 좁혀 한 번
-            return 200, json.dumps(soil_rows).encode()
-        raise AssertionError(table)
+        raise AssertionError(f"slot_done 이 {table} 를 읽었다 — 예보 지점의 회차 기록만 봐야 한다")
 
     return db
 
 
-def test_slot_done_waits_for_yesterdays_rows_of_the_observation_only_stations():
+def test_slot_done_ignores_the_observation_only_stations_completely():
+    d = _obs_dicts()  # 216·301~303 은 관측만 하는 지점, 어제 줄이 하나도 없어도
+    assert W.slot_done("https://x.supabase.co", "srv", d, ISSUE, _slot_db())
+
+
+def test_slot_done_still_needs_the_forecast_stations_on_time():
     d = _obs_dicts()
-    have = [{"stn_id": s} for s in ("216", "301", "302")]
-    assert not W.slot_done("https://x.supabase.co", "srv", d, ISSUE, _slot_db(have), obs_all=True)
-    have.append({"stn_id": "303"})
-    assert W.slot_done("https://x.supabase.co", "srv", d, ISSUE, _slot_db(have), obs_all=True)
+    runs = [{"stn_id": "101", "result": "지연 수집"}]
+    assert not W.slot_done("https://x.supabase.co", "srv", d, ISSUE, _slot_db(runs))
 
 
-def test_slot_done_is_unchanged_when_the_switch_is_off():
-    d = _obs_dicts()
-    assert W.slot_done("https://x.supabase.co", "srv", d, ISSUE, _slot_db([]))  # 소토 줄은 묻지도 않는다
+def test_slot_done_has_no_observation_option_any_more():
+    import inspect
+
+    assert "obs_all" not in inspect.signature(W.slot_done).parameters
 
 
-def test_slot_done_does_not_wait_for_stations_that_can_never_be_calculated():
-    d = _obs_dicts()
-    d.stations["303"] = dict(d.stations["303"], wind_height_m=None)
-    have = [{"stn_id": s} for s in ("216", "301", "302")]
-    assert W.slot_done("https://x.supabase.co", "srv", d, ISSUE, _slot_db(have), obs_all=True)
+def test_one_observation_only_station_that_keeps_failing_ends_the_slot_in_one_run_with_a_warning_only():
+    """관측만 하는 지점 1곳이 계속 실패해도: 회차는 실패가 아니고, slot_done 은 끝났다고 보고(재실행 없음), 경고만 남는다."""
+    r, _, _ = _run(obs_all=True, http=_down(["301"]))
+    assert not r.failed and r.problems == []
+    assert [x["stn_id"] for x in r.forecast_runs] == ["101"] and r.forecast_runs[0]["result"] == "정시 성공"
+    assert any("ASOS 실패" in w and "301" in w for w in r.warnings)
+    assert not [x for x in r.soil_water_daily if x["stn_id"] == "301"]  # 301 의 어제 줄은 없다
+    done_rows = [{"stn_id": x["stn_id"], "result": x["result"]} for x in r.forecast_runs]
+    assert W.slot_done(
+        "https://x.supabase.co", "srv", _obs_dicts(), ISSUE, _slot_db(done_rows)
+    )  # 재실행 없음
+    # 그 지점은 감시의 "N일째" 경고로만 알린다
+    from croplib_dp.core.monitor import check_health
 
-
-def test_slot_done_still_needs_the_forecast_stations_first():
-    d = _obs_dicts()
-    have = [{"stn_id": s} for s in ("216", "301", "302", "303")]
-    assert not W.slot_done(
-        "https://x.supabase.co",
-        "srv",
-        d,
-        ISSUE,
-        _slot_db(have, runs=[{"stn_id": "101", "result": "지연 수집"}]),
-        obs_all=True,
+    yesterday = PREV
+    a = check_health(
+        TS("2026-06-10 18:30"),
+        [
+            dict(
+                run_at="2026-06-10 02:00",
+                finished_at="2026-06-10 02:10",
+                stn_id="101",
+                result="정시 성공",
+                on_time=True,
+            )
+        ],
+        {"101": yesterday},
+        {"301": "관측301"},
+        obs_last={"301": dt.date(2026, 6, 7)},
     )
+    assert [x.code for x in a] == ["obs"] and "301 관측301(2일째)" in a[0].text
 
 
 # ── 워크플로 입력: workflow_dispatch 에서만 ────────────────────────────────
