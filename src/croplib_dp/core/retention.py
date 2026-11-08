@@ -72,7 +72,7 @@ SYSTEM_MB = 12.0  # E2: 전체 57MB − 10표 합계 45MB
 EXTRA_MB = 1.0  # 줄 수를 세지 않는 작은 표(krei.report·storage.objects) 약 1MB (E2 2026-11-08)
 COUNT_TABLES = tuple(ROW_BYTES)  # 줄 수를 읽어 크기를 추정하는 표 8개
 
-# 용량 경고선 (#61 Q4, 2026-11-08 승인). DB 한도 500MB, Storage 한도 1GB(가정, 실제 한도 확인되면 고친다)
+# 용량 경고선 (#61 Q4, 2026-11-08 승인). DB 한도 500MB, Storage 한도 1GB(확인됨 2026-11-08)
 DB_WARN_MB, DB_ERR_MB = 400.0, 450.0  # 정확한 크기(CropMon#77 db_size_bytes())를 읽었을 때
 DB_EST_WARN_MB, DB_EST_ERR_MB = 360.0, 405.0  # 추정일 때는 오차 ±10% 를 두고 일찍
 STORAGE_WARN_MB, STORAGE_ERR_MB = 800.0, 950.0
