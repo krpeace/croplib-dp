@@ -513,6 +513,7 @@ class WeeklyResult:
     now: pd.Timestamp
     auto: bool
     max_rows: int
+    auto_reason: str = "cli"
     plan: Plan | None = None
     applied: ApplyResult | None = None
     storage_mb: float | None = None
@@ -524,6 +525,43 @@ class WeeklyResult:
     @property
     def failed(self) -> bool:
         return any(a.level == "error" for a in self.alerts)
+
+
+@dataclass(frozen=True)
+class AutoDecision:
+    auto: bool
+    reason: str  # AUTO_REASON_TEXT 의 열쇠
+
+
+# 켜짐·꺼짐의 이유를 사람이 읽는 말로(보고서·알림에 그대로 쓴다). 이유마다 말이 달라야 한다.
+AUTO_REASON_TEXT = {
+    "schedule": "예약 실행(일요일 05:10)이라 삭제까지 함",
+    "weekly_apply": "수동 실행, weekly_apply 켬(예약과 똑같이 삭제까지 함)",
+    "cli": "직접 실행(삭제까지 함)",
+    "manual": "수동 점검(weekly_apply 꺼짐)이라 읽기만 함",
+    "emergency": "비상 정지(Actions 변수 RETENTION_AUTO_APPLY=false)라 읽기만 함",
+    "flag": "--no-auto 로 꺼서 읽기만 함",
+}
+
+
+def decide_auto(
+    event: str | None, weekly_apply: str = "", auto_var: str = "", no_auto: bool = False
+) -> AutoDecision:
+    """자동 삭제를 켤지 정한다. 셸이 아니라 여기서 정해야 시험할 수 있다.
+    - 비상 정지 변수(RETENTION_AUTO_APPLY)가 `false`(대소문자·공백 무시)일 때만 끈다. **변수가 없으면(빈 글자) 켜짐.**
+    - 예약 실행(schedule)은 켜짐. 수동 실행은 weekly_apply 를 켰을 때만 켜짐(아니면 읽기만 하는 점검).
+    - event 가 None 이면 워크플로 밖에서 직접 부른 것이라 켜짐."""
+    if no_auto:
+        return AutoDecision(False, "flag")
+    if (auto_var or "").strip().lower() == "false":
+        return AutoDecision(False, "emergency")
+    if event is None:
+        return AutoDecision(True, "cli")
+    if event == "schedule":
+        return AutoDecision(True, "schedule")
+    if (weekly_apply or "").strip().lower() == "true":
+        return AutoDecision(True, "weekly_apply")
+    return AutoDecision(False, "manual")
 
 
 def _storage_total(env: Env, plan: Plan) -> dict[str, float]:
@@ -550,6 +588,15 @@ def _storage_alert(mb: float) -> Alert | None:
     return Alert(level, "storage", f"{head} — {mb:.0f}MB (모든 버킷 합계, {line}). {todo}")
 
 
+def _off_todo(reason: str) -> str:
+    """자동 삭제가 꺼진 채 보관 대기가 있을 때, 이유별로 무엇을 하면 되는지."""
+    if reason == "emergency":
+        return "비상 정지 변수(Actions 변수 RETENTION_AUTO_APPLY=false) 때문에 지우지 않았습니다. 변수를 지우면 주 1회 자동 삭제가 다시 켜집니다"
+    if reason == "manual":
+        return "수동 점검(weekly_apply 꺼짐)이라 지우지 않았습니다. 일요일 05:10 예약 실행은 삭제까지 합니다. 지금 지우려면 weekly_apply 를 켜거나 수동 apply 하세요"
+    return "자동 삭제가 꺼져 있어 지우지 않았습니다. 수동 apply 하세요"
+
+
 def weekly(
     env: Env,
     now: Any,
@@ -557,12 +604,15 @@ def weekly(
     max_rows: int = DEFAULT_MAX_ROWS,
     sink: IssueAlerts | None = None,
     xz_sample: int = 0,
+    auto_reason: str | None = None,
 ) -> WeeklyResult:
     """주 1회 정기 실행: **같은 실행 안에서 plan → 그 줄 수로 apply**(기본 `auto=True`). `auto=False`(비상 정지 변수
-    RETENTION_AUTO_APPLY=false·수동 점검)면 읽기만 하고 경고한다. apply 는 S3-a 와 같은 확인을 모두 거치고, plan 이 센 줄 수와
+    RETENTION_AUTO_APPLY=false·수동 점검)면 읽기만 하고 경고한다. auto_reason 은 켜짐·꺼짐 이유(decide_auto). apply 는 S3-a 와 같은 확인을 모두 거치고, plan 이 센 줄 수와
     다르면 지우지 않는다. 한 번에 지울 줄이 max_rows 를 넘으면 삭제하지 않고 오류. 예외는 올리지 않고 오류 경고로 남긴다."""
     now = pd.Timestamp(now)
-    res = WeeklyResult(now=now, auto=auto, max_rows=max_rows)
+    res = WeeklyResult(
+        now=now, auto=auto, max_rows=max_rows, auto_reason=auto_reason or ("cli" if auto else "flag")
+    )
     try:
         plan = build_plan(env, now, None, xz_sample=xz_sample)
         res.plan = plan
@@ -585,7 +635,7 @@ def weekly(
             res.applied = apply(env, now, plan.through, plan.total_rows, len(plan.raw_expired))
         elif waiting:
             what = f"전망 표 {plan.total_rows}줄(~{plan.through})이 14일을 넘었습니다(90일 지난 원문 {len(plan.raw_expired)}개). "
-            todo = "자동 삭제가 꺼져 있습니다(Actions 변수 RETENTION_AUTO_APPLY=false 또는 수동 점검). 수동 apply 하거나 변수를 지우면 주 1회 자동 삭제가 켜집니다"
+            todo = _off_todo(res.auto_reason)
             res.alerts.append(Alert("warn", "retention", f"보관 대기 — {what}{todo}"))
     except Exception as e:  # 확인이 어긋나거나 읽기가 실패해도 조용히 넘어가지 않고 오류 경고로 남긴다
         first = (str(e).strip().splitlines() or ["이유 없음"])[0]
@@ -599,7 +649,8 @@ def weekly_markdown(res: WeeklyResult) -> str:
     L = [
         f"# 주간 보관·용량 점검 ({res.now:%Y-%m-%d %H:%M} KST)",
         "",
-        f"- 자동 삭제: **{'켜짐' if res.auto else '꺼짐'}**(비상 정지: Actions 변수 RETENTION_AUTO_APPLY=false), 한 번에 지우는 상한 {res.max_rows}줄",
+        f"- 자동 삭제: **{'켜짐' if res.auto else '꺼짐'}** — {AUTO_REASON_TEXT.get(res.auto_reason, res.auto_reason)}",
+        f"- 한 번에 지우는 상한: {res.max_rows}줄",
     ]
     if res.plan is not None:
         p = res.plan
@@ -626,6 +677,7 @@ def weekly_dict(res: WeeklyResult) -> dict:
     return dict(
         now=str(res.now),
         auto=res.auto,
+        auto_reason=res.auto_reason,
         max_rows=res.max_rows,
         rows_waiting=res.plan.total_rows if res.plan else None,
         raw_expired_files=len(res.plan.raw_expired) if res.plan else None,
@@ -665,10 +717,19 @@ def main(argv: list[str] | None = None, env: Env | None = None, now: Any = None)
     p.add_argument("--table", choices=list(TABLES), help="restore: 표")
     p.add_argument("--month", help="restore: 월(YYYY-MM)")
     p.add_argument("--apply", action="store_true", help="restore: 실제로 되살림(기본은 보고만)")
+    p.add_argument("--no-auto", action="store_true", help="weekly: 자동 삭제를 끄고 읽기만 함(직접 끌 때)")
     p.add_argument(
-        "--no-auto",
-        action="store_true",
-        help="weekly: 자동 삭제를 끄고 읽기만 함(워크플로에서는 변수 RETENTION_AUTO_APPLY=false 이거나 수동 점검일 때)",
+        "--event",
+        default=None,
+        help="weekly: 실행 방식(github.event_name: schedule 또는 workflow_dispatch). 없으면 직접 실행으로 보고 켜짐",
+    )
+    p.add_argument(
+        "--weekly-apply", default="", help="weekly: 수동 실행의 weekly_apply 입력(true 일 때만 삭제)"
+    )
+    p.add_argument(
+        "--auto-var",
+        default="",
+        help="weekly: Actions 변수 RETENTION_AUTO_APPLY 값. `false` 일 때만 끔(변수가 없으면 빈 글자 = 켜짐)",
     )
     p.add_argument(
         "--max-rows",
@@ -693,7 +754,8 @@ def main(argv: list[str] | None = None, env: Env | None = None, now: Any = None)
                 label=ALERT_LABEL,
                 label_desc="용량·보관 자동 알림",
             )
-        res = weekly(env, now, auto=not a.no_auto, max_rows=a.max_rows, sink=sink)
+        dec = decide_auto(a.event, a.weekly_apply, a.auto_var, a.no_auto)
+        res = weekly(env, now, auto=dec.auto, max_rows=a.max_rows, sink=sink, auto_reason=dec.reason)
         (out / "weekly.md").write_text(res.text, encoding="utf-8")
         (out / "weekly.json").write_text(
             json.dumps(weekly_dict(res), ensure_ascii=False, indent=1), encoding="utf-8"

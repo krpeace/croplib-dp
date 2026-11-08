@@ -4,7 +4,7 @@ name: retention
 #   예약: **매주 일요일 05:10 KST** 에 mode=weekly 가 돈다. 같은 실행 안에서 plan → 그 줄 수로 apply(기본 켜짐).
 #         apply 는 보관 파일을 올린 뒤 다시 내려받아 sha256·줄 수·지울 줄이 모두 있음을 확인하고 지운다. 하나라도 어긋나면
 #         지우지 않고 `[용량·보관 경고]` 이슈를 열고 실패로 끝난다. forecast_runs 는 지우지 않는다. Storage 용량(800/950MB)도 점검한다.
-#         비상 정지: Actions 변수 RETENTION_AUTO_APPLY=false (없으면 켜짐). 한 번에 지우는 상한 8,000줄(S4 때 함께 올린다).
+#         비상 정지: Actions 변수 RETENTION_AUTO_APPLY=false (변수가 없으면 켜짐, 켜려고 변수를 만들 필요 없음). 한 번에 지우는 상한 8,000줄(S4 때 함께 올린다).
 #   mode=plan(기본, 수동): 읽기만 하는 dry-run. 지울 줄 수·월별 보관 파일 크기·Storage 사용량을 보고한다. 쓰기·삭제 0.
 #   mode=apply(수동): through 와 confirm_rows 가 dry-run 이 보고한 값과 맞아야 실행한다. 하나라도 어긋나면 멈춘다.
 #   mode=restore(수동): 보관 파일을 표로 되살린다(restore_apply 를 켜지 않으면 보고만).
@@ -92,9 +92,9 @@ jobs:
           args=("$MODE" --out out)
           case "$MODE" in
             weekly)
-              # 예약 실행은 삭제까지 한다(기본 켜짐). 끄는 경우: ① 비상 정지 변수가 false, ② 수동 실행인데 weekly_apply 를 안 켬
-              if [ "$AUTO_APPLY" = "false" ]; then args+=(--no-auto); fi
-              if [ "$EVENT" != "schedule" ] && [ "$WEEKLY_APPLY" != "true" ]; then args+=(--no-auto); fi
+              # 켤지 끌지는 파이썬(decide_auto)이 정한다: 예약은 삭제까지(변수가 없으면 켜짐), 수동은 weekly_apply 를 켰을 때만,
+              # 변수 RETENTION_AUTO_APPLY 가 false 면 비상 정지. 보고서에 이유가 그대로 적힌다.
+              args+=(--event "$EVENT" --weekly-apply "$WEEKLY_APPLY" --auto-var "$AUTO_APPLY")
               ;;
             plan)
               if [ -n "$THROUGH" ]; then args+=(--through "$THROUGH"); fi
