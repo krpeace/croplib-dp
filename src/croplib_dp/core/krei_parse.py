@@ -4,9 +4,14 @@
 """
 
 import calendar
+import csv
 import datetime as dt
+import json
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from importlib import resources
+from pathlib import Path
 from typing import Any
 
 from croplib_dp.core.krei_check import (
@@ -32,6 +37,65 @@ CORE_TABLE_TYPES = {
 
 SECTION_NAMES = ["가격동향", "생육동향", "생산전망", "저장의향", "출하전망", "가격전망"]
 DIRECTION_KEYWORDS = ["증가", "감소", "비슷", "상승", "하락", "양호", "부진"]
+
+APPROVED_TABLES_FILENAME = "krei_approved_tables.json"
+
+
+@lru_cache(maxsize=1)
+def load_approved_tables(path: Path | str | None = None) -> list[dict[str, Any]]:
+    """저장소에 보관된 수동 승인 목록(file_id, 표 제목, 사유, 승인일)을 읽는다."""
+    if path is not None:
+        p = Path(path)
+        if p.suffix == ".json" and p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+        elif p.suffix == ".csv" and p.exists():
+            with p.open(encoding="utf-8-sig") as f:
+                return list(csv.DictReader(f))
+        return []
+
+    try:
+        data_res = resources.files("croplib_dp.data")
+        json_file = data_res.joinpath(APPROVED_TABLES_FILENAME)
+        if json_file.is_file():
+            with json_file.open(encoding="utf-8") as f:
+                return json.load(f)
+        csv_file = data_res.joinpath("krei_approved_tables.csv")
+        if csv_file.is_file():
+            with csv_file.open(encoding="utf-8-sig") as f:
+                return list(csv.DictReader(f))
+    except Exception:
+        pass
+
+    local_json = Path(__file__).resolve().parent.parent / "data" / APPROVED_TABLES_FILENAME
+    if local_json.exists():
+        return json.loads(local_json.read_text(encoding="utf-8"))
+    local_csv = Path(__file__).resolve().parent.parent / "data" / "krei_approved_tables.csv"
+    if local_csv.exists():
+        with local_csv.open(encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))
+
+    return []
+
+
+def find_table_approval(
+    file_id: int,
+    title: str,
+    approved_list: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """승인 목록에서 file_id와 title이 일치하는 항목을 반환."""
+    if approved_list is None:
+        approved_list = load_approved_tables()
+    t_clean = title.strip()
+    for item in approved_list:
+        try:
+            fid = int(item.get("file_id", 0))
+        except (ValueError, TypeError):
+            continue
+        if fid == file_id:
+            approved_title = str(item.get("title") or item.get("표 제목") or item.get("표제목") or "").strip()
+            if approved_title == t_clean or approved_title in t_clean or t_clean in approved_title:
+                return item
+    return None
 
 
 @dataclass
@@ -578,14 +642,22 @@ def extract_raw_tables(
     return tables
 
 
-def parse_period_dates(label: str, issue_y: int, issue_m: int) -> tuple[dt.date | None, dt.date | None]:
+def parse_period_dates(
+    label: str,
+    issue_y: int,
+    issue_m: int,
+    crop_year: int | None = None,
+) -> tuple[dt.date | None, dt.date | None]:
     """period_label 로부터 period_start, period_end 계산 (§2-3)."""
     lbl = label.strip()
 
-    m_range = re.match(r"(\d+)월\s*~\s*익년\s*(\d+)월", lbl)
+    m_range = re.match(r"(\d+)월\s*[~-]\s*익년\s*(\d+)월", lbl)
     if m_range:
         m1, m2 = int(m_range.group(1)), int(m_range.group(2))
-        y1 = issue_y if m1 <= issue_m else issue_y - 1
+        if crop_year is not None:
+            y1 = crop_year
+        else:
+            y1 = issue_y if m1 <= issue_m else issue_y - 1
         y2 = y1 + 1
         last_d = calendar.monthrange(y2, m2)[1]
         return dt.date(y1, m1, 1), dt.date(y2, m2, last_d)
@@ -703,9 +775,6 @@ def parse_production_outlook(
                     if not ok:
                         errors.append({"check": "vs_normal_recalc", "metric": m_name, "error": msg})
 
-    if errors:
-        return obs, errors
-
     raw_id = table.id or 0
     basis_rows = [
         ("current", yyyy, row_map["current"]),
@@ -740,7 +809,7 @@ def parse_production_outlook(
                         )
                     )
 
-    return obs, []
+    return obs, errors
 
 
 def parse_shipment_outlook(
@@ -837,9 +906,6 @@ def parse_shipment_outlook(
                             }
                         )
 
-    if errors:
-        return obs, errors
-
     raw_id = table.id or 0
     unit_str = "천 톤"
     if table.unit and "톤" in table.unit:
@@ -861,7 +927,8 @@ def parse_shipment_outlook(
             if idx < len(r):
                 val = parse_clean_float(r[idx])
                 if val is not None:
-                    p_start, p_end = parse_period_dates(plabel, yyyy, mm)
+                    target_cy = c_year or current_year
+                    p_start, p_end = parse_period_dates(plabel, yyyy, mm, crop_year=target_cy)
                     u = "%" if "pct" in basis else unit_str
                     obs.append(
                         Observation(
@@ -881,7 +948,7 @@ def parse_shipment_outlook(
                         )
                     )
 
-    return obs, []
+    return obs, errors
 
 
 def parse_monthly_price(
@@ -1100,10 +1167,7 @@ def parse_growth_survey(
                         )
                     )
 
-    if errors:
-        return [], errors
-
-    return dists, []
+    return dists, errors
 
 
 def parse_report_pages(
@@ -1114,6 +1178,7 @@ def parse_report_pages(
     pages: list[dict[str, Any]],
     items: list[dict[str, Any]],
     text_status: str | None = "ok",
+    approved_tables: list[dict[str, Any]] | None = None,
 ) -> ParsedReport:
     """단일 발행호의 pages.json.gz 데이터 전체 파싱 오케스트레이터."""
     # 제외 조건 (§0)
@@ -1151,46 +1216,48 @@ def parse_report_pages(
     all_survey_dists: list[SurveyDist] = []
     has_failed_core_table = False
 
+    approved_list = approved_tables if approved_tables is not None else load_approved_tables()
+
     for t in raw_tables:
+        approval = find_table_approval(file_id, t.title, approved_list)
+        obs_to_add: list[Observation] = []
+        dists_to_add: list[SurveyDist] = []
+        errs: list[dict[str, Any]] = []
+
         if t.table_type == "production_outlook":
-            obs, errs = parse_production_outlook(t, file_id, yyyy)
-            if errs:
-                t.check_status = "fail"
-                t.check_log = errs
-                has_failed_core_table = True
-            else:
-                t.check_status = "pass"
-                all_observations.extend(obs)
-
+            obs_to_add, errs = parse_production_outlook(t, file_id, yyyy)
         elif t.table_type == "shipment_outlook":
-            obs, errs = parse_shipment_outlook(t, file_id, yyyy, mm)
-            if errs:
-                t.check_status = "fail"
-                t.check_log = errs
-                has_failed_core_table = True
-            else:
-                t.check_status = "pass"
-                all_observations.extend(obs)
-
+            obs_to_add, errs = parse_shipment_outlook(t, file_id, yyyy, mm)
         elif t.table_type == "monthly_price":
-            obs, errs = parse_monthly_price(t, file_id, yyyy)
-            if errs:
-                t.check_status = "fail"
-                t.check_log = errs
-                has_failed_core_table = True
-            else:
-                t.check_status = "pass"
-                all_observations.extend(obs)
-
+            obs_to_add, errs = parse_monthly_price(t, file_id, yyyy)
         elif t.table_type == "growth_survey":
-            dists, errs = parse_growth_survey(t, file_id)
-            if errs:
+            dists_to_add, errs = parse_growth_survey(t, file_id)
+
+        if t.table_type in CORE_TABLE_TYPES:
+            if approval:
+                t.check_status = "pass"
+                reason = str(approval.get("reason") or approval.get("사유") or "").strip()
+                app_at = str(approval.get("approved_at") or approval.get("승인일") or "").strip()
+                t.check_log = [
+                    {
+                        "check": "manual_approval",
+                        "message": f"수동 승인: {reason}",
+                        "error": f"수동 승인: {reason}",
+                        "reason": reason,
+                        "approved_at": app_at,
+                        "original_errors": errs,
+                    }
+                ]
+                all_observations.extend(obs_to_add)
+                all_survey_dists.extend(dists_to_add)
+            elif errs:
                 t.check_status = "fail"
                 t.check_log = errs
                 has_failed_core_table = True
             else:
                 t.check_status = "pass"
-                all_survey_dists.extend(dists)
+                all_observations.extend(obs_to_add)
+                all_survey_dists.extend(dists_to_add)
 
         else:
             t.check_status = "not_checked"
