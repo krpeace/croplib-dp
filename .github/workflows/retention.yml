@@ -1,0 +1,113 @@
+name: retention
+
+# 전망 표 월 보관·삭제·복원, 대표 밖 예보 원문 90일 정리 (이슈 #61, #28 S3-a, 결정 0022).
+# 사람이 Actions 화면에서 눌렀을 때만 돈다(예약 없음).
+#   mode=plan(기본): 읽기만 하는 dry-run. 지울 줄 수·월별 보관 파일 크기·Storage 사용량을 보고한다. 쓰기·삭제 0.
+#   mode=apply: through 와 confirm_rows 가 dry-run 이 보고한 값과 맞아야 실행한다. 보관 파일을 올리고 다시 내려받아
+#               확인한 뒤 지운다. 하나라도 어긋나면 멈춘다. 첫 실행은 사용자가 승인한 뒤 한 번만 한다.
+#   mode=restore: 보관 파일을 표로 되살린다(restore_apply 를 켜지 않으면 보고만).
+# 서버 키(삭제·쓰기 권한)는 GitHub Secrets 환경변수로만 읽고 기록에 남기지 않는다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "plan = 읽기만(dry-run, 기본) / apply = 실제 보관·삭제(승인 뒤) / restore = 보관 파일에서 되살리기"
+        type: choice
+        options: [plan, apply, restore]
+        default: plan
+      through:
+        description: "보관·삭제할 마지막 날짜(포함, YYYY-MM-DD, 한국 날짜). plan 은 비우면 가능한 가장 늦은 날(오늘 − 15일). apply 는 필수"
+        required: false
+        default: ""
+      confirm_rows:
+        description: "apply 전용: dry-run 이 보고한 '지울 줄 합계'. 다르면 아무것도 지우지 않고 멈춘다"
+        required: false
+        default: ""
+      confirm_raw_files:
+        description: "apply 전용: 90일 지난 대표 밖 원문 파일 수(dry-run 보고, 없으면 0)"
+        required: false
+        default: "0"
+      table:
+        description: "restore 전용: 표"
+        type: choice
+        options: [water_outlook, water_outlook_summary]
+        default: water_outlook
+      month:
+        description: "restore 전용: 월 (YYYY-MM)"
+        required: false
+        default: ""
+      restore_apply:
+        description: "restore 전용: 켜면 실제로 되살림(upsert). 끄면 보고만"
+        type: boolean
+        default: false
+
+concurrency:
+  group: retention
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  retention:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 실행 (기본은 읽기만 하는 dry-run)
+        env:
+          MODE: ${{ inputs.mode }}
+          THROUGH: ${{ inputs.through }}
+          CONFIRM_ROWS: ${{ inputs.confirm_rows }}
+          CONFIRM_RAW: ${{ inputs.confirm_raw_files }}
+          TABLE: ${{ inputs.table }}
+          MONTH: ${{ inputs.month }}
+          RESTORE_APPLY: ${{ inputs.restore_apply }}
+        run: |
+          args=("$MODE" --out out)
+          case "$MODE" in
+            plan)
+              if [ -n "$THROUGH" ]; then args+=(--through "$THROUGH"); fi
+              ;;
+            apply)
+              if [ -n "$THROUGH" ]; then args+=(--through "$THROUGH"); fi
+              if [ -n "$CONFIRM_ROWS" ]; then args+=(--confirm-rows "$CONFIRM_ROWS"); fi
+              args+=(--confirm-raw-files "${CONFIRM_RAW:-0}")
+              ;;
+            restore)
+              args+=(--table "$TABLE" --month "$MONTH")
+              if [ "$RESTORE_APPLY" = "true" ]; then args+=(--apply); fi
+              ;;
+          esac
+          set +e
+          python -m croplib_dp.collectors.retention "${args[@]}" 2> err.txt
+          code=$?
+          cat err.txt >&2
+          exit $code
+      - name: 보고를 실행 화면에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          if [ -s err.txt ]; then echo "::error title=보관 수집기 중단::$(tail -n 40 err.txt | esc)"; fi
+          for f in out/retention/*.md; do
+            [ -f "$f" ] || continue
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retention
+          path: out/
+          retention-days: 30
+          if-no-files-found: warn
