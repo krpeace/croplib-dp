@@ -6,10 +6,8 @@
 import calendar
 import csv
 import datetime as dt
-import json
 import re
 from dataclasses import dataclass, field
-from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -38,43 +36,84 @@ CORE_TABLE_TYPES = {
 SECTION_NAMES = ["가격동향", "생육동향", "생산전망", "저장의향", "출하전망", "가격전망"]
 DIRECTION_KEYWORDS = ["증가", "감소", "비슷", "상승", "하락", "양호", "부진"]
 
-APPROVED_TABLES_FILENAME = "krei_approved_tables.json"
+APPROVED_TABLES_FILENAME = "krei_approved_tables.csv"
+REQUIRED_APPROVED_COLUMNS = ("file_id", "title", "reason", "approver", "approved_at")
 
 
-@lru_cache(maxsize=1)
-def load_approved_tables(path: Path | str | None = None) -> list[dict[str, Any]]:
-    """저장소에 보관된 수동 승인 목록(file_id, 표 제목, 사유, 승인일)을 읽는다."""
+def load_approved_tables_with_warnings(
+    path: Path | str | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """저장소에 보관된 수동 승인 목록(file_id, title, reason, approver, approved_at)을 CSV에서 읽는다."""
+    errors: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    def _read_csv(f) -> list[dict[str, Any]]:
+        reader = csv.DictReader(f)
+        fieldnames = [fn.strip() for fn in (reader.fieldnames or [])]
+        missing = set(REQUIRED_APPROVED_COLUMNS) - set(fieldnames)
+        if missing:
+            errors.append(f"승인 목록 필수 열 누락: {sorted(missing)}")
+            return []
+        parsed_rows = []
+        for row_idx, r in enumerate(reader, 1):
+            if not any(r.values()):
+                continue
+            fid_raw = str(r.get("file_id", "")).strip()
+            try:
+                int(fid_raw)
+            except (ValueError, TypeError):
+                errors.append(f"승인 목록 {row_idx}행 file_id 유효하지 않음: {fid_raw}")
+                continue
+            parsed_rows.append(r)
+        return parsed_rows
+
     if path is not None:
         p = Path(path)
-        if p.suffix == ".json" and p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
-        elif p.suffix == ".csv" and p.exists():
+        if not p.exists():
+            errors.append(f"승인 목록 파일 없음: {p}")
+            return [], errors
+        try:
             with p.open(encoding="utf-8-sig") as f:
-                return list(csv.DictReader(f))
-        return []
+                rows = _read_csv(f)
+        except Exception as e:
+            errors.append(f"승인 목록 파일 읽기 실패: {e}")
+        return rows, errors
 
+    # 기본 경로 1: croplib_dp.data 패키지 리소스
+    loaded_from_res = False
     try:
         data_res = resources.files("croplib_dp.data")
-        json_file = data_res.joinpath(APPROVED_TABLES_FILENAME)
-        if json_file.is_file():
-            with json_file.open(encoding="utf-8") as f:
-                return json.load(f)
-        csv_file = data_res.joinpath("krei_approved_tables.csv")
+        csv_file = data_res.joinpath(APPROVED_TABLES_FILENAME)
         if csv_file.is_file():
-            with csv_file.open(encoding="utf-8-sig") as f:
-                return list(csv.DictReader(f))
+            loaded_from_res = True
+            try:
+                with csv_file.open(encoding="utf-8-sig") as f:
+                    rows = _read_csv(f)
+            except Exception as e:
+                errors.append(f"승인 목록 파일 읽기 실패: {e}")
+            return rows, errors
     except Exception:
         pass
 
-    local_json = Path(__file__).resolve().parent.parent / "data" / APPROVED_TABLES_FILENAME
-    if local_json.exists():
-        return json.loads(local_json.read_text(encoding="utf-8"))
-    local_csv = Path(__file__).resolve().parent.parent / "data" / "krei_approved_tables.csv"
-    if local_csv.exists():
-        with local_csv.open(encoding="utf-8-sig") as f:
-            return list(csv.DictReader(f))
+    # 기본 경로 2: 로컬 상대 경로
+    if not loaded_from_res:
+        local_csv = Path(__file__).resolve().parent.parent / "data" / APPROVED_TABLES_FILENAME
+        if local_csv.exists():
+            try:
+                with local_csv.open(encoding="utf-8-sig") as f:
+                    rows = _read_csv(f)
+            except Exception as e:
+                errors.append(f"승인 목록 파일 읽기 실패: {e}")
+        else:
+            errors.append(f"승인 목록 파일을 찾을 수 없음: {APPROVED_TABLES_FILENAME}")
 
-    return []
+    return rows, errors
+
+
+def load_approved_tables(path: Path | str | None = None) -> list[dict[str, Any]]:
+    """수동 승인 목록 행 목록 반환 (경고 무시)."""
+    rows, _ = load_approved_tables_with_warnings(path)
+    return rows
 
 
 def find_table_approval(
@@ -82,18 +121,19 @@ def find_table_approval(
     title: str,
     approved_list: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """승인 목록에서 file_id와 title이 일치하는 항목을 반환."""
+    """승인 목록에서 file_id와 title이 공백 정리 후 정확히 일치하는 항목을 반환 (부분 포함 제외)."""
     if approved_list is None:
         approved_list = load_approved_tables()
-    t_clean = title.strip()
+    t_clean = re.sub(r"\s+", " ", title).strip()
     for item in approved_list:
         try:
             fid = int(item.get("file_id", 0))
         except (ValueError, TypeError):
             continue
         if fid == file_id:
-            approved_title = str(item.get("title") or item.get("표 제목") or item.get("표제목") or "").strip()
-            if approved_title == t_clean or approved_title in t_clean or t_clean in approved_title:
+            approved_title = str(item.get("title") or item.get("표 제목") or item.get("표제목") or "")
+            a_clean = re.sub(r"\s+", " ", approved_title).strip()
+            if a_clean == t_clean:
                 return item
     return None
 
@@ -1237,6 +1277,7 @@ def parse_report_pages(
             if approval:
                 t.check_status = "pass"
                 reason = str(approval.get("reason") or approval.get("사유") or "").strip()
+                approver = str(approval.get("approver") or approval.get("승인자") or "").strip()
                 app_at = str(approval.get("approved_at") or approval.get("승인일") or "").strip()
                 t.check_log = [
                     {
@@ -1244,6 +1285,7 @@ def parse_report_pages(
                         "message": f"수동 승인: {reason}",
                         "error": f"수동 승인: {reason}",
                         "reason": reason,
+                        "approver": approver,
                         "approved_at": app_at,
                         "original_errors": errs,
                     }
