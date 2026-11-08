@@ -319,6 +319,8 @@ SPECS["krei.report"] = TableSpec(
         "fetch_status",
         "fetch_error",
         "parse_status",
+        "parser_version",
+        "parsed_at",
         "updated_at",
     ),
     required=(
@@ -348,10 +350,96 @@ SPECS["krei.report"] = TableSpec(
     enums={
         "api": ("monthly", "news"),
         "fetch_status": ("listed", "fetched", "failed"),
-        "parse_status": ("pending", "parsed", "failed", "skipped"),
+        "parse_status": ("pending", "parsed", "needs_review", "skipped", "failed"),
         "text_status": ("ok", "partial", "no_text", None),
     },
     key=("file_id",),
+)
+SPECS["krei.section_text"] = TableSpec(
+    columns=(
+        "id",
+        "file_id",
+        "page",
+        "item_code",
+        "item_label",
+        "section",
+        "headline",
+        "direction",
+        "bullets",
+    ),
+    required=("file_id", "page", "section", "headline"),
+    enums={"direction": ("증가", "감소", "비슷", "상승", "하락", "양호", "부진", None)},
+    key=("id",),
+)
+SPECS["krei.table_raw"] = TableSpec(
+    columns=(
+        "id",
+        "file_id",
+        "page",
+        "seq",
+        "item_code",
+        "item_label",
+        "title",
+        "unit",
+        "header",
+        "rows",
+        "note",
+        "source",
+        "table_type",
+        "check_status",
+        "check_log",
+    ),
+    required=("file_id", "page", "seq", "title", "header", "rows", "table_type", "check_status"),
+    enums={
+        "table_type": (
+            "production_outlook",
+            "shipment_outlook",
+            "monthly_price",
+            "growth_survey",
+            "other",
+        ),
+        "check_status": ("pass", "fail", "not_checked"),
+    },
+    key=("file_id", "seq"),
+)
+SPECS["krei.observation"] = TableSpec(
+    columns=(
+        "id",
+        "file_id",
+        "table_raw_id",
+        "item_code",
+        "item_label",
+        "variety",
+        "metric",
+        "basis",
+        "crop_year",
+        "period_label",
+        "period_start",
+        "period_end",
+        "value",
+        "unit",
+    ),
+    required=("file_id", "table_raw_id", "metric", "basis", "value", "unit"),
+    enums={
+        "metric": ("area", "yield", "production", "shipment", "wholesale_price"),
+        "basis": ("current", "prev", "normal", "yoy_pct", "vs_normal_pct"),
+    },
+    key=("id",),
+)
+SPECS["krei.survey_dist"] = TableSpec(
+    columns=(
+        "id",
+        "file_id",
+        "table_raw_id",
+        "item_code",
+        "item_label",
+        "aspect",
+        "good",
+        "same",
+        "bad",
+    ),
+    required=("file_id", "table_raw_id", "aspect"),
+    key=("id",),
 )
 DR_COLUMNS = {
     "water_balance_daily": ("dr_prev_mm", "dr_mm"),

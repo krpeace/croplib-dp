@@ -37,6 +37,10 @@ on:
         description: "Storage의 pages.json.gz를 읽어 기존 fetched 행 전체의 text_chars·no_text_pages·text_status 다시 계산(--force)"
         type: boolean
         default: false
+      reparse:
+        description: "from~to 범위 안의 이미 수집된 보고서들을 Storage에서 읽어 다시 파싱"
+        type: boolean
+        default: false
 
 concurrency:
   group: krei
@@ -71,12 +75,14 @@ jobs:
           WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
           KREI_BUDGET_MINUTES: ${{ inputs.budget_minutes || '25' }}
           BACKFILL_TEXT_STATUS: ${{ inputs.backfill_text_status }}
+          REPARSE: ${{ inputs.reparse }}
         run: |
           args=(--out out)
           if [ -n "$FROM_YM" ]; then args+=(--from "$FROM_YM"); fi
           if [ -n "$TO_YM" ]; then args+=(--to "$TO_YM"); fi
           if [ -n "$KREI_BUDGET_MINUTES" ]; then args+=(--budget-minutes "$KREI_BUDGET_MINUTES"); fi
           if [ "$BACKFILL_TEXT_STATUS" = "true" ]; then args+=(--backfill-text-status --force); fi
+          if [ "$REPARSE" = "true" ]; then args+=(--reparse); fi
           if [ "$WRITE" = "true" ]; then args+=(--write); fi
           set +e
           for attempt in 1 2; do
