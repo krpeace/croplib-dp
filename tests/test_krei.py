@@ -581,3 +581,118 @@ def test_resolve_months_cli_validation():
     ]
     with pytest.raises(ValueError, match="함께 지정"):
         K.resolve_months(clock, yyyy="2026")
+
+
+# ── 10. 시간 예산(25분)·한 건씩 저장·이어 받기 및 시험 실행(표본 1건) ───────────
+def test_time_budget_stops_saves_incrementally_and_resumes_next_run(tmp_path: Path):
+    clock1 = FakeClock("2026-11-07 20:40:00")
+    base_http = FakeKreiHttp()
+
+    # PDF 1건마다 시계를 10분 진행 → 25분 예산이면 3건(0·10·20분 시작)만 받고 멈춤
+    def slow_pdf_http(url: str, timeout: int, headers: dict[str, str]):
+        res = base_http(url, timeout, headers)
+        if "/download/" in url:
+            clock1.sleep(600)
+        return res
+
+    sb_calls: list[tuple[str, str, dict, bytes]] = []
+
+    def fake_sb(method, url, headers, body):
+        sb_calls.append((method, url, headers, body))
+        return 201, b""
+
+    writer1 = SupabaseWriter("https://x.supabase.co", "srv", http=fake_sb)
+    r1 = K.run(
+        months=[(2026, 11)],
+        http=slow_pdf_http,
+        clock=clock1,
+        write=True,
+        writer=writer1,
+        budget_minutes=25.0,
+        out_dir=tmp_path,
+    )
+    # 1차 실행: 12건 중 3건만 받고 시간 예산(25분)에 걸려 정상 종료 (실패·경고 아님)
+    assert not r1.failed
+    assert r1.listed_count == 12
+    assert len(r1.fetched) == 3
+    assert r1.remaining_count == 9
+    assert [f["file_id"] for f in r1.fetched] == [8773, 8774, 8775]
+    brief1 = K.brief_text(r1)
+    assert "남은 9건, 다음 실행에서 이어 받음" in brief1
+
+    # out/ 요약 파일이 처리 중에 갱신되어 남아 있음
+    out_brief = (tmp_path / "krei_202611" / "brief.md").read_text(encoding="utf-8")
+    assert "남은 9건, 다음 실행에서 이어 받음" in out_brief
+
+    # 한 건씩 저장: report upsert 가 3번(각 1행씩) 호출되었고, 글자 좌표 업로드도 3번 끝남
+    report_upserts = [
+        json.loads(body.decode("utf-8"))
+        for _, u, _, body in sb_calls
+        if "/rest/v1/report?on_conflict=file_id" in u
+    ]
+    assert len(report_upserts) == 3
+    assert [rows[0]["file_id"] for rows in report_upserts] == [8773, 8774, 8775]
+    text_uploads = [u for _, u, _, _ in sb_calls if "/storage/v1/object/krei-raw/text/" in u]
+    assert len(text_uploads) == 3
+
+    # 2차 실행: 이미 fetched 된 3건(8773, 8774, 8775)은 건너뛰고 나머지 9건을 이어서 받는다
+    saved_reports = {rows[0]["file_id"]: rows[0] for rows in report_upserts}
+    clock2 = FakeClock("2026-11-08 20:40:00")
+    http2 = FakeKreiHttp()
+    r2 = K.run(
+        months=[(2026, 11)],
+        existing_items=r1.items,
+        existing_reports=saved_reports,
+        http=http2,
+        clock=clock2,
+        write=True,
+        budget_minutes=25.0,
+    )
+    assert not r2.failed
+    assert r2.skipped_count == 3
+    assert len(r2.fetched) == 9
+    assert r2.remaining_count == 0
+    assert {f["file_id"] for f in r2.fetched}.isdisjoint({8773, 8774, 8775})
+    assert len(r2.reports) == 12
+
+
+def test_dry_run_write_false_fetches_at_most_one_pdf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    clock = FakeClock("2026-11-07 20:40:00")
+    http = FakeKreiHttp()
+    r = K.run(
+        months=[(2026, 11)],
+        http=http,
+        clock=clock,
+        write=False,
+        out_dir=tmp_path,
+    )
+    assert not r.failed
+    assert r.listed_count == 12
+    assert len(r.fetched) == 1
+    assert r.sample_skipped_count == 11
+    pdf_downloads = [u for u, _, _ in http.calls if "/download/" in u]
+    assert len(pdf_downloads) == 1
+    assert "시험 실행(write=false): PDF 표본 1건만 받고 나머지 11건 생략" in K.brief_text(r)
+
+    # 모두 이미 fetched 인 상태에서 시험 실행하면 PDF 를 0건(최대 1건 이하)만 받고 끝난다
+    all_fetched = {
+        fid: {"file_id": fid, "fetch_status": "fetched", "mod_at": None}
+        for fid in [8773, 8774, 8775, 8776, 8777, 8778, 8779, 8780, 8783, 8784, 8785, 8786]
+    }
+    http_zero = FakeKreiHttp()
+    r_zero = K.run(
+        months=[(2026, 11)],
+        existing_reports=all_fetched,
+        http=http_zero,
+        clock=clock,
+        write=False,
+    )
+    assert len(r_zero.fetched) == 0
+    assert [u for u, _, _ in http_zero.calls if "/download/" in u] == []
+
+    # 환경변수 KREI_BUDGET_MINUTES 및 인자 해석 확인
+    monkeypatch.setenv("KREI_BUDGET_MINUTES", "15")
+    assert K.resolve_budget_minutes(None) == 15.0
+    assert K.resolve_budget_minutes("40") == 40.0
+    with pytest.raises(ValueError, match="0보다 커야"):
+        K.resolve_budget_minutes(0)
