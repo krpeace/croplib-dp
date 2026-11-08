@@ -80,7 +80,11 @@ def read_state(
         heat_last=heat,
     )
     if include_krei:
-        out["krei_reports"] = read_krei_reports(base, key, http, now=now)
+        try:
+            out["krei_reports"] = read_krei_reports(base, key, http, now=now)
+        except Exception as e:
+            out["krei_reports"] = None
+            out["krei_error"] = str(e)
     return out
 
 
@@ -94,6 +98,7 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         state.get("heat_last"),
         collect_count=len(state["weather_last"]),
         krei_reports=state.get("krei_reports"),
+        krei_error=state.get("krei_error"),
     )
     text = report(alerts, now)
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"

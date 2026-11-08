@@ -109,6 +109,7 @@ def check_health(
     heat_last: Mapping[str, dt.date | None] | None = None,
     collect_count: int | None = None,
     krei_reports: Iterable[Mapping[str, Any]] | None = None,
+    krei_error: str | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
@@ -164,7 +165,11 @@ def check_health(
             alerts.append(
                 Alert("warn", "heat", f"어제({yesterday:%m/%d}) 적산온도 없음 — {named(missing, names)}")
             )
-    if krei_reports is not None:
+
+    if krei_error:
+        first_line = (str(krei_error).strip().splitlines() or ["이유 없음"])[0]
+        alerts.append(Alert("warn", "krei", f"KREI 상태 조회 실패 — {first_line}"))
+    elif krei_reports is not None:
         alerts.extend(_check_krei(now, krei_reports))
     return alerts
 

@@ -488,6 +488,16 @@ def test_monitor_krei_9th_missing_hort_warns_7th_does_not_and_grain_ignored():
     alerts_8 = check_health(now_8th, _ok_run("2026-11-08 23:59"), {}, {"101": "춘천"}, krei_reports=partial)
     assert [a for a in alerts_8 if a.code == "krei"] == []
 
+    # 9일 00:00 KST 경계부터 즉시 미수집 경고 발생
+    now_9th_00 = TS("2026-11-09 00:00")
+    alerts_9_00 = check_health(
+        now_9th_00, _ok_run("2026-11-09 00:00"), {}, {"101": "춘천"}, krei_reports=partial
+    )
+    krei_9_00 = [a for a in alerts_9_00 if a.code == "krei"]
+    assert len(krei_9_00) == 1
+    assert krei_9_00[0].level == "warn"
+    assert krei_9_00[0].text == "KREI 11월 월보 미수집 — 엽근채소, 양념채소"
+
     # 9일인데 엽근채소·양념채소 월보가 없으면 경고
     now_9th = TS("2026-11-09 09:40")
     alerts_9 = check_health(now_9th, _ok_run("2026-11-09 09:40"), {}, {"101": "춘천"}, krei_reports=partial)
@@ -539,6 +549,37 @@ def test_monitor_read_krei_reports_sends_accept_profile_krei():
     assert headers["Accept-Profile"] == "krei"
 
 
+def test_monitor_krei_query_failure_warns_krei_only_and_continues_water_heat():
+    now = TS("2026-11-09 19:00")
+    ok_runs = _ok_run("2026-11-09 19:00")
+
+    def fake_get(url: str, headers: dict) -> tuple[int, bytes]:
+        if headers.get("Accept-Profile") == "krei":
+            return 406, b'{"message":"The schema must be one of the following: public"}'
+        if "/rest/v1/forecast_runs" in url:
+            return 200, json.dumps(ok_runs).encode("utf-8")
+        if "/rest/v1/stations" in url:
+            return 200, json.dumps([{"stn_id": "101", "name_ko": "춘천"}]).encode("utf-8")
+        if "/rest/v1/weather_daily" in url:
+            # 어제(11/08) 관측이 없고 11/07까지만 있는 상태 → asos 경고가 나와야 함
+            return 200, json.dumps([{"date": "2026-11-07"}]).encode("utf-8")
+        if "/rest/v1/heat_daily" in url:
+            # 어제(11/08) 적산온도가 없는 상태 → heat 경고가 나와야 함
+            return 200, b"[]"
+        return 200, b"[]"
+
+    state = M.read_state("https://x.supabase.co", "srv", http=fake_get, now=now, include_krei=True)
+    assert state["krei_reports"] is None
+    assert "406" in (state.get("krei_error") or "")
+
+    text, action = M.run_monitor(state, alerts_sink=None, now=now)
+    assert action == "dry"
+    # KREI 조회가 실패해도 멈추지 않고 asos · heat · krei 경고가 모두 함께 보고됨
+    assert "🟡 경고: 어제(11/08) ASOS 관측 없음 — 101 춘천" in text
+    assert "🟡 경고: 어제(11/08) 적산온도 없음 — 101 춘천" in text
+    assert "🟡 경고: KREI 상태 조회 실패 — Supabase report 읽기 실패: HTTP 406" in text
+
+
 # ── 9. 마이그레이션 SQL 구조 검증 ────────────────────────────────────────────
 def test_krei_migration_sql_contains_schemas_rls_view_and_bucket():
     sql_path = Path(__file__).parent.parent / "supabase" / "migrations" / "20261108000000_krei_schema.sql"
@@ -548,6 +589,13 @@ def test_krei_migration_sql_contains_schemas_rls_view_and_bucket():
     assert "create table if not exists krei.report" in sql
     assert "alter table krei.item enable row level security;" in sql
     assert "alter table krei.report enable row level security;" in sql
+    assert "grant usage on schema krei to anon, authenticated, service_role;" in sql
+    assert "grant all on all tables in schema krei to service_role;" in sql
+    assert "grant all on all sequences in schema krei to service_role;" in sql
+    assert "alter default privileges in schema krei grant all on tables to service_role;" in sql
+    assert "alter default privileges in schema krei grant all on sequences to service_role;" in sql
+    assert "grant usage on schema krei_api to anon, authenticated, service_role;" in sql
+    assert "grant select on krei_api.reports to anon, authenticated, service_role;" in sql
     assert "grant select on krei.item to anon, authenticated;" in sql
     assert "grant select on krei.report to anon, authenticated;" in sql
     assert "create schema if not exists krei_api;" in sql

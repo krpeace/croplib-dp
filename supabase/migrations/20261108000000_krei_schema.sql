@@ -66,6 +66,10 @@ create index if not exists report_ovr_item_code_yyyy_mm_idx on krei.report (ovr_
 -- ---------------------------------------------------------------------------
 grant usage on schema krei to anon, authenticated, service_role;
 grant all on all tables in schema krei to service_role;
+grant all on all sequences in schema krei to service_role;
+alter default privileges in schema krei grant all on tables to service_role;
+alter default privileges in schema krei grant all on sequences to service_role;
+alter default privileges in schema krei grant select on tables to anon, authenticated;
 
 alter table krei.item enable row level security;
 revoke all on krei.item from anon, authenticated;
