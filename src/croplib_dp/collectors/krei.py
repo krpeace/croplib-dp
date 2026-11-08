@@ -806,8 +806,8 @@ def run(
                             select="file_id",
                             schema=KREI_SCHEMA,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        r.problems.append(f"#{fid} skipped 기록 실패: {e}")
             r.parsed.append(
                 dict(
                     file_id=fid,

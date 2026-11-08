@@ -505,3 +505,89 @@ def test_parse_one_report_idempotency(pages_8778):
 
     assert tables_count_1 == tables_count_2
     assert obs_count_1 == obs_count_2
+
+
+def test_stored_fruit_shipment_outlook_prior_crop_year():
+    """봄/초여름 월보에서 저장 사과·배 출하량 전망(2025년산/2024년산) 및 다단 머리글 기간 라벨 파싱 확인."""
+    from croplib_dp.core.krei_parse import RawTable, parse_shipment_outlook
+
+    table = RawTable(
+        page=3,
+        seq=1,
+        item_code="OVR0000000005",
+        item_label="사과",
+        title="사과 출하량 전망",
+        unit="천 톤, %",
+        header=[
+            [
+                {"text": "구분"},
+                {"text": "7월~익년 3월"},
+                {"text": "4월"},
+                {"text": "5월"},
+            ]
+        ],
+        rows=[
+            ["2025년산", "368.8", "41.4", "26.0"],
+            ["2024년산", "378.4", "39.5", "25.3"],
+            ["평년", "388.1", "34.8", "23.8"],
+            ["전년 대비", "-2.6", "4.8", "3.0"],
+            ["평년 대비", "-5.0", "19.1", "9.5"],
+        ],
+        note=None,
+        source=None,
+        table_type="shipment_outlook",
+    )
+
+    obs, errors = parse_shipment_outlook(table, file_id=8677, yyyy=2026, mm=4)
+    assert errors == []
+    assert len(obs) > 0
+
+    # 당해년산(2025)과 전년산(2024)이 올바른 crop_year로 기록되는지 확인
+    cur_obs = [o for o in obs if o.basis == "current"]
+    prev_obs = [o for o in obs if o.basis == "prev"]
+    assert all(o.crop_year == 2025 for o in cur_obs)
+    assert all(o.crop_year == 2024 for o in prev_obs)
+
+    # 기간 날짜 파싱 확인: 7월~익년 3월은 4월호 기준 전년도 7월(2025-07) ~ 당해년도 3월(2026-03)
+    obs_prev_period = next(o for o in obs if o.period_label == "7월~익년 3월" and o.basis == "current")
+    assert obs_prev_period.period_start == dt.date(2025, 7, 1)
+    assert obs_prev_period.period_end == dt.date(2026, 3, 31)
+
+    # 4월, 5월
+    obs_m4 = next(o for o in obs if o.period_label == "4월" and o.basis == "current")
+    assert obs_m4.period_start == dt.date(2026, 4, 1)
+    assert obs_m4.period_end == dt.date(2026, 4, 30)
+
+
+def test_multilevel_header_shipment_outlook():
+    """2단 머리글(9월, 추석 성수기, 10월)에서 빈 셀이 상위 행 텍스트로 합성되어
+    기간 라벨이 올바르게 보존되는지 확인."""
+    from croplib_dp.core.krei_parse import RawTable, parse_shipment_outlook
+
+    table = RawTable(
+        page=3,
+        seq=4,
+        item_code="OVR0000000005",
+        item_label="사과",
+        title="사과 출하량 전망",
+        unit="천 톤, %",
+        header=[
+            [{"text": "구분"}, {"text": "9월"}, {"text": ""}, {"text": "10월"}],
+            [{"text": ""}, {"text": ""}, {"text": "추석 성수기"}, {"text": ""}],
+        ],
+        rows=[
+            ["2026년", "71.5", "47.7", "39.2"],
+            ["2025년", "68.6", "40.0", "37.8"],
+            ["평년", "63.5", "56.2", "50.6"],
+            ["전년 대비", "4.3", "19.3", "3.7"],
+            ["평년 대비", "12.7", "-15.1", "-22.5"],
+        ],
+        note=None,
+        source=None,
+        table_type="shipment_outlook",
+    )
+
+    obs, errors = parse_shipment_outlook(table, file_id=8743, yyyy=2026, mm=9)
+    assert errors == []
+    labels = sorted({o.period_label for o in obs})
+    assert labels == ["10월", "9월", "추석 성수기"]
