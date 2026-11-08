@@ -25,6 +25,7 @@ from typing import Any
 import pandas as pd
 
 from croplib_dp.core.krei import HORT_MONTH_ITEMS
+from croplib_dp.core.retention import DB_ERR_MB, DB_EST_ERR_MB, DB_EST_WARN_MB, DB_WARN_MB, db_level
 
 # 이보다 오래 갱신이 없으면 멈춤. 정상 최대 간격 약 16시간(02시 회차 → 17시 회차 마감 18:30) + 여유.
 # CropMon src/domain/freshness.ts STALE_AFTER_MS 와 같은 값이어야 함
@@ -102,6 +103,22 @@ def _check_krei(now: pd.Timestamp, krei_reports: Iterable[Mapping[str, Any]]) ->
     return out
 
 
+def _check_db_size(db_size: Mapping[str, Any]) -> list[Alert]:
+    """DB 용량 경고: 정확한 값 400(경고)·450MB(오류), 추정은 360·405MB부터 (한도 500MB).
+    경고 열쇠는 ' — ' 앞 문구라 숫자가 바뀌어도 같은 경고로 본다(댓글이 쌓이지 않게)."""
+    mb, exact = float(db_size["mb"]), bool(db_size.get("exact"))
+    level = db_level(mb, exact)
+    if level == "ok":
+        return []
+    kind = "정확한 값" if exact else "줄 수로 추정한 값(정확한 값은 CropMon#77 db_size_bytes() 필요)"
+    head = "DB 용량 오류선 초과" if level == "error" else "DB 용량 경고선 초과"
+    lines = dict(warn=DB_WARN_MB if exact else DB_EST_WARN_MB, error=DB_ERR_MB if exact else DB_EST_ERR_MB)
+    todo = "전망 표 보관·삭제(retention)와 오래된 해 정리(S6)를 확인하세요"
+    return [
+        Alert(level, "dbsize", f"{head} — {mb:.0f}MB ({kind}, 기준 {lines[level]:.0f}MB, 한도 500MB). {todo}")
+    ]
+
+
 def check_health(
     now: pd.Timestamp,
     runs: Iterable[Mapping[str, Any]],
@@ -111,12 +128,16 @@ def check_health(
     collect_count: int | None = None,
     krei_reports: Iterable[Mapping[str, Any]] | None = None,
     krei_error: str | None = None,
+    db_size: Mapping[str, Any] | None = None,
+    db_size_error: str | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
     heat_last: 적산온도 대상 지점(is_active)별 날짜 (어제 값이 있으면 그 날짜, 없으면 None).
     collect_count: 수집 지점 수. 0 이면 오류 (넘기지 않으면 보지 않는다 — 알림 연습 등).
-    krei_reports: krei.report 행 목록 (이번 달 행 + failed 행). 넘기지 않으면 보지 않는다."""
+    krei_reports: krei.report 행 목록 (이번 달 행 + failed 행). 넘기지 않으면 보지 않는다.
+    db_size: DB 크기 {mb, exact}. exact=False 는 줄 수로 추정한 값. 넘기지 않으면 보지 않는다 (결정 0022).
+    db_size_error: 크기를 못 읽은 이유. 있으면 "조회 실패" 경고(조용히 넘어가지 않음)."""
     names = station_names or {}
     now = pd.Timestamp(now)
     alerts: list[Alert] = []
@@ -172,6 +193,11 @@ def check_health(
         alerts.append(Alert("warn", "krei", f"KREI 상태 조회 실패 — {first_line}"))
     elif krei_reports is not None:
         alerts.extend(_check_krei(now, krei_reports))
+    if db_size_error:
+        first_line = (str(db_size_error).strip().splitlines() or ["이유 없음"])[0]
+        alerts.append(Alert("warn", "dbsize", f"DB 용량 조회 실패 — {first_line}"))
+    elif db_size is not None:
+        alerts.extend(_check_db_size(db_size))
     return alerts
 
 

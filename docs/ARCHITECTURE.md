@@ -98,16 +98,16 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 ## 수집 감시 (공3)
 | 모듈 | 하는 일 |
 |---|---|
-| `core/monitor.py` | 경고 규칙: 마지막 회차가 17시간 넘게 지남(오류), 마지막 회차 실패(오류), 수집 지점 0곳(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고), 12시 뒤에도 어제 적산온도 없음(경고), 매달 9일 뒤에도 KREI 원예 4부류(과일·과채·엽근채소·양념채소) 이번 달 월보 미수집 또는 `failed` 건 있음(경고). 빠진 지점이 10곳을 넘으면 "N곳 — 앞 10곳 …"으로 줄임 |
+| `core/monitor.py` | 경고 규칙: 마지막 회차가 17시간 넘게 지남(오류), 마지막 회차 실패(오류), 수집 지점 0곳(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고), 12시 뒤에도 어제 적산온도 없음(경고), 매달 9일 뒤에도 KREI 원예 4부류(과일·과채·엽근채소·양념채소) 이번 달 월보 미수집 또는 `failed` 건 있음(경고). 빠진 지점이 10곳을 넘으면 "N곳 — 앞 10곳 …"으로 줄임. DB 용량(정확 400/450MB, 추정 360/405MB, 조회 실패)(결정 0022) |
 | `io/github_issue.py` | "수집 경고" 이슈 열기·댓글·닫기. 새 경고가 생길 때만 댓글(같은 경고로 메일이 쌓이지 않게). 제목·라벨을 바꿔 쓸 수 있음(알림 연습) |
-| `collectors/monitor.py` | DB에서 최근 서버 회차 기록, 수집 지점(`stations.has_forecast = true`)의 관측 마지막 날, 운영 지점(`is_active = true`)의 어제 적산온도 유무(`heat_daily` 한 번에 조회), KREI 이번 달 발행물·실패 건(`krei.report`)을 읽어 규칙을 돌리고 이슈에 반영. 관측은 수집 지점만, 적산온도는 운영 지점 전부 본다(결정 0007 보충, 0017, 0019) |
+| `collectors/monitor.py` | DB에서 최근 서버 회차 기록, 수집 지점(`stations.has_forecast = true`)의 관측 마지막 날, 운영 지점(`is_active = true`)의 어제 적산온도 유무(`heat_daily` 한 번에 조회), KREI 이번 달 발행물·실패 건(`krei.report`)을 읽어 규칙을 돌리고 이슈에 반영. 관측은 수집 지점만, 적산온도는 운영 지점 전부 본다(결정 0007 보충, 0017, 0019). DB 크기는 CropMon `db_size_bytes()` RPC, 없으면 표 8개 줄 수 × 줄당 크기로 추정(결정 0022) |
 | `collectors/radiation_audit.py` | 사람이 누를 때만(`radiation-audit.yml`): 운영 지점 × 지난 365일 ASOS 일자료 → `core/radiation_audit` → 결과 파일. **DB 쓰기 없음**, 지점 목록만 읽음 (결정 0021) |
 | `io/storage.py` | Supabase Storage: 목록(재귀·크기)·내려받기·올리기·지우기. 서버 키 사용, 지운 개수가 요청과 다르면 오류 (결정 0022) |
 | `io/db_stats.py` | DB 읽기 도우미: 줄 수(`Prefer: count=exact`)·1,000줄씩 이어 읽기 (결정 0022) |
 | `io/coastal.py` | 지점별 식50 kRs: `data/coastal_stations.csv`(해안선 10 km 이하 0.19, 그 밖·목록에 없음 0.16)를 읽음. `station_meta()`가 `StationMeta.krs`에 넣음 — 관측 결측일 대체에만 쓰이고 예보용 kRs와 무관 (결정 0021) |
 | `io/coast_data.py` | Natural Earth 10m 해안선·땅(GeoJSON) 내려받기(커밋 고정 주소, sha256 확인)·읽기. 원본은 저장소에 넣지 않음 (결정 0021) |
 | `collectors/radiation_report.py` | 오프라인: 점검 결과 폴더 + 해안선 → `docs/data/`에 실태표·보고서·그림. 키·DB를 쓰지 않음 (결정 0021) |
-| `collectors/retention.py` | 사람이 누를 때만(`retention.yml`): `plan`(dry-run, 읽기만) / `apply`(`--through`·`--confirm-rows`가 맞을 때만: 보관 → 다시 내려받아 확인 → 삭제) / `restore`(기본 보고만). `forecast_runs`는 지우지 않음 (결정 0022) |
+| `collectors/retention.py` | 수동(`retention.yml`): `plan`(dry-run, 읽기만) / `apply`(`--through`·`--confirm-rows`가 맞을 때만: 보관 → 다시 내려받아 확인 → 삭제) / `restore`(기본 보고만). `forecast_runs`는 지우지 않음 (결정 0022). `weekly`(일요일 05:10 KST 예약): 같은 실행에서 plan → 그 줄 수로 apply(기본 켜짐, 확인이 어긋나면 지우지 않고 별도 경고 이슈 + 실패, 비상 정지 변수 `RETENTION_AUTO_APPLY=false`, 상한 8,000줄은 S4 때 함께 올림), 모든 버킷 합계 Storage 800/950MB 경고 (결정 0022) |
 | `collectors/heat_sun.py` | 하루 한 번(09:20, `heat-sun.yml`): **운영 지점(`is_active`) 전부**(폐지·휴지는 안 돎)에 대해 ASOS 일자료 평년 기간(지난 10년)·올해를 해마다 나눠 받기(일시 오류 재시도) → `core/heat_sun` 한 해 표 → 계약 검사 → `heat_daily`·`sun_daily` 덮어쓰기. 지난 해 자료는 `--cache-dir` 파일 캐시(워크플로는 `actions/cache`)에서 읽고 올해만 새로 받음(목표 15분 이내). 기준온도는 `crops.t_base_c`(사과·배추 4℃, 작물 공통 `common` 5℃), 일사를 재지 않는 지점은 `sun_daily` 없음. 받지 못한 지점은 빼고 실패로 남김. 새해 1월 1~3일(`PREV_YEAR_DAYS`)은 작년도 12/31까지 다시 계산해 마감하고, 시작 > 끝인 구간은 묻지 않음(`fetch_year`가 `[]`), 해마다 한 묶음(`blocks`) (결정 0017, 0018) |
 
 **알림 연습** (`monitor.yml` 수동 실행의 `drill` 선택, 결정 0011): `start` 는 가짜 실패 회차를 진짜 감시 규칙에 넣어 "[수집 경고] 알림 연습 (실제 문제 아님)" 이슈를 열고(메일이 감), `end` 는 "정상 회복" 댓글과 함께 닫는다. DB를 읽지 않고, 라벨이 달라 열려 있는 진짜 경고 이슈는 건드리지 않는다.

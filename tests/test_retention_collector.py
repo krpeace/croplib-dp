@@ -431,7 +431,7 @@ def test_no_code_path_deletes_from_forecast_runs():
 # ── CLI ────────────────────────────────────────────────────────────────
 def test_cli_default_mode_is_plan_and_writes_report_files_but_no_data(tmp_path):
     f = _fake()
-    code = RT.main(["--out", str(tmp_path)], env=_env(f))
+    code = RT.main(["--out", str(tmp_path)], env=_env(f), now=NOW)
     assert code == 0 and f.writes == []
     assert (tmp_path / "retention" / "plan.md").exists() and (tmp_path / "retention" / "plan.json").exists()
 
@@ -439,17 +439,21 @@ def test_cli_default_mode_is_plan_and_writes_report_files_but_no_data(tmp_path):
 def test_cli_apply_without_confirmation_stops_and_deletes_nothing(tmp_path):
     f = _fake()
     with pytest.raises(SystemExit):
-        RT.main(["apply", "--through", THROUGH, "--out", str(tmp_path)], env=_env(f))
+        RT.main(["apply", "--through", THROUGH, "--out", str(tmp_path)], env=_env(f), now=NOW)
     assert f.writes == []
     with pytest.raises(SystemExit):
-        RT.main(["apply", "--through", THROUGH, "--confirm-rows", "5", "--out", str(tmp_path)], env=_env(f))
+        RT.main(
+            ["apply", "--through", THROUGH, "--confirm-rows", "5", "--out", str(tmp_path)],
+            env=_env(f),
+            now=NOW,
+        )
     assert f.writes == [] and len(f.tables["water_outlook"]) == 18
 
 
 def test_cli_apply_with_matching_confirmation_runs_and_writes_a_result_report(tmp_path):
     f = _fake()
     code = RT.main(
-        ["apply", "--through", THROUGH, "--confirm-rows", "16", "--out", str(tmp_path)], env=_env(f)
+        ["apply", "--through", THROUGH, "--confirm-rows", "16", "--out", str(tmp_path)], env=_env(f), now=NOW
     )
     assert code == 0 and len(f.tables["water_outlook"]) == 6
     assert "16" in (tmp_path / "retention" / "apply.md").read_text(encoding="utf-8")
@@ -460,7 +464,9 @@ def test_cli_restore_defaults_to_dry_run(tmp_path):
     _apply(f)
     before = f.writes[:]
     RT.main(
-        ["restore", "--table", "water_outlook", "--month", "2026-10", "--out", str(tmp_path)], env=_env(f)
+        ["restore", "--table", "water_outlook", "--month", "2026-10", "--out", str(tmp_path)],
+        env=_env(f),
+        now=NOW,
     )
     assert f.writes == before
 

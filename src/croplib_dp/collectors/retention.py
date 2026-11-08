@@ -8,6 +8,9 @@
           하나라도 어긋나면 그 뒤를 하지 않고 멈춘다. forecast_runs 는 지우지 않는다(읽기만).
           대표 밖 원문(`fcst-ext/`)이 90일 지난 것이 있으면 `--confirm-raw-files <N>` 도 맞아야 같이 지운다.
   restore 보관 파일 → 표로 되살린다(기본은 보고만, `--apply` 면 같은 키로 upsert).
+  weekly  주 1회 정기 실행(일요일 05:10 KST 예약). **같은 실행 안에서 plan → 그 줄 수로 apply**(기본 켜짐, `--no-auto` 면 읽기만).
+          보관 파일 확인이 하나라도 어긋나면 지우지 않고 별도 경고 이슈를 열고 실패(종료 코드 1)로 끝난다.
+          Storage 용량(모든 버킷 합계 800MB 경고 / 950MB 오류, 한도 1GB 확인됨)도 같이 점검한다.
 키는 환경변수(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)로만 읽는다.
 """
 
@@ -17,6 +20,7 @@ import argparse
 import datetime as dt
 import gzip
 import json
+import os
 import sys
 import urllib.parse
 from collections.abc import Callable, Sequence
@@ -28,8 +32,11 @@ import pandas as pd
 
 from croplib_dp.collectors.water import _env, kst_now
 from croplib_dp.core import retention as R
+from croplib_dp.core.monitor import Alert
+from croplib_dp.core.monitor import report as alert_report
 from croplib_dp.io.db_stats import HeadRequest, http_request_h, read_all, row_count
 from croplib_dp.io.dictionaries import RestGet, rest_get
+from croplib_dp.io.github_issue import IssueAlerts
 from croplib_dp.io.storage import Storage
 from croplib_dp.io.supabase_write import SupabaseWriter, http_request
 
@@ -37,6 +44,11 @@ BUCKET = "raw"
 TABLES = ("water_outlook", "water_outlook_summary")
 RUN_CHUNK = 50  # 한 번에 지우는 회차 수
 XZ_SAMPLE = 200
+DEFAULT_MAX_ROWS = (
+    8000  # 주간 자동 삭제가 한 번에 지울 수 있는 줄 상한(지금 주 3,500줄 정도). 지점이 늘면 함께 올린다
+)
+ALERT_TITLE = "[용량·보관 경고] 저장 공간과 전망 표 보관"
+ALERT_LABEL = "용량 경고"
 OUT_NAME = "retention"
 RUN_EMBED = "forecast_runs!inner(run_at,run_name,stn_id,collector)"
 
@@ -100,6 +112,7 @@ class Plan:
     raw_expired_bytes: int = 0
     xz: dict = field(default_factory=lambda: dict(n=0, gz_bytes=0, xz_bytes=0, ratio=None))
     xz_total_saving_bytes: float = 0.0
+    raw_total_bytes: int = 0  # raw 버킷 전체 파일 크기 합(Storage 용량 경고용)
 
     @property
     def total_rows(self) -> int:
@@ -240,6 +253,7 @@ def build_plan(env: Env, now: Any, through: dt.date | None = None, xz_sample: in
     expired = [f for f in files if R.raw_expired(f["path"], now)]
     plan.raw_expired = [f["path"] for f in expired]
     plan.raw_expired_bytes = sum(f["size"] for f in expired)
+    plan.raw_total_bytes = sum(f["size"] for f in files)
     gz = [
         f
         for f in files
@@ -493,12 +507,150 @@ def restore_markdown(r: RestoreResult) -> str:
     )
 
 
+# ── 주간 정기 실행 (S3-b) ───────────────────────────────────────────────
+@dataclass
+class WeeklyResult:
+    now: pd.Timestamp
+    auto: bool
+    max_rows: int
+    plan: Plan | None = None
+    applied: ApplyResult | None = None
+    storage_mb: float | None = None
+    storage_by_bucket: dict[str, float] = field(default_factory=dict)
+    alerts: list[Alert] = field(default_factory=list)
+    text: str = ""
+    action: str = "none"
+
+    @property
+    def failed(self) -> bool:
+        return any(a.level == "error" for a in self.alerts)
+
+
+def _storage_total(env: Env, plan: Plan) -> dict[str, float]:
+    """Storage 용량(MB): 모든 버킷의 파일 크기 합. raw 는 plan 이 이미 목록을 읽었으므로 그 값을 쓴다."""
+    out: dict[str, float] = {}
+    for bucket in env.storage.list_buckets():
+        size = (
+            plan.raw_total_bytes
+            if bucket == BUCKET
+            else sum(f["size"] for f in env.storage.list_files(bucket))
+        )
+        out[bucket] = size / 1024 / 1024
+    out.setdefault(BUCKET, plan.raw_total_bytes / 1024 / 1024)
+    return out
+
+
+def _storage_alert(mb: float) -> Alert | None:
+    level = R.storage_level(mb)
+    if level == "ok":
+        return None
+    head = "Storage 용량 오류선 초과" if level == "error" else "Storage 용량 경고선 초과"
+    todo = "예보 원문 xz 전환(#61 Q6)·대표 밖 원문 90일 정리·KREI 보관을 확인하세요"
+    line = f"경고 {R.STORAGE_WARN_MB:.0f}MB / 오류 {R.STORAGE_ERR_MB:.0f}MB, 한도 1GB 확인됨"
+    return Alert(level, "storage", f"{head} — {mb:.0f}MB (모든 버킷 합계, {line}). {todo}")
+
+
+def weekly(
+    env: Env,
+    now: Any,
+    auto: bool = True,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    sink: IssueAlerts | None = None,
+    xz_sample: int = 0,
+) -> WeeklyResult:
+    """주 1회 정기 실행: **같은 실행 안에서 plan → 그 줄 수로 apply**(기본 `auto=True`). `auto=False`(비상 정지 변수
+    RETENTION_AUTO_APPLY=false·수동 점검)면 읽기만 하고 경고한다. apply 는 S3-a 와 같은 확인을 모두 거치고, plan 이 센 줄 수와
+    다르면 지우지 않는다. 한 번에 지울 줄이 max_rows 를 넘으면 삭제하지 않고 오류. 예외는 올리지 않고 오류 경고로 남긴다."""
+    now = pd.Timestamp(now)
+    res = WeeklyResult(now=now, auto=auto, max_rows=max_rows)
+    try:
+        plan = build_plan(env, now, None, xz_sample=xz_sample)
+        res.plan = plan
+        res.storage_by_bucket = _storage_total(env, plan)
+        res.storage_mb = sum(res.storage_by_bucket.values())
+        a = _storage_alert(res.storage_mb)
+        if a:
+            res.alerts.append(a)
+        waiting = plan.total_rows > 0 or bool(plan.raw_expired)
+        if waiting and auto and plan.total_rows > max_rows:
+            over = f"지울 줄 {plan.total_rows}줄이 상한 {max_rows}줄보다 많아 삭제하지 않았습니다. "
+            res.alerts.append(
+                Alert(
+                    "error",
+                    "retention",
+                    f"자동 삭제 상한 초과 — {over}예상 밖으로 많이 쌓였는지 확인하고 dry-run 을 본 뒤 수동 apply 하세요",
+                )
+            )
+        elif waiting and auto:
+            res.applied = apply(env, now, plan.through, plan.total_rows, len(plan.raw_expired))
+        elif waiting:
+            what = f"전망 표 {plan.total_rows}줄(~{plan.through})이 14일을 넘었습니다(90일 지난 원문 {len(plan.raw_expired)}개). "
+            todo = "자동 삭제가 꺼져 있습니다(Actions 변수 RETENTION_AUTO_APPLY=false 또는 수동 점검). 수동 apply 하거나 변수를 지우면 주 1회 자동 삭제가 켜집니다"
+            res.alerts.append(Alert("warn", "retention", f"보관 대기 — {what}{todo}"))
+    except Exception as e:  # 확인이 어긋나거나 읽기가 실패해도 조용히 넘어가지 않고 오류 경고로 남긴다
+        first = (str(e).strip().splitlines() or ["이유 없음"])[0]
+        res.alerts.append(Alert("error", "retention", f"보관·삭제 중단 — {type(e).__name__}: {first[:300]}"))
+    res.text = weekly_markdown(res)
+    res.action = sink.sync([a.key for a in res.alerts], res.text) if sink is not None else "dry"
+    return res
+
+
+def weekly_markdown(res: WeeklyResult) -> str:
+    L = [
+        f"# 주간 보관·용량 점검 ({res.now:%Y-%m-%d %H:%M} KST)",
+        "",
+        f"- 자동 삭제: **{'켜짐' if res.auto else '꺼짐'}**(비상 정지: Actions 변수 RETENTION_AUTO_APPLY=false), 한 번에 지우는 상한 {res.max_rows}줄",
+    ]
+    if res.plan is not None:
+        p = res.plan
+        L.append(
+            f"- 보관 대기: 전망 표 {p.total_rows}줄(`--through {p.through}`까지), 90일 지난 대표 밖 원문 {len(p.raw_expired)}개"
+        )
+    if res.applied is not None:
+        d = res.applied.deleted
+        L.append(
+            f"- **자동 삭제 실행: {sum(d.values())}줄**(water_outlook {d['water_outlook']}, water_outlook_summary "
+            f"{d['water_outlook_summary']}), 보관 파일 {len(res.applied.archives)}개 확인 뒤 삭제, 원문 {res.applied.raw_deleted}개 삭제"
+        )
+    if res.storage_mb is not None:
+        L += ["", "## Storage 용량 (모든 버킷 합계)", "", "| 버킷 | 크기 |", "|---|---:|"]
+        L += [f"| {b} | {mb:.1f}MB |" for b, mb in sorted(res.storage_by_bucket.items())]
+        L.append(
+            f"| **합계** | **{res.storage_mb:.1f}MB** (경고 {R.STORAGE_WARN_MB:.0f} / 오류 {R.STORAGE_ERR_MB:.0f}MB) |"
+        )
+    L += ["", alert_report(res.alerts, res.now)]
+    return chr(10).join(L) + chr(10)
+
+
+def weekly_dict(res: WeeklyResult) -> dict:
+    return dict(
+        now=str(res.now),
+        auto=res.auto,
+        max_rows=res.max_rows,
+        rows_waiting=res.plan.total_rows if res.plan else None,
+        raw_expired_files=len(res.plan.raw_expired) if res.plan else None,
+        applied_rows=sum(res.applied.deleted.values()) if res.applied else 0,
+        storage_mb=res.storage_mb,
+        storage_by_bucket=res.storage_by_bucket,
+        alerts=[a.key for a in res.alerts],
+        failed=res.failed,
+        action=res.action,
+    )
+
+
+def _env_issue(name: str) -> str:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        raise SystemExit(f"환경변수 {name}가 없습니다 (GitHub Actions 에서는 자동으로 있음)")
+    return v
+
+
 # ── CLI ────────────────────────────────────────────────────────────────
-def main(argv: list[str] | None = None, env: Env | None = None) -> int:
+def main(argv: list[str] | None = None, env: Env | None = None, now: Any = None) -> int:
     p = argparse.ArgumentParser(
         description="전망 표 월 보관·삭제·복원, 대표 밖 원문 90일 정리 (기본은 dry-run)"
     )
-    p.add_argument("mode", nargs="?", choices=["plan", "apply", "restore"], default="plan")
+    p.add_argument("mode", nargs="?", choices=["plan", "apply", "restore", "weekly"], default="plan")
     p.add_argument("--out", default="out", help="결과 폴더")
     p.add_argument("--through", help="보관·삭제할 마지막 날짜(포함, YYYY-MM-DD). apply 에 필수")
     p.add_argument(
@@ -513,12 +665,42 @@ def main(argv: list[str] | None = None, env: Env | None = None) -> int:
     p.add_argument("--table", choices=list(TABLES), help="restore: 표")
     p.add_argument("--month", help="restore: 월(YYYY-MM)")
     p.add_argument("--apply", action="store_true", help="restore: 실제로 되살림(기본은 보고만)")
+    p.add_argument(
+        "--no-auto",
+        action="store_true",
+        help="weekly: 자동 삭제를 끄고 읽기만 함(워크플로에서는 변수 RETENTION_AUTO_APPLY=false 이거나 수동 점검일 때)",
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=DEFAULT_MAX_ROWS,
+        help="weekly: 한 번에 지우는 줄 상한(S4 때 함께 올린다)",
+    )
+    p.add_argument("--no-issue", action="store_true", help="weekly: GitHub 이슈로 알리지 않음(시험용)")
     a = p.parse_args(argv)
     env = env or Env.from_environ()
-    now = kst_now()
+    now = pd.Timestamp(now) if now is not None else kst_now()
     through = dt.date.fromisoformat(a.through) if a.through else None
     out = Path(a.out) / OUT_NAME
     out.mkdir(parents=True, exist_ok=True)
+    if a.mode == "weekly":
+        sink = None
+        if not a.no_issue:
+            sink = IssueAlerts(
+                _env_issue("GITHUB_REPOSITORY"),
+                _env_issue("GITHUB_TOKEN"),
+                title=ALERT_TITLE,
+                label=ALERT_LABEL,
+                label_desc="용량·보관 자동 알림",
+            )
+        res = weekly(env, now, auto=not a.no_auto, max_rows=a.max_rows, sink=sink)
+        (out / "weekly.md").write_text(res.text, encoding="utf-8")
+        (out / "weekly.json").write_text(
+            json.dumps(weekly_dict(res), ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        print(res.text)
+        print(f"이슈: {res.action}")
+        return 1 if res.failed else 0
     try:
         if a.mode == "plan":
             plan = build_plan(env, now, through, xz_sample=a.xz_sample)
