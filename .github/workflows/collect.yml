@@ -4,6 +4,11 @@ name: collect
 # 계약 검사를 통과한 결과를 Supabase에 쓴다. 회차가 실패하면 5분 뒤 한 번 더 돌린다.
 # GitHub 예약 실행은 몰릴 때 늦게 시작할 수 있다(보통 수 분~30분). 늦게 시작해도 마감 안이면 재시도하고,
 # 마감을 넘기면 한 번만 받아 "지연 수집"으로 남긴다.
+#
+# 관측 물 계산을 운영 지점 전부로 넓히는 스위치(결정 0026): Actions 변수 OBS_ALL_STATIONS=true 일 때만 켜진다(기본 꺼짐,
+# 변수를 지우면 바로 대표 10곳으로 돌아간다). 켜기 전에 CropMon 선행 조건(#76)과 소급이 끝나 있어야 한다.
+# 아래 수동 실행 입력(지점·소급·시험 실행)은 workflow_dispatch 에서만 쓰이고, 예약 실행은 입력과 상관없이 늘 똑같다
+# (판단은 파이썬 dispatch_options, 시험으로 고정).
 
 on:
   schedule:
@@ -17,6 +22,20 @@ on:
         description: "발표시각 (예: 2026-10-25 02). 비우면 지금 회차"
         required: false
         default: ""
+      stations:
+        description: "(소급·점검) 지점 번호 쉼표 목록 (예: 108,112). 비우면 기본 대상. 소급은 관측만 하는 지점 20곳까지"
+        required: false
+        default: ""
+      soil_backfill:
+        description: "(소급) 작물 공통 토양 물 상태·관측을 그해 1/1부터 전부 올린다. 먼저 dry_run 으로 줄 수·예상 MB를 본다"
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "시험 실행: 계산만 하고 DB에 쓰지 않는다(요약에 지점·줄 수·예상 DB 증가 MB). 소급은 늘 이것부터"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: collect
@@ -34,6 +53,11 @@ jobs:
       DATA_GO_KR: ${{ secrets.DATA_GO_KR }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OBS_ALL_STATIONS: ${{ vars.OBS_ALL_STATIONS }}
+      EVENT: ${{ github.event_name }}
+      IN_STATIONS: ${{ inputs.stations }}
+      IN_BACKFILL: ${{ inputs.soil_backfill }}
+      IN_DRY_RUN: ${{ inputs.dry_run }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,7 +81,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write --skip-if-done 2> err.txt
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --event "$EVENT" --input-stations "$IN_STATIONS" --input-backfill "$IN_BACKFILL" --input-dry-run "$IN_DRY_RUN" 2> err.txt
           code=$?
           cat err.txt >&2
           exit $code
@@ -67,7 +91,7 @@ jobs:
         run: |
           sleep 300
           set +e
-          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --write --skip-if-done 2> err.txt
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --event "$EVENT" --input-stations "$IN_STATIONS" --input-backfill "$IN_BACKFILL" --input-dry-run "$IN_DRY_RUN" 2> err.txt
           code=$?
           cat err.txt >&2
           exit $code

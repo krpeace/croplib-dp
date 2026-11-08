@@ -39,6 +39,7 @@
 4. `observed_water_balance(forecast_fill=fill_from_forecast(...), end=발표일 전날)` → 관측 물수지
 5. `service_outlook` → `outlook_rows` → 3일 전망
 6. (예보 지점) 토성 12종마다 `soil_water_rows` → 작물 공통 흙 물 상태 (`soil_water_daily`)
+7. (관측만 하는 지점, `OBS_ALL_STATIONS=true`일 때) 1~2번은 ASOS 1/1~어제 한 번, 6번은 창 시작 전날 DB 줄에서 이어 계산(`soil_water_rows(window_start, prior)`). 3·4·5번(예보·작물별 물수지·전망)은 하지 않는다 (결정 0026)
 
 계산 결과에는 `core.CALC_VERSION`(패키지 버전)을 붙인다. 수집기(물1-3)는 다음 PR에서 더한다.
 
@@ -61,13 +62,14 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 | `io/kma.py` | 단기예보·ASOS 조회: 키 인코딩, 여러 쪽 이어 받기, 응답 해석(JSON·XML 오류), 결과 구분(ok·nodata·retry·fatal), 기록에서 키 감추기 |
 | `io/dictionaries.py` | Supabase에서 사전 자료 6개 표 읽기, 계산 입력(StationMeta·CropParams·Soil)으로 바꾸기 |
 | `io/asos_cache.py` | 지난 해 ASOS 일자료 파일 캐시(`<폴더>/asos/<지점>/<해>.json`). 계산에 쓰는 5칸만 저장, 12/31까지 다 받은 해(또는 관측 없는 해)만 남김. 깨진 파일은 없는 것으로 보고, 쓰기 실패는 넘어감 (결정 0017) |
-| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄. `--stations`가 없으면 **수집 지점(`has_forecast`)만** 돈다(결정 0017) |
+| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄. `--stations`가 없으면 **수집 지점(`has_forecast`)만** 돈다(결정 0017). Actions 변수 `OBS_ALL_STATIONS=true`면 운영 지점 중 예보 지점이 아닌 곳을 **관측만 하는 지점**으로 뒤에 더한다: 작물 공통 12토성만, `forecast_runs`·사과·배추·전망 없음, 평소 회차는 최근 14일 줄만 올림, ASOS 실패는 경고(결정 0026) |
 
 - 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 기본 대상이 `has_forecast` 지점뿐이라 예보 없는 지점은 `--stations`로 따로 지정했을 때만 돌고, 그때는 관측 물수지만 계산하며 ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다. 수집 지점이 0곳이면 회차를 실패로 남긴다.
+- **관측만 하는 지점**(결정 0026, 기본 꺼짐): 운영 지점 중 `has_forecast`가 아닌 곳. 대표 지점이 끝난 뒤 돈다. ASOS는 1/1~어제 한 번(재시도 30초·90초 2번, 단계 20분 상한, 실패는 회차 실패가 아니라 경고), 토성 12종 `soil_water_daily`와 `weather_daily`만 만든다. 평소 회차는 최근 14일만 올리고 창 시작 전날 Dr·DP·`filled`를 `soil_water_daily`에서 읽어(`load_soil_prior`) 이어 계산한다(없으면 1/1부터 전체 재계산 + 경고, 올리는 건 창만). 소급(`--soil-backfill`)은 한 번에 20곳까지. `slot_done`은 이 지점들의 어제 줄도 확인한다. `weather_daily.rs_source` 칸이 DB에 없으면 그 칸만 빼고 올린다(경고).
 - 서버는 받은 예보를 쌓아 두지 않는다. 그래서 하루 넘게 지난 관측 결측일은 예보로 채우지 못하고 앞 7일 평균이 된다(연속 7일까지만, 8일째부터 ETo를 비운다). 물3에서 예보 원자료를 Storage에 쌓으면 현장 PC처럼 채운다.
-- 일사(Rs)는 `core/radiation.py` 규칙으로 고른다(결정 0020): 0.01×Ra보다 작은 값(0.0 등)은 무효, 한 달(자료 10일 이상) 무효가 90% 이상이면 그 달 전체 무효 → 유효한 관측 일사 → 일조시간(식35) → 기온차(식50, `StationMeta.krs` 기본 0.16) → 비움. 어느 방식을 썼는지는 계산 결과의 `rs_source`에 있다(DB에는 아직 안 올림). 적산일사(`sun_daily`)는 관측 일사만 쓰고, 걸러진 날은 비운다. 평년선의 유효 일수가 100일 미만인 지점은 일사 미측정 지점으로 보고 빈 값 줄로 덮어쓴다.
-- 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--soil-backfill] [--out out]`. 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
-- ASOS 조회가 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 세 번 더 시도한다. 시험 실행에서 공공데이터포털이 몇 분 동안 모든 요청에 응답하지 않은 적이 두 번 있었다.
+- 일사(Rs)는 `core/radiation.py` 규칙으로 고른다(결정 0020): 0.01×Ra보다 작은 값(0.0 등)은 무효, 한 달(자료 10일 이상) 무효가 90% 이상이면 그 달 전체 무효 → 유효한 관측 일사 → 일조시간(식35) → 기온차(식50, `StationMeta.krs` 기본 0.16) → 비움. 어느 방식을 썼는지는 계산 결과의 `rs_source`에 있다(DB 칸이 있으면 올리고, 없으면 그 칸만 빼고 올림 — 결정 0026). 적산일사(`sun_daily`)는 관측 일사만 쓰고, 걸러진 날은 비운다. 평년선의 유효 일수가 100일 미만인 지점은 일사 미측정 지점으로 보고 빈 값 줄로 덮어쓴다.
+- 실행: `python -m croplib_dp.collectors.water [--slot "2026-10-25 02"] [--stations 101] [--no-wait] [--soil-backfill] [--out out]`(워크플로는 `--event`·`--input-stations`·`--input-backfill`·`--input-dry-run`으로 `dispatch_options`가 판단: 새 입력은 수동 실행에서만). 환경변수 `DATA_GO_KR`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`. 결과는 `out/<발표시각>/`에 표(JSON), 수집 기록, 요약, 응답 원문(raw, 압축). DB 쓰기는 물3.
+- ASOS 조회가 일시 오류(시간 초과·서버 오류)면 30초·90초·3분 뒤 세 번 더 시도한다(관측만 하는 지점은 30초·90초 두 번). 시험 실행에서 공공데이터포털이 몇 분 동안 모든 요청에 응답하지 않은 적이 두 번 있었다.
 - 시험 실행: GitHub Actions → `collect-dryrun` → Run workflow. 손으로 누를 때만 돌고, 결과 파일은 그 실행의 Artifacts(7일 보관)에 올라간다. 요약과 오류는 실행의 알림(annotation)에도 남겨, API로 결과를 확인할 수 있다.
 
 ## DB에 올리기 (물3)
@@ -85,7 +87,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 ## 예약 실행 (물2)
 | 파일 | 언제 | 하는 일 |
 |---|---|---|
-| `.github/workflows/collect.yml` | 매일 02:15·02:35·02:55, 17:15·17:35·17:55 (KST), 손으로도 | 회차 정하기 → 수집·계산·DB 쓰기(마감까지 재시도) → 실패하면 5분 뒤 한 번 더 → 요약·알림 |
+| `.github/workflows/collect.yml` | 매일 02:15·02:35·02:55, 17:15·17:35·17:55 (KST), 손으로도(수동 입력: 회차 `slot`, 소급용 `stations`·`soil_backfill`, 시험 실행 `dry_run`) | 회차 정하기 → 수집·계산·DB 쓰기(마감까지 재시도) → 실패하면 5분 뒤 한 번 더 → 요약·알림. 변수 `OBS_ALL_STATIONS=true`일 때만 관측 전 지점(결정 0026) |
 | `.github/workflows/monitor.yml` | 매시 40분, 수집 끝날 때 | 수집 감시: 문제가 있으면 "수집 경고" 이슈를 열거나 댓글, 사라지면 닫음 |
 | `.github/workflows/keepalive.yml` | 매달 1일 12:40 (KST) | 60일 무활동 자동 중지를 막으려고 예약 실행(collect, monitor, keepalive)을 API로 다시 켬 |
 | `.github/workflows/collect-dryrun.yml` | 손으로만 | 시험 실행 (DB 쓰기는 선택) |
@@ -99,9 +101,9 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 ## 수집 감시 (공3)
 | 모듈 | 하는 일 |
 |---|---|
-| `core/monitor.py` | 경고 규칙: 마지막 회차가 17시간 넘게 지남(오류), 마지막 회차 실패(오류), 수집 지점 0곳(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고), 12시 뒤에도 어제 적산온도 없음(경고), 매달 9일 뒤에도 KREI 원예 4부류(과일·과채·엽근채소·양념채소) 이번 달 월보 미수집 또는 `failed` 건 있음(경고). 빠진 지점이 10곳을 넘으면 "N곳 — 앞 10곳 …"으로 줄임. DB 용량(정확 400/450MB, 추정 360/405MB, 조회 실패)(결정 0022) |
+| `core/monitor.py` | 경고 규칙: 마지막 회차가 17시간 넘게 지남(오류), 마지막 회차 실패(오류), 수집 지점 0곳(오류), 지연 수집·백업(경고), 18시 뒤에도 어제 ASOS 없음(경고), 18시 뒤에도 관측만 하는 지점의 어제 `soil_water_daily` 줄 없음(경고 `obs`, `N일째`, 결정 0026), 12시 뒤에도 어제 적산온도 없음(경고), 매달 9일 뒤에도 KREI 원예 4부류(과일·과채·엽근채소·양념채소) 이번 달 월보 미수집 또는 `failed` 건 있음(경고). 빠진 지점이 10곳을 넘으면 "N곳 — 앞 10곳 …"으로 줄임. DB 용량(정확 400/450MB, 추정 360/405MB, 조회 실패)(결정 0022) |
 | `io/github_issue.py` | "수집 경고" 이슈 열기·댓글·닫기. 새 경고가 생길 때만 댓글(같은 경고로 메일이 쌓이지 않게). 제목·라벨을 바꿔 쓸 수 있음(알림 연습) |
-| `collectors/monitor.py` | DB에서 최근 서버 회차 기록, 수집 지점(`stations.has_forecast = true`)의 관측 마지막 날, 운영 지점(`is_active = true`)의 어제 적산온도 유무(`heat_daily` 한 번에 조회), KREI 이번 달 발행물·실패 건(`krei.report`)을 읽어 규칙을 돌리고 이슈에 반영. 관측은 수집 지점만, 적산온도는 운영 지점 전부 본다(결정 0007 보충, 0017, 0019). DB 크기는 CropMon `db_size_bytes()` RPC, 없으면 표 8개 줄 수 × 줄당 크기로 추정(결정 0022) |
+| `collectors/monitor.py` | DB에서 최근 서버 회차 기록, 수집 지점(`stations.has_forecast = true`)의 관측 마지막 날, 운영 지점(`is_active = true`)의 어제 적산온도 유무(`heat_daily` 한 번에 조회), KREI 이번 달 발행물·실패 건(`krei.report`)을 읽어 규칙을 돌리고 이슈에 반영. 관측은 수집 지점만(지점마다가 아니라 어제 이후 줄을 한 번에), 적산온도는 운영 지점 전부 본다. `OBS_ALL_STATIONS=true`면 관측만 하는 지점을 `soil_water_daily`(기본 토성 하나, 최근 5일)로 한 번에 본다(결정 0007 보충, 0017, 0019, 0026). DB 크기는 CropMon `db_size_bytes()` RPC, 없으면 표 8개 줄 수 × 줄당 크기로 추정(결정 0022) |
 | `collectors/grid_table.py` | 사람이 손으로 한 번(워크플로 없음): 운영 지점 예보 격자 표 `docs/data/stations_grid_<날짜>.csv`·`.md`(겹침·경계 근접). `--source csv`(저장소 지점 목록) 또는 `db`(읽기 전용 키로 `stations`만 읽고 DB 격자와 비교). DB 쓰기 없음 (결정 0025) |
 | `collectors/radiation_audit.py` | 사람이 누를 때만(`radiation-audit.yml`): 운영 지점 × 지난 365일 ASOS 일자료 → `core/radiation_audit` → 결과 파일. **DB 쓰기 없음**, 지점 목록만 읽음 (결정 0021) |
 | `io/storage.py` | Supabase Storage: 목록(재귀·크기)·내려받기·올리기·지우기. 서버 키 사용, 지운 개수가 요청과 다르면 오류 (결정 0022) |

@@ -195,7 +195,9 @@ def test_read_state_and_run(monkeypatch):
             ).encode()
         if table == "heat_daily":  # 적산온도는 한 번에: 어제 값이 있는 지점 목록
             return 200, json.dumps([{"stn_id": "101"}]).encode()
-        rows = [{"date": "2026-10-25"}] if q["stn_id"] == "eq.101" else []
+        assert q["stn_id"].startswith("in.(") and q["date"] == "gte.2026-10-25"  # 지점마다 묻지 않고 한 번에
+        ids = q["stn_id"].removeprefix("in.(").removesuffix(")").split(",")
+        rows = [{"stn_id": "101", "date": "2026-10-25"}] if "101" in ids else []
         return 200, json.dumps(rows).encode()
 
     state = M.read_state("https://x.supabase.co", "srv", db, now=TS("2026-10-26 18:30"))
@@ -336,8 +338,11 @@ class FakeDb:
             assert q["date"] == f"eq.{self.heat_date}" and q["crop_id"] == "eq.common"
             assert q["gdd_cum"] == "not.is.null"
             return 200, json.dumps([{"stn_id": s} for s in sorted(self.heat)]).encode()
-        stn = q["stn_id"].removeprefix("eq.")
-        rows = [{"date": self.obs[stn]}] if stn in self.obs else []
+        # 관측: 지점마다가 아니라 수집 지점 전체를 한 번에, 어제 이후 줄만(지점별 마지막 날이 어제 이상인 것)
+        assert q["stn_id"].startswith("in.(") and q["date"].startswith("gte.")
+        since = q["date"].removeprefix("gte.")  # 보통 어제(감시가 어제 줄이 있나만 가린다)
+        ids = q["stn_id"].removeprefix("in.(").removesuffix(")").split(",")
+        rows = [{"stn_id": s, "date": self.obs[s]} for s in ids if s in self.obs and self.obs[s] >= since]
         return 200, json.dumps(rows).encode()
 
 
@@ -353,11 +358,14 @@ def test_read_state_asks_collected_for_obs_and_active_for_heat_in_few_calls():
     assert sum("has_forecast=eq.true" in u for u in st_urls) == 1  # 요청 주소에 조건이 들어 있다
     assert sum("is_active=eq.true" in u for u in st_urls) == 1
     obs = [u for u in db.urls if "/rest/v1/weather_daily" in u]
-    assert len(obs) == 2 and not any("stn_id=eq.108" in u or "stn_id=eq.999" in u for u in obs)
+    assert len(obs) == 1  # 수집 지점이 몇 곳이든 한 번 (전에는 지점마다 한 번씩 2번)
+    assert (
+        "stn_id=in.(101,216)" in urllib.parse.unquote(obs[0]) and "108" not in obs[0] and "999" not in obs[0]
+    )
     heat = [u for u in db.urls if "/rest/v1/heat_daily" in u]
     assert len(heat) == 1  # 적산온도는 지점 수와 상관없이 REST 한 번
     assert "stn_id=eq" not in heat[0] and f"date=eq.{YESTERDAY}" in heat[0] and "crop_id=eq.common" in heat[0]
-    assert len(db.urls) == 1 + 2 + 2 + 1  # 회차, 지점 2번, 관측 2곳, 적산온도 1번
+    assert len(db.urls) == 1 + 2 + 1 + 1  # 회차, 지점 2번, 관측 1번, 적산온도 1번
 
 
 def test_state_targets_obs_collected_and_heat_active():

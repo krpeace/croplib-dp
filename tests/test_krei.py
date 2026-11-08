@@ -561,7 +561,7 @@ def test_monitor_krei_query_failure_warns_krei_only_and_continues_water_heat():
             return 200, json.dumps([{"stn_id": "101", "name_ko": "춘천"}]).encode("utf-8")
         if "/rest/v1/weather_daily" in url:
             # 어제(11/08) 관측이 없고 11/07까지만 있는 상태 → asos 경고가 나와야 함
-            return 200, json.dumps([{"date": "2026-11-07"}]).encode("utf-8")
+            return 200, json.dumps([{"stn_id": "101", "date": "2026-11-07"}]).encode("utf-8")
         if "/rest/v1/heat_daily" in url:
             # 어제(11/08) 적산온도가 없는 상태 → heat 경고가 나와야 함
             return 200, b"[]"

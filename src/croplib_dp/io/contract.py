@@ -64,6 +64,7 @@ SPECS: dict[str, TableSpec] = {
             "u2_ms",
             "sunshine_h",
             "rs_mj",
+            "rs_source",
             "rain_mm",
             "eto_mm",
             "filled",
@@ -84,6 +85,9 @@ SPECS: dict[str, TableSpec] = {
             "rain_mm": (0, 500),
             "eto_mm": (0, 15),
         },
+        # rs_source: ETo 의 일사를 어디서 얻었나(C7, 결정 0020·0026). DB 칸이 없는 동안은 올리기 전에 이
+        # 칸만 뺀다
+        enums={"rs_source": ("observed", "sunshine", "temp_range", None)},
         key=("stn_id", "date"),
     ),
     "water_balance_daily": TableSpec(
