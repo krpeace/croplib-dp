@@ -80,6 +80,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 | `collectors/water.publish` | 계약 검사 → 원자료(Storage `raw`) → `weather_daily` → `water_balance_daily` → `soil_water_daily` → `forecast_runs`(번호 받기) → `water_outlook` → `water_outlook_summary` |
 
 - 계약 검사에 걸리면 계산 결과는 올리지 않고, 회차 기록만 "실패"와 이유(`error`)를 담아 올린다. 종료 코드 1.
+- 쓰지 않는 시험 실행(dry-run)도 같은 검사를 미리 돌린다(`precheck_contract`, 결정 0028): 어긋나면 요약 `## 문제`·종료 코드 1, 통과하면 `계약 검사: 통과 (쓰지 않고 미리 검사함)`. DB에는 쓰지 않는다.
 - 원자료는 예보 발표마다 한 파일(`fcst/<격자>/<연>/<월>/<발표>.json.gz`)이고, 다시 받으면 덮어쓴다. ASOS 응답은 언제든 다시 받을 수 있어 보관하지 않는다. 원자료 올리기가 실패하면 문제로 남기고 `raw_path`를 비운 채 계속한다.
 - 같은 회차를 다시 돌리면 줄이 늘지 않고 새 값으로 바뀐다. 회차 기록(`forecast_runs`)도 마지막 실행으로 바뀐다.
 - 실행: 수집기에 `--write`. 시험 실행 버튼에서는 `write`를 켠다.
