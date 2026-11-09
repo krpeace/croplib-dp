@@ -4,6 +4,7 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 
 - 계약 버전을 올릴 때는 CropMon에서 마이그레이션과 계약서를 함께 고치고, 이 저장소의 업로드 코드를 새 계약에 맞춘다. 두 PR에 서로의 링크를 단다.
 - 업로드 전 검사(컬럼, 단위, 값 범위)는 `src/croplib_dp/io/`에 둔다.
+- **하루 강수량(`rain_mm`, 예보 `rain_fcst_mm`·`rain_expected_mm`)의 상한은 1,000 mm**다(`io/contract.py`의 `DAILY_RAIN_MAX_MM`, 결정 0027). 옛 500 mm는 2026-08-17 294 거제의 실제 654.3 mm를 막았다. DB에는 이 범위 제약이 없다(CropMon 마이그레이션 확인). CropMon 계약서 306행의 "0~500" 문구 정정은 결정 0027의 요청 문안.
 
 현재 맞춘 계약 버전: v1.5 (2026-10-28, 작물 공통 토양 물 상태 `soil_water_daily`, `soil_types.is_estimated` 및 추정 3종, `crops.common`, CropMon#35·결정 0014). v1.4: 적산온도 `heat_daily`·적산일사 `sun_daily`, 작물 사전 `t_base_c` (2026-10-26). v1.3: 3일 전망 요약 `water_outlook_summary` (2026-10-28, 구조 그대로·문구만: `status_start` 휴면기 판정 기준 = 회차 발표 날짜, CropMon#37·결정 0015). v1.2: 3일 전망 선행일 0~4, 원자료 버킷 `raw`. 업로드 전 검사는 `io/contract.py`. 계산 결과의 열 이름과 상태 코드를 맞췄다. 재배 방식별 Kc(`crop_kc_sets`)는 기후보정 전 표값이고, 보정은 `core/kc.py`가 한다.
 

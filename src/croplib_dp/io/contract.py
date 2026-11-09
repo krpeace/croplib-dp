@@ -12,6 +12,9 @@ from typing import Any
 CONTRACT_VERSION = "v1.5"
 STATUS = ("need", "caution", "normal", "wet", "dormant")
 SOIL_WATER_STATUS = ("winter", "pool", "ample", "fair", "dry", "very_dry")
+# 하루 강수량 상한(mm). 국내 일강수 최고 기록은 870.5 mm(2002-08-31 강릉)이고, 2026-08-17 294 거제에서도
+# 하루 654.3 mm 가 실제로 관측됐다(옛 상한 500 mm 에 걸려 소급이 막힘). 결정 0027.
+DAILY_RAIN_MAX_MM = 1000
 
 
 @dataclass(frozen=True)
@@ -82,7 +85,7 @@ SPECS: dict[str, TableSpec] = {
             "u2_ms": (0, 60),
             "sunshine_h": (0, 15),
             "rs_mj": (0, 40),
-            "rain_mm": (0, 500),
+            "rain_mm": (0, DAILY_RAIN_MAX_MM),
             "eto_mm": (0, 15),
         },
         # rs_source: ETo 의 일사를 어디서 얻었나(C7, 결정 0020·0026). DB 칸이 없는 동안은 올리기 전에 이
@@ -114,7 +117,7 @@ SPECS: dict[str, TableSpec] = {
             "kc": (0, 1.5),
             "eto_mm": (0, 15),
             "etc_mm": (0, 25),
-            "rain_mm": (0, 500),
+            "rain_mm": (0, DAILY_RAIN_MAX_MM),
             "irr_net_mm": (0, 500),
             "ks": (0, 1),
             "etc_adj_mm": (0, 25),
@@ -147,9 +150,9 @@ SPECS: dict[str, TableSpec] = {
             "eto_mm": (0, 15),
             "etc_mm": (0, 25),
             "etc_err_mm": (0, 25),
-            "rain_fcst_mm": (0, 500),
+            "rain_fcst_mm": (0, DAILY_RAIN_MAX_MM),
             "pop_pct": (0, 100),
-            "rain_expected_mm": (0, 500),
+            "rain_expected_mm": (0, DAILY_RAIN_MAX_MM),
         },
         enums={"status": ("need", "caution", "normal", "dormant")},  # 예보 날은 과습을 판정하지 않는다
         key=("run_id", "scenario_id", "target_date"),
@@ -265,7 +268,7 @@ SPECS["soil_water_daily"] = TableSpec(
     required=("stn_id", "soil_code", "date", "taw_mm", "raw_mm", "status", "filled", "calc_version"),
     ranges={
         "eto_mm": (0, 15),
-        "rain_mm": (0, 500),
+        "rain_mm": (0, DAILY_RAIN_MAX_MM),
         "eto_7d_mm": (0, 105),
         "rain_7d_mm": (0, 2000),
         "dp_mm": (0, 1000),
