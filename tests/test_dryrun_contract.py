@@ -67,6 +67,9 @@ def test_a_normal_write_run_is_not_checked_twice(monkeypatch, tmp_path):
     clock = FakeClock("2026-06-10 02:20")
     calls = _main_env(monkeypatch, _obs_dicts(), clock, FakeApi(clock, ISSUES))
     monkeypatch.setattr(W, "slot_done", lambda *a, **k: False)
+    monkeypatch.setattr(
+        W, "pending_forecast_stations", lambda base, key, d, issue, http=None: W.forecast_stations(d)
+    )
     monkeypatch.setattr(W, "load_soil_prior", lambda *a, **k: {})
     W.main(["--slot", "2026-06-10 02", "--out", str(tmp_path), "--event", "schedule",
             "--input-stations", "", "--input-backfill", "", "--input-dry-run", ""])  # fmt: skip

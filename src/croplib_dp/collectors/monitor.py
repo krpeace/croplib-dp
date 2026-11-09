@@ -15,10 +15,17 @@ import pandas as pd
 
 from croplib_dp.collectors.water import COLLECTOR, default_soil_code, kst_now, obs_all_enabled
 from croplib_dp.core.grid import check_station_grid
-from croplib_dp.core.monitor import OBS_LOOKBACK_DAYS, check_health, report
+from croplib_dp.core.monitor import (
+    OBS_LOOKBACK_DAYS,
+    RUNS_WINDOW_H,
+    check_health,
+    db_size_line,
+    estimate_fallback_alerts,
+    report,
+)
 from croplib_dp.core.retention import COUNT_TABLES, estimate_db_mb
 from croplib_dp.io.db_stats import http_request_h, row_count, rpc_db_size
-from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
+from croplib_dp.io.dictionaries import RestGet, read_pages, read_table, rest_get
 from croplib_dp.io.github_issue import IssueAlerts, Request, http_request
 from croplib_dp.io.supabase_write import http_request as supabase_http_request
 
@@ -52,12 +59,18 @@ def read_state(
       (어제·작물 공통 값이 있는 지점 목록 → 운영 지점과 비교). 지점이 늘어도 매시간 호출 수가 늘지 않는다."""
     now = pd.Timestamp(now) if now is not None else kst_now()
     yesterday = (now - pd.Timedelta(days=1)).date()
-    runs = read_table(
+    # 최신 몇 줄이 아니라 최근 RUNS_WINDOW_H시간 전부(쪽 나눠 읽음):
+    # 예보 지점이 늘어도 지점마다 최신 줄이 들어온다
+    # (S4, 결정 0029). 한 회차가 지점 수만큼 줄을 만들므로 "최신 20줄"은 20곳을 넘으면 일부 지점을 못 본다.
+    since = (
+        pd.Timestamp(now).tz_localize("Asia/Seoul").tz_convert("UTC") - pd.Timedelta(hours=RUNS_WINDOW_H)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runs = read_pages(
         base,
         key,
         "forecast_runs",
         http,
-        f"select={RUN_COLS}&collector=eq.{COLLECTOR}&order=run_at.desc&limit=20",
+        f"select={RUN_COLS}&collector=eq.{COLLECTOR}&run_at=gte.{since}&order=run_at.desc,stn_id",
     )
     # 수집하는 지점(has_forecast)만 본다. 수집하지 않는 지점은 관측이 없는 게 정상이다 (#33).
     # 전 지점으로 넓힐 때(#28)는 has_forecast 만 켜면 감시가 따라간다.
@@ -102,6 +115,14 @@ def read_state(
         # 예보 지점의 격자 점검(결정 0025). 같은 stations 읽기에 칸만 더했으므로 호출 수는 그대로다.
         # 답에 격자 칸 자체가 없으면(칸을 고르지 않은 읽기) 점검하지 않는다.
         grid_status={str(st["stn_id"]): check_station_grid(st).status for st in collected if "grid_nx" in st},
+        # 최근 회차 기록이 있어야 하는 예보 지점: has_forecast + DB 격자 있음
+        # (격자가 비면 예보를 건너뛰어 줄이 없는 게 정상).
+        # 격자 칸이 답에 없는 읽기면 기다리는 지점이 없다고 본다(전과 같이 점검하지 않음).
+        expected_run_stations=[
+            str(st["stn_id"])
+            for st in collected
+            if st.get("grid_nx") is not None and st.get("grid_ny") is not None
+        ],
     )
     if obs_all:
         collected_ids = {str(st["stn_id"]) for st in collected}
@@ -171,8 +192,13 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         db_size_error=state.get("db_size_error"),
         grid_status=state.get("grid_status"),
         obs_last=state.get("obs_last"),
+        expected_run_stations=state.get("expected_run_stations"),
     )
+    alerts += estimate_fallback_alerts(state.get("db_size"))  # 정확한 값을 못 읽고 추정으로 떨어졌으면 경고
     text = report(alerts, now)
+    line = db_size_line(state.get("db_size"), state.get("db_size_error"))
+    if line:  # 경고가 없어도 매번 DB 크기 한 줄(정확/추정 구분)을 남긴다
+        text += "\n" + line
     action = alerts_sink.sync([a.key for a in alerts], text) if alerts_sink is not None else "dry"
     return text, action
 

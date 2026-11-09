@@ -61,7 +61,8 @@ from croplib_dp.core.outlook import (
     service_outlook,
     wb_frame,
 )
-from croplib_dp.core.retention import ROW_BYTES
+from croplib_dp.core.retention import ROW_BYTES, raw_prefix
+from croplib_dp.core.retention import raw_path as storage_raw_path
 from croplib_dp.core.soil_water import MissingPrior, soil_water_rows, window_needs_prior
 from croplib_dp.core.water_balance import observed_water_balance
 from croplib_dp.io import kma
@@ -86,6 +87,8 @@ AVAIL_MIN = 10  # 발표 10분 뒤부터 제공(활용가이드)
 DEADLINE_MIN = 90  # 마감 = 발표 + 90분 (03:30, 18:30). cropwater 2026-10-15 결정
 RETRY_MIN = (0, 5, 10, 15, 20, 30, 45, 60, 80)  # 회차 시작(발표 + 10분)부터의 재시도 시각(분)
 CATCHUP_H = 24  # 함께 받는 앞선 발표 범위(시간)
+# 대표 밖(is_representative = false) 예보 지점이 받는 앞선 발표 수(대표는 8개 그대로, 결정 0029 ④)
+CATCHUP_NONREP_N = 2
 COLLECTOR = "actions"
 SOIL_UPLOAD_DAYS = 14  # 평소 회차에서 올리는 최근 일수 (--soil-backfill 이면 그해 1/1부터 전체)
 OBS_ASOS_RETRY_S = (30, 90)  # 관측만 하는 지점의 ASOS 재시도(모두 3번): 대표 지점의 (30, 90, 180)보다 짧게
@@ -184,8 +187,21 @@ class RunLog:
 class ForecastCollector:
     """격자 하나의 단기예보를 받는다. 받은 발표는 계산에 쓸 항목만(usable_items) 모아 둔다."""
 
-    def __init__(self, key: str, nx: int, ny: int, http: kma.Http, clock: Clock, log: RunLog):
+    def __init__(
+        self,
+        key: str,
+        nx: int,
+        ny: int,
+        http: kma.Http,
+        clock: Clock,
+        log: RunLog,
+        representative: bool = True,
+    ):
         self.key, self.nx, self.ny, self.http, self.clock, self.log = key, int(nx), int(ny), http, clock, log
+        # 대표 10곳은 앞선 발표 8개·원문 전부(`fcst/`),
+        # 대표 밖은 앞선 발표 2개·서비스 발표 원문만(`fcst-ext/`, 90일)
+        self.representative = representative
+        self.service_issue: pd.Timestamp | None = None
         self.issues: dict[pd.Timestamp, pd.DataFrame] = {}
         self.complete8: dict[pd.Timestamp, bool] = {}
         self.raw_pages: dict[pd.Timestamp, list[bytes]] = {}  # 계산에 쓴 발표의 응답 원문 (Storage 보관용)
@@ -215,12 +231,16 @@ class ForecastCollector:
     def catch_up(self, slot: Any) -> int:
         """앞선 CATCHUP_H 시간 안에 아직 받지 않은 발표를 한 번씩(가장 최근부터)"""
         slot = pd.Timestamp(slot)
-        got = 0
+        got, asked = 0, 0
+        limit = None if self.representative else CATCHUP_NONREP_N  # 대표 밖은 가장 최근 앞선 발표 몇 개만
         for back in range(3, CATCHUP_H + 1, 3):
             iss = slot - pd.Timedelta(hours=back)
             if iss.hour not in ISSUE_HOURS or iss in self.issues or self.fatal:
                 continue
+            if limit is not None and asked >= limit:
+                break
             st, _ = self.get_issue(iss, attempt=1)
+            asked += 1
             got += st in ("ok", "partial")
         return got
 
@@ -228,6 +248,7 @@ class ForecastCollector:
         """서비스 발표를 마감까지 받기. wait=False면 지금 한 번만(시험 실행).
         반환 dict(received_at, complete8, required_ok, attempts, last, late)"""
         issue = pd.Timestamp(issue)
+        self.service_issue = issue
         start, deadline = slot_times(issue)
         out = dict(received_at=None, complete8=False, required_ok=False, attempts=0, last="", late=False)
         now = self.clock.now()
@@ -264,16 +285,21 @@ class ForecastCollector:
         return out
 
     def raw_path(self, issue: Any) -> str:
-        """Storage 버킷 raw 안의 위치: fcst/<격자>/<연>/<월>/<발표>.json.gz
+        """Storage 버킷 raw 안의 위치: 대표 fcst/<격자>/<연>/<월>/<발표>.json.gz, 대표 밖 fcst-ext/…(90일).
         발표마다 한 파일이고, 다시 받으면 덮어쓴다."""
-        issue = pd.Timestamp(issue)
-        return f"fcst/{self.nx}_{self.ny}/{issue:%Y}/{issue:%m}/{issue:%Y%m%d_%H%M}.json.gz"
+        return storage_raw_path(raw_prefix(self.representative), f"{self.nx}_{self.ny}", pd.Timestamp(issue))
+
+    def keeps_raw(self, issue: Any) -> bool:
+        """이 발표의 원문을 Storage에 올리나: 대표는 받은 발표 전부, 대표 밖은 서비스 발표만(결정 0029)."""
+        return self.representative or self.service_issue is None or pd.Timestamp(issue) == self.service_issue
 
     def raw_files(self) -> dict[str, bytes]:
         """계산에 쓴 발표마다 응답 원문(여러 쪽)을 한 파일로 압축.
         단기예보 API는 지난 하루치만 주므로 여기 쌓아 둔다."""
         out = {}
         for issue, pages in self.raw_pages.items():
+            if not self.keeps_raw(issue):
+                continue
             doc = dict(
                 issue=f"{issue:%Y-%m-%d %H:%M}",
                 grid=f"{self.nx}_{self.ny}",
@@ -304,7 +330,10 @@ def slot_result(col: dict, svc: dict) -> str:
         return "실패"
     if col.get("late") and col.get("required_ok") and not svc.get("backup"):
         return "지연 수집"
-    if col.get("complete8") and not svc.get("backup") and svc.get("rs_method") == svc.get("rs_base", "S4"):
+    # 계산 조건이 없는 지점(calc=False)은 3일 전망을 만들지 않아 일사 방식(rs_method)이 비어 있다.
+    # 그래도 서비스 발표를 정시에 다 받았으면 정시 성공이다(안 그러면 slot_done 이 영영 안 끝난다, 결정 0029)
+    rs_ok = (not svc.get("calc", True)) or svc.get("rs_method") == svc.get("rs_base", "S4")
+    if col.get("complete8") and not svc.get("backup") and rs_ok:
         return "정시 성공"
     if svc.get("backup"):
         return "백업: 직전 발표"
@@ -391,6 +420,11 @@ class SlotResult:
     )  # 실패는 아니지만 알릴 것(격자 비어 있음·다름 결정 0025, 관측 전용 지점 문제 결정 0026)
     uploaded: bool = False
     contract_checked: bool = False  # 쓰지 않는 시험 실행에서 계약 검사를 미리 돌렸나(결정 0028)
+    # 한 회차 단계별 시간·지점 수(요약에 기록, S4 켜기 단계마다 실측하려고 — 결정 0029)
+    fc_seconds: float = 0.0
+    fc_n: int = 0
+    obs_seconds: float = 0.0
+    obs_n: int = 0
 
     @property
     def failed(self) -> bool:
@@ -457,7 +491,9 @@ def run_station(
         )
         s3, s4 = load_s3_coef(stn_id), load_s4_coef(stn_id)
         err = pooled_errors(err_all, stn_id)
-    svc = dict(ok=forecast, backup=None, rs_method=None, src_run=None, obs_prev=None, error="")
+    svc = dict(
+        ok=forecast, backup=None, rs_method=None, src_run=None, obs_prev=None, error="", calc=bool(scen)
+    )
     if forecast:
         svc["rs_base"] = "S4" if len(s4) else "S3"  # 하늘상태 계수가 없는 지점은 S3가 평소 방식
     if forecast and collector.fatal:
@@ -598,7 +634,15 @@ def _start_day(ol: dict) -> dt.date:
 
 def _raw_path(collector: "ForecastCollector", issue: Any) -> str | None:
     issue = pd.Timestamp(issue)
-    return collector.raw_path(issue) if issue in collector.raw_pages else None
+    # 대표 밖은 서비스 발표 원문만 올리므로, 대신 쓴 앞선 발표를 가리키면 없는 파일이 된다
+    return collector.raw_path(issue) if issue in collector.raw_pages and collector.keeps_raw(issue) else None
+
+
+def is_representative(st: dict) -> bool:
+    """대표 10곳인가(`stations.is_representative`, 결정 0029 ②).
+    칸이 없으면 대표로 본다 — 대표의 앞선 발표·원문을
+    줄이지 않는 안전한 쪽. (실제 DB에는 칸이 있고 기본 거짓이다.)"""
+    return bool(st.get("is_representative", True))
 
 
 def collect_stations(d: Dictionaries) -> list[str]:
@@ -904,20 +948,32 @@ def run_slot(
             if (clock.now() - obs_t0).total_seconds() > OBS_STAGE_MAX_S:
                 skipped["cap"].append(stn_id)
                 continue
+            t_obs = clock.now()
             summary, prior_missing = run_obs_station(
                 stn_id, issue, d, key, http, clock, result, fetched_at, soil_backfill, soil_prior
             )
+            result.obs_seconds += (clock.now() - t_obs).total_seconds()
+            result.obs_n += 1
             if prior_missing:
                 skipped["prior"].append(stn_id)
             result.stations.append(summary)
             continue
+        t_fc = clock.now()
         scen = d.scenarios_for(stn_id, D.year)
         collector, col = None, None
         if st.get("has_forecast"):
             _grid_warning(stn_id, st, result)
         if forecast_ready(st):
             started = _iso(clock.now())
-            collector = ForecastCollector(key, st["grid_nx"], st["grid_ny"], http, clock, result.log)
+            collector = ForecastCollector(
+                key,
+                st["grid_nx"],
+                st["grid_ny"],
+                http,
+                clock,
+                result.log,
+                representative=is_representative(st),
+            )
             col = collector.collect_service(issue, wait=wait)
             col["started_at"] = started
         starts = [dt.date.fromisoformat(str(s["season_start"])[:10]) for s in scen]
@@ -952,6 +1008,8 @@ def run_slot(
         summary["asos_last"] = str(weather[-1]["date"]) if weather else None
         summary["asos_status"] = res.get("status") if res else "조회 안 함"
         result.stations.append(summary)
+        result.fc_seconds += (clock.now() - t_fc).total_seconds()
+        result.fc_n += 1
     if obs_set:
         _obs_warnings(d, result, skipped, prev - dt.timedelta(days=SOIL_UPLOAD_DAYS))
     return result
@@ -993,6 +1051,7 @@ def summary_text(r: SlotResult) -> str:
         lines += ["", "## 경고"] + [f"- {x}" for x in r.warnings]
     lines += [
         "",
+        timing_text(r),
         f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
         *(["계약 검사: 통과 (쓰지 않고 미리 검사함)"] if r.contract_checked and not r.problems else []),
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
@@ -1001,6 +1060,22 @@ def summary_text(r: SlotResult) -> str:
         growth_text(r),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _duration(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 60}분 {s % 60}초"
+
+
+def timing_text(r: SlotResult) -> str:
+    """한 회차의 단계별 시간·지점 수·호출 수. 예보 지점을 20곳씩 켤 때 회차 시간·호출 수를 실측하는 근거다."""
+    fcst = sum(1 for e in r.log.entries if e["kind"] == "fcst")
+    asos = sum(1 for e in r.log.entries if e["kind"] == "asos")
+    return (
+        f"단계: 예보 지점 {r.fc_n}곳 {_duration(r.fc_seconds)}"
+        f" · 관측 지점 {r.obs_n}곳 {_duration(r.obs_seconds)}"
+        f" · 예보 요청 {fcst}번(발표 단위, 쪽 수 제외) · ASOS {asos}번"
+    )
 
 
 def growth_text(r: SlotResult) -> str:
@@ -1053,6 +1128,7 @@ def brief_text(r: SlotResult) -> str:
             f"- 관측 전용 {len(obs)}곳: ASOS 성공 {len(obs) - bad} · 실패 {bad} · "
             f"토양 {sum(s.get('n_soil', 0) for s in obs)}줄"
         )
+    lines.append(timing_text(r))
     lines.append(
         f"DB 올리기: {'완료' if r.uploaded else '안 함'} · 전망 {len(r.water_outlook)}줄 · "
         f"요약 {len(r.water_outlook_summary)}줄 · 물수지 {len(r.water_balance_daily)}줄"
@@ -1192,17 +1268,28 @@ def slot_done(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -
     정시 성공이 아니면(지연·백업·실패) 다시 돈다 — 늦게라도 서비스 발표를 받으면 결과가 나아진다.
     **관측만 하는 지점(OBS_ALL_STATIONS)은 보지 않는다**(사용자 확정 2026-11-08, 결정 0026): 그 지점의 ASOS가
     계속 안 돼도 회차를 되풀이하지 않고, 감시의 "N일째" 경고(`obs`)로만 알린다."""
-    # 예보를 할 수 있는 지점(격자 있음)만 기다린다. 격자가 비어 있는 지점은 예보를 건너뛰므로 그 지점 때문에
-    # 같은 회차가 반복되면 안 된다(#28 문제 ④, 결정 0025).
-    stations = [s for s in collect_stations(d) if forecast_ready(d.stations[s])]
+    return bool(forecast_stations(d)) and not pending_forecast_stations(base, key, d, issue, http)
+
+
+def forecast_stations(d: Dictionaries) -> list[str]:
+    """회차 완료를 기다리는 예보 지점: has_forecast 이면서 예보를 할 수 있는(DB 격자 있음) 곳.
+    격자가 비어 있는 지점은 예보를 건너뛰므로 그 지점 때문에
+    같은 회차가 반복되면 안 된다(#28 문제 ④, 결정 0025)."""
+    return [s for s in collect_stations(d) if forecast_ready(d.stations[s])]
+
+
+def pending_forecast_stations(base: str, key: str, d: Dictionaries, issue: Any, http=rest_get) -> list[str]:
+    """이 회차에서 아직 '정시 성공'이 아닌 예보 지점(실패·지연·백업·기록 없음). 재실행은 이 지점만 다시 돈다
+    (사용자 확정 2026-11-09, 결정 0029 ③): 지점 하나가 실패해도 예보 지점 전부를 다시 돌지 않는다."""
+    stations = forecast_stations(d)
     if not stations:
-        return False
+        return []
     run_at = urllib.parse.quote(_iso(issue), safe="")
     rows = read_table(
         base, key, "forecast_runs", http, f"select=stn_id,result&run_at=eq.{run_at}&collector=eq.{COLLECTOR}"
     )
     ok = {str(r["stn_id"]) for r in rows if r["result"] == "정시 성공"}
-    return set(stations) <= ok
+    return [s for s in stations if s not in ok]
 
 
 def _env(name: str) -> str:
@@ -1252,9 +1339,21 @@ def main(argv: list[str] | None = None) -> int:
     d = load_dictionaries(base, svc)
     obs_all = obs_all_enabled()
     check_backfill_scope(d, stations, soil_backfill, obs_all)
-    if skip_if_done and slot_done(base, svc, d, issue):
-        print(f"{name} {issue:%Y-%m-%d %H:%M} 회차는 이미 정시 성공으로 끝났습니다. 다시 하지 않습니다.")
-        return 0
+    if skip_if_done:
+        if slot_done(base, svc, d, issue):
+            print(f"{name} {issue:%Y-%m-%d %H:%M} 회차는 이미 정시 성공으로 끝났습니다. 다시 하지 않습니다.")
+            return 0
+        # 일부만 정시 성공이면 나머지 지점만 다시 돈다(결정 0029 ③). 아무것도 못 했으면 지금처럼 전부 돈다.
+        ready = forecast_stations(d)
+        pending = pending_forecast_stations(base, svc, d, issue) if ready else []
+        if stations is None and pending and len(pending) < len(ready):
+            shown = ", ".join(pending[:10]) + (" …" if len(pending) > 10 else "")
+            print(
+                f"{name} {issue:%Y-%m-%d %H:%M} 회차: 정시 성공이 아닌 예보 지점만 다시 돕니다 — "
+                f"다시 도는 지점 {len(pending)}곳({shown}), "
+                f"이미 정시 성공한 {len(ready) - len(pending)}곳은 건너뜀"
+            )
+            stations = pending + (observation_only_stations(d) if obs_all else [])
     soil_prior = None
     if (
         obs_all and not soil_backfill

@@ -33,7 +33,14 @@ from typing import Any
 import pandas as pd
 
 from croplib_dp.core.krei import HORT_MONTH_ITEMS
-from croplib_dp.core.retention import DB_ERR_MB, DB_EST_ERR_MB, DB_EST_WARN_MB, DB_WARN_MB, db_level
+from croplib_dp.core.retention import (
+    DB_ERR_MB,
+    DB_EST_ERR_MB,
+    DB_EST_WARN_MB,
+    DB_WARN_MB,
+    S6_ISSUE,
+    db_level,
+)
 
 # 이보다 오래 갱신이 없으면 멈춤. 정상 최대 간격 약 16시간(02시 회차 → 17시 회차 마감 18:30) + 여유.
 # CropMon src/domain/freshness.ts STALE_AFTER_MS 와 같은 값이어야 함
@@ -43,6 +50,8 @@ BACKUP_RESULTS = ("지연 수집", "백업: 직전 발표", "백업: S3")
 HEAT_CHECK_AFTER_H = 12  # 적산온도는 09:20 에 한 번 수집 (재시도·늦은 시작 여유)
 KREI_CHECK_AFTER_DAY = 8  # 매달 8일 23:59 KST까지 여유, 9일(now.day > 8)부터 이번 달 원예 4부류 월보 확인
 MAX_NAMED = 10  # 경고 문구에 이름을 다 적는 지점 수의 한도
+# 감시가 읽는 회차 기록의 기간(시간). 지점별 최신 줄을 보려고 최신 몇 줄이 아니라 기간으로 읽는다
+RUNS_WINDOW_H = 48
 OBS_LOOKBACK_DAYS = 5  # 관측만 하는 지점의 표 최신성을 볼 때 읽는 날 수 (어제 포함). 없으면 "5일 넘게"
 
 
@@ -122,9 +131,44 @@ def _check_db_size(db_size: Mapping[str, Any]) -> list[Alert]:
     kind = "정확한 값" if exact else "줄 수로 추정한 값(정확한 값은 CropMon#77 db_size_bytes() 필요)"
     head = "DB 용량 오류선 초과" if level == "error" else "DB 용량 경고선 초과"
     lines = dict(warn=DB_WARN_MB if exact else DB_EST_WARN_MB, error=DB_ERR_MB if exact else DB_EST_ERR_MB)
-    todo = "전망 표 보관·삭제(retention)와 오래된 해 정리(S6)를 확인하세요"
+    todo = f"전망 표 보관·삭제(retention)와 오래된 해 정리(S6, {S6_ISSUE})를 확인하세요"
     return [
         Alert(level, "dbsize", f"{head} — {mb:.0f}MB ({kind}, 기준 {lines[level]:.0f}MB, 한도 500MB). {todo}")
+    ]
+
+
+def db_size_line(db_size: Mapping[str, Any] | None, db_size_error: str | None = None) -> str:
+    """감시가 매번 남기는 DB 크기 한 줄. 정확한 값(db_size_bytes())인지
+    줄 수로 추정한 값인지 로그에서 구분된다
+    (사용자 승인 2026-11-09). 크기를 안 넘긴 호출이면 빈 문자열."""
+    if db_size_error:
+        first_line = (str(db_size_error).strip().splitlines() or ["이유 없음"])[0]
+        return f"DB 크기: 읽지 못함 — {first_line}"
+    if db_size is None:
+        return ""
+    mb = float(db_size["mb"])
+    if db_size.get("exact"):
+        return (
+            f"DB 크기: {mb:.1f}MB (정확: db_size_bytes() 값)"
+            f" · 경고선 {DB_WARN_MB:.0f}MB·오류선 {DB_ERR_MB:.0f}MB"
+        )
+    return (
+        f"DB 크기: 약 {mb:.1f}MB (줄 수로 추정한 값 — db_size_bytes()를 쓰지 못함)"
+        f" · 경고선 {DB_EST_WARN_MB:.0f}MB·오류선 {DB_EST_ERR_MB:.0f}MB"
+    )
+
+
+def estimate_fallback_alerts(db_size: Mapping[str, Any] | None) -> list[Alert]:
+    """정확한 값을 못 읽고 줄 수 추정으로 떨어졌으면 경고(조용히 추정으로 가지 않는다)."""
+    if db_size is None or db_size.get("exact"):
+        return []
+    return [
+        Alert(
+            "warn",
+            "dbsize",
+            "DB 크기를 정확한 값으로 읽지 못함 — db_size_bytes() 호출이 안 되어(함수 없음 또는 401·403·404) "
+            "줄 수 추정을 쓰는 중입니다. CropMon 함수와 service_role 권한을 확인하세요",
+        )
     ]
 
 
@@ -141,6 +185,7 @@ def check_health(
     db_size_error: str | None = None,
     grid_status: Mapping[str, str] | None = None,
     obs_last: Mapping[str, dt.date | None] | None = None,
+    expected_run_stations: Iterable[str] | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
@@ -152,7 +197,10 @@ def check_health(
     grid_status: 예보 지점별 격자 점검 결과(core/grid.check_station_grid 의 status).
     넘기지 않거나 비면 보지 않는다.
     obs_last: 관측만 하는 지점별 soil_water_daily 가장 최근 날짜(최근 OBS_LOOKBACK_DAYS일 안, 없으면 None).
-    넘기지 않거나(스위치 꺼짐) 비면 보지 않는다."""
+    넘기지 않거나(스위치 꺼짐) 비면 보지 않는다.
+    expected_run_stations: 최근 회차 기록이 있어야 하는 예보 지점(has_forecast + DB 격자 있음).
+    이 지점인데 기록이
+    하나도 없으면 경고(S4: 지점이 늘면 감시가 지점별 최신 줄을 읽는다). 넘기지 않으면 보지 않는다."""
     names = station_names or {}
     now = pd.Timestamp(now)
     alerts: list[Alert] = []
@@ -164,6 +212,18 @@ def check_health(
         alerts.append(
             Alert("error", "stale", "회차 기록이 하나도 없습니다 — 예약 수집이 돌았는지 확인하세요")
         )
+    if expected_run_stations is not None and by_stn:
+        no_run = sorted(set(map(str, expected_run_stations)) - set(by_stn))
+        if no_run:
+            alerts.append(
+                Alert(
+                    "warn",
+                    "stale",
+                    f"예보 지점 회차 기록 없음(최근 {RUNS_WINDOW_H}시간) — {named(no_run, names)}: "
+                    "방금 켠 지점이면 다음 회차(02·17시)까지는 정상입니다(켠 직후),"
+                    " 그 뒤에도 없으면 수집을 확인하세요",
+                )
+            )
     if collect_count == 0:
         alerts.append(Alert("error", "stale", "수집 지점이 0곳 — 지점 사전 has_forecast 확인"))
     if heat_last is not None and not heat_last:

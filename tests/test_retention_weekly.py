@@ -274,8 +274,8 @@ def test_the_old_auto_flag_is_gone_and_manual_modes_are_unchanged():
         assert mode in src
 
 
-def test_cli_weekly_default_cap_is_8000_rows():
-    assert RT.DEFAULT_MAX_ROWS == 8000
+def test_cli_weekly_default_cap_is_20000_rows():  # S4 결정 ⑤(2026-11-09): 8,000 → 20,000
+    assert RT.DEFAULT_MAX_ROWS == 20000
 
 
 # ── 워크플로 설정 (글자 검사) ──────────────────────────────────────────
@@ -423,7 +423,7 @@ def test_keepalive_re_enables_the_retention_schedule_too():
 
 
 # ── 문서 ────────────────────────────────────────────────────────────────
-def test_decision_document_says_the_cap_goes_up_with_s4_and_that_storage_1gb_is_confirmed():
+def test_decision_document_says_the_cap_was_raised_in_s4a_and_that_storage_1gb_is_confirmed():
     d = (ROOT / "docs" / "decisions" / "0022-retention-archive.md").read_text(encoding="utf-8")
-    assert "S4(예보 확대) 때 함께 올린다" in d
+    assert "S4-a에서 20,000으로 올렸다" in d and "20,000줄" in d  # 2026-11-09 S4 결정 ⑤(결정 0029)
     assert "1GB 확인됨" in d and "한도 1GB 가정" not in d and "1GB는 가정" not in d

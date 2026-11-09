@@ -187,7 +187,8 @@ def test_read_state_and_run(monkeypatch):
         table, q = u.path.split("/rest/v1/")[1], dict(urllib.parse.parse_qsl(u.query))
         seen.append((table, q))
         if table == "forecast_runs":
-            assert q["collector"] == "eq.actions" and q["order"] == "run_at.desc"
+            assert q["collector"] == "eq.actions" and q["order"] == "run_at.desc,stn_id"
+            assert q["run_at"].startswith("gte.")  # 최신 20줄이 아니라 최근 48시간 전부(지점별 최신 줄)
             return 200, json.dumps(runs).encode()
         if table == "stations":
             return 200, json.dumps(
