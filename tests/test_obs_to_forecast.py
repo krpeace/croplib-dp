@@ -74,7 +74,7 @@ def test_soil_rows_are_identical_except_the_7_day_figures_in_the_first_week_of_m
 
 @pytest.mark.xfail(
     strict=True,
-    reason="3/1 근처에 ETo 결측이 있으면 앞 7일 평균으로 채우는데, 3/1부터 받으면 2월 자료가 없어 채운 값이 다르다(S4-b 보고)",
+    reason="3/1 근처에 ETo 결측이 있으면 앞 7일 평균으로 채우는데, 3/1부터 받으면 2월 자료가 없어 채운 값이 다르다(S4-b 보고). 계산상 차이는 남지만 대표 밖 지점은 3월 초 줄을 올리지 않으므로 DB에는 영향이 없어 수용(결정 0026 12번)",
 )
 def test_filled_eto_in_early_march_matches():
     full, rep = _both(_items(eto_gap={dt.date(2026, 3, 2), dt.date(2026, 3, 3)}))
@@ -91,25 +91,61 @@ def test_the_filled_eto_difference_stays_inside_the_filled_days():
     assert all(a[d]["filled"] and b[d]["filled"] for d in differing)  # 둘 다 '채운 값' 표시가 있다
 
 
+def _forecast_run_both():
+    clock = FakeClock("2026-06-10 02:20")
+    api = FakeApi(clock, ISSUES)
+    return W.run_slot(
+        "아침", ISSUE, _dicts_with_nonrep(), KEY, http=api, clock=clock, stations=["101", "301"]
+    )
+
+
 def _forecast_run(station):
     clock = FakeClock("2026-06-10 02:20")
     api = FakeApi(clock, ISSUES)
     return W.run_slot("아침", ISSUE, _dicts_with_nonrep(), KEY, http=api, clock=clock, stations=[station])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="대표 밖 예보 지점이 평소 회차마다 weather_daily를 3/1~어제 전부(약 250줄) 다시 올린다 — 소급해 둔 3월 초 줄을 "
-    "3/1부터 계산한 값으로 덮어쓰고 쓰기량이 늘어난다. 관측만 하는 지점처럼 최근 14일만 올리는 것이 바람(S4-b 보고)",
-)
 def test_a_non_representative_forecast_station_uploads_only_the_recent_weather_window():
+    """계산 조건이 없는 대표 밖 지점은 관측·예보 구분 없이 weather_daily 도 최근 14일 창만 올린다(결정 0026 12번).
+    3/1부터 받아 계산은 하지만(soil_water_daily 가 3/1부터 계산) 올리는 줄은 창뿐이라, 소급해 둔 3월 초 줄을
+    덮어쓰지 않고 회차마다 250줄씩 다시 쓰지도 않는다. (S4-b 에서 xfail 이던 것이 풀렸다.)"""
     r = _forecast_run("301")
-    rows = [x for x in r.weather_daily if x["stn_id"] == "301"]
-    assert len(rows) <= W.SOIL_UPLOAD_DAYS
+    days = sorted(x["date"] for x in r.weather_daily if x["stn_id"] == "301")
+    assert days[0] == "2026-05-27" and days[-1] == "2026-06-09" and len(days) == W.SOIL_UPLOAD_DAYS
+    soil_days = {x["date"] for x in r.soil_water_daily if x["stn_id"] == "301"}
+    assert min(soil_days) == "2026-05-27"  # soil_water_daily 도 같은 14일 창(전과 같음)
+
+
+def test_backfill_on_a_non_representative_forecast_station_still_uploads_the_whole_year():
+    """소급(--soil-backfill)은 창이 없다: 관측만 하는 지점과 같이 그해 1/1부터 전부."""
+    clock = FakeClock("2026-06-10 02:20")
+    r = W.run_slot(
+        "아침", ISSUE, _dicts_with_nonrep(), KEY, http=FakeApi(clock, ISSUES), clock=clock,
+        stations=["301"], soil_backfill=True,
+    )  # fmt: skip
+    days = sorted(x["date"] for x in r.weather_daily if x["stn_id"] == "301")
+    assert days[0] == "2026-01-01" and days[-1] == "2026-06-09" and len(days) == 160
 
 
 def test_the_representative_still_uploads_the_season_from_march():
     """대표 지점(계산 조건·전망이 있음)은 3/1부터 전부 올린다 — 이 규칙은 그대로다."""
     r = _forecast_run("101")
-    rows = [x for x in r.weather_daily if x["stn_id"] == "101"]
-    assert min(x["date"] for x in rows) <= "2026-04-01" and len(rows) > W.SOIL_UPLOAD_DAYS
+    days = sorted(x["date"] for x in r.weather_daily if x["stn_id"] == "101")
+    assert days[0] == "2026-03-01" and days[-1] == "2026-06-09" and len(days) == 101
+
+
+def test_adding_a_non_representative_station_changes_nothing_for_the_representative():
+    """대표 10곳 동작은 그대로: 대표 밖 지점을 같이 돌려도 대표의 모든 결과 줄이 똑같다."""
+    both = _forecast_run_both()
+    alone = _forecast_run("101")
+    for table in (
+        "weather_daily",
+        "soil_water_daily",
+        "water_balance_daily",
+        "water_outlook",
+        "water_outlook_summary",
+        "forecast_runs",
+    ):
+        a = [x for x in getattr(both, table) if x.get("stn_id", "101") == "101"]
+        b = getattr(alone, table)
+        assert a and a == b, table
