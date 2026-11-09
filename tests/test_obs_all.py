@@ -649,6 +649,9 @@ def test_main_normal_run_reads_the_db_start_once_for_the_observation_only_statio
 
     monkeypatch.setattr(W, "load_soil_prior", prior)
     monkeypatch.setattr(W, "slot_done", lambda *a, **k: False)
+    monkeypatch.setattr(
+        W, "pending_forecast_stations", lambda base, key, d, issue, http=None: W.forecast_stations(d)
+    )
     W.main(["--slot", "2026-06-10 02", "--out", str(tmp_path), "--event", "schedule",
             "--input-stations", "", "--input-backfill", "", "--input-dry-run", ""])  # fmt: skip
     assert len(seen) == 1 and seen[0][0] == ["216", "301", "302", "303"] and seen[0][1] == PRIOR_DAY
@@ -666,6 +669,9 @@ def test_main_with_the_switch_off_does_not_read_the_start_and_runs_forecast_stat
         W, "load_soil_prior", lambda *a, **k: (_ for _ in ()).throw(AssertionError("꺼짐인데 읽었다"))
     )
     monkeypatch.setattr(W, "slot_done", lambda *a, **k: False)
+    monkeypatch.setattr(
+        W, "pending_forecast_stations", lambda base, key, d, issue, http=None: W.forecast_stations(d)
+    )
     W.main(["--slot", "2026-06-10 02", "--out", str(tmp_path), "--event", "schedule",
             "--input-stations", "", "--input-backfill", "", "--input-dry-run", ""])  # fmt: skip
     assert not any("stnIds=301" in u for u in api.calls)

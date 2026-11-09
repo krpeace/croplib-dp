@@ -44,9 +44,8 @@ BUCKET = "raw"
 TABLES = ("water_outlook", "water_outlook_summary")
 RUN_CHUNK = 50  # 한 번에 지우는 회차 수
 XZ_SAMPLE = 200
-DEFAULT_MAX_ROWS = (
-    8000  # 주간 자동 삭제가 한 번에 지울 수 있는 줄 상한(지금 주 3,500줄 정도). 지점이 늘면 함께 올린다
-)
+DEFAULT_MAX_ROWS = 20000  # 주간 자동 삭제가 한 번에 지울 수 있는 줄 상한. 대표 밖 87곳 전망(S5)까지 가면 주 약 15,700줄(결정 0029 ⑤)
+S6_NOTE = R.S6_NOTE  # 용량 경고 이슈 본문에 적어 경고가 울리면 S6(오래된 해 정리)로 바로 연결(결정 0029)
 ALERT_TITLE = "[용량·보관 경고] 저장 공간과 전망 표 보관"
 ALERT_LABEL = "용량 경고"
 OUT_NAME = "retention"
@@ -669,7 +668,7 @@ def weekly_markdown(res: WeeklyResult) -> str:
         L.append(
             f"| **합계** | **{res.storage_mb:.1f}MB** (경고 {R.STORAGE_WARN_MB:.0f} / 오류 {R.STORAGE_ERR_MB:.0f}MB) |"
         )
-    L += ["", alert_report(res.alerts, res.now)]
+    L += ["", alert_report(res.alerts, res.now), "", f"> {S6_NOTE}"]
     return chr(10).join(L) + chr(10)
 
 
