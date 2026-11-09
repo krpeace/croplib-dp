@@ -987,7 +987,15 @@ def run_slot(
         )
         if collector is not None and collector.fatal:
             weather = []
+        # 계산 조건이 없는 대표 밖 지점은 관측만 하는 지점과 같이 weather_daily 도 최근 14일 창만 올린다
+        # (결정 0026 12번). 계산은 3/1부터 받은 기상값 전체로 하지만, 매 회차 3/1~어제를 다시 올리면
+        # 소급해 둔 3월 초 줄을 덮어쓰고 쓰기량이 늘어난다(S4-b). 소급(--soil-backfill)은 창이 없다.
+        # 대표 10곳은 그대로(전망에 전체 시즌이 필요하다).
+        window_only = not scen and not is_representative(st) and not soil_backfill
+        upload_from = prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1)
         for w in weather:
+            if window_only and w["date"] < upload_from:
+                continue
             result.weather_daily.append(
                 _jsonable(
                     dict(
