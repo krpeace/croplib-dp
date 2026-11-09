@@ -390,6 +390,7 @@ class SlotResult:
         default_factory=list
     )  # 실패는 아니지만 알릴 것(격자 비어 있음·다름 결정 0025, 관측 전용 지점 문제 결정 0026)
     uploaded: bool = False
+    contract_checked: bool = False  # 쓰지 않는 시험 실행에서 계약 검사를 미리 돌렸나(결정 0028)
 
     @property
     def failed(self) -> bool:
@@ -993,6 +994,7 @@ def summary_text(r: SlotResult) -> str:
     lines += [
         "",
         f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
+        *(["계약 검사: 통과 (쓰지 않고 미리 검사함)"] if r.contract_checked and not r.problems else []),
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
         f"water_balance_daily {len(r.water_balance_daily)}, soil_water_daily {len(r.soil_water_daily)}, "
         f"water_outlook {len(r.water_outlook)}, water_outlook_summary {len(r.water_outlook_summary)}",
@@ -1113,6 +1115,17 @@ def check_contract(
 
 def _run_key(row: dict) -> tuple:
     return (pd.Timestamp(row["run_at"]), str(row["stn_id"]), row["collector"])
+
+
+def precheck_contract(
+    r: SlotResult, taw_by_scenario: dict[str, float], rs_source_column: bool = True
+) -> SlotResult:
+    """시험 실행(DB에 쓰지 않음)에서 쓰기 직전과 같은 계약 검사를 미리 돌린다(결정 0028).
+    어긋나면 `r.problems`에 남겨 요약의 "## 문제"와 실패 종료로 알린다. 아무것도 쓰지 않는다.
+    rs_source_column=True(칸 있음)로 검사하므로 DB에 칸이 없을 때 쓰기가 그 칸만 빼는 것은 보지 않는다."""
+    r.problems += check_contract(r, taw_by_scenario, rs_source_column)
+    r.contract_checked = True
+    return r
 
 
 def publish(
@@ -1276,6 +1289,8 @@ def main(argv: list[str] | None = None) -> int:
             rs_source_column=rs_ok,
             rs_source_note=rs_note,
         )
+    else:
+        precheck_contract(r, taw_map(d))
     out = write_outputs(r, Path(a.out))
     print(summary_text(r))
     print(f"결과 폴더: {out}")
