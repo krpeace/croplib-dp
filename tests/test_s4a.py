@@ -64,14 +64,16 @@ def test_is_representative_reads_the_column_and_defaults_to_representative_when_
 
 # ── 앞선 발표 8 → 2 ──────────────────────────────────────────────────────
 def test_representative_still_asks_for_eight_earlier_issues_but_a_non_representative_only_two():
+    """S5-a(결정 0030)에서 대표 밖의 앞선 발표 2개를 "가장 최근 2개(3·6시간 전)"에서 "필요한 2개"로 바꿨다:
+    02시 회차는 3시간 전(23시) + 24시간 전(어제 아침 발표). 개수는 그대로 2개."""
     r, api = _run()
     assert len(_issues_asked(api, 73, 134)) == 1 + 8  # 대표 101: 서비스 발표 1 + 앞선 8
     asked = _issues_asked(api, 73, 135)
     assert asked == {
         "202606100200",
         "202606092300",
-        "202606092000",
-    }  # 대표 밖 301: 서비스 발표 + 가장 최근 앞선 2개
+        "202606090200",
+    }  # 대표 밖 301: 서비스 발표 + 필요한 앞선 2개(3시간 전·24시간 전)
     assert [x["stn_id"] for x in r.forecast_runs] == ["101", "301"]
 
 
@@ -201,8 +203,8 @@ def test_summary_reports_stage_times_and_request_counts():
 
 
 # ── retention 상한 ───────────────────────────────────────────────────────
-def test_retention_weekly_cap_is_20000_and_the_report_points_to_s6():
-    assert RT.DEFAULT_MAX_ROWS == 20000
+def test_retention_weekly_cap_is_raised_and_the_report_points_to_s6():
+    assert RT.DEFAULT_MAX_ROWS == 40000  # S4 결정 ⑤ 20,000 → S5-a 40,000(결정 0030)
     assert "#86" in RT.S6_NOTE and "S6" in RT.S6_NOTE
 
 

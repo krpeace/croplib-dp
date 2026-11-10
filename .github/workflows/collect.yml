@@ -9,6 +9,9 @@ name: collect
 # 변수를 지우면 바로 대표 10곳으로 돌아간다). 켜기 전에 CropMon 선행 조건(#76)과 소급이 끝나 있어야 한다.
 # 아래 수동 실행 입력(지점·소급·시험 실행)은 workflow_dispatch 에서만 쓰이고, 예약 실행은 입력과 상관없이 늘 똑같다
 # (판단은 파이썬 dispatch_options, 시험으로 고정).
+#
+# 대표 밖 지점에 3일 전망·물수지를 켜는 스위치(결정 0030, S5): Actions 변수 NONREP_SCENARIOS=true 일 때만 켜진다(기본
+# 꺼짐, 시드된 계산 조건이 있어도 꺼져 있으면 무시). 켜기 전에 S5-a 병합과 CropMon 시드 순서를 지켜야 한다(#87).
 
 on:
   schedule:
@@ -36,6 +39,16 @@ on:
         type: boolean
         required: false
         default: false
+      wb_backfill:
+        description: "(소급) 대표 밖 지점 water_balance_daily 를 작기 시작부터 올린다(예보·전망 없이 ASOS만). stations 필수(20곳 이하). 먼저 dry_run"
+        type: boolean
+        required: false
+        default: false
+      nonrep_scenarios:
+        description: "(시험) dry_run 과 함께만: 변수 없이도 대표 밖 지점 전망을 계산해 본다(DB에 쓰지 않음)"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: collect
@@ -54,10 +67,13 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       OBS_ALL_STATIONS: ${{ vars.OBS_ALL_STATIONS }}
+      NONREP_SCENARIOS: ${{ vars.NONREP_SCENARIOS }}
       EVENT: ${{ github.event_name }}
       IN_STATIONS: ${{ inputs.stations }}
       IN_BACKFILL: ${{ inputs.soil_backfill }}
       IN_DRY_RUN: ${{ inputs.dry_run }}
+      IN_WB_BACKFILL: ${{ inputs.wb_backfill }}
+      IN_NONREP: ${{ inputs.nonrep_scenarios }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -81,7 +97,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --event "$EVENT" --input-stations "$IN_STATIONS" --input-backfill "$IN_BACKFILL" --input-dry-run "$IN_DRY_RUN" 2> err.txt
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --event "$EVENT" --input-stations "$IN_STATIONS" --input-backfill "$IN_BACKFILL" --input-dry-run "$IN_DRY_RUN" --input-wb-backfill "$IN_WB_BACKFILL" --input-nonrep-scenarios "$IN_NONREP" 2> err.txt
           code=$?
           cat err.txt >&2
           exit $code
@@ -91,7 +107,7 @@ jobs:
         run: |
           sleep 300
           set +e
-          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --event "$EVENT" --input-stations "$IN_STATIONS" --input-backfill "$IN_BACKFILL" --input-dry-run "$IN_DRY_RUN" 2> err.txt
+          python -m croplib_dp.collectors.water --slot "${{ steps.slot.outputs.slot }}" --out out --event "$EVENT" --input-stations "$IN_STATIONS" --input-backfill "$IN_BACKFILL" --input-dry-run "$IN_DRY_RUN" --input-wb-backfill "$IN_WB_BACKFILL" --input-nonrep-scenarios "$IN_NONREP" 2> err.txt
           code=$?
           cat err.txt >&2
           exit $code

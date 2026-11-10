@@ -87,8 +87,15 @@ AVAIL_MIN = 10  # 발표 10분 뒤부터 제공(활용가이드)
 DEADLINE_MIN = 90  # 마감 = 발표 + 90분 (03:30, 18:30). cropwater 2026-10-15 결정
 RETRY_MIN = (0, 5, 10, 15, 20, 30, 45, 60, 80)  # 회차 시작(발표 + 10분)부터의 재시도 시각(분)
 CATCHUP_H = 24  # 함께 받는 앞선 발표 범위(시간)
-# 대표 밖(is_representative = false) 예보 지점이 받는 앞선 발표 수(대표는 8개 그대로, 결정 0029 ④)
-CATCHUP_NONREP_N = 2
+# 대표 밖(is_representative = false) 예보 지점이 받는 앞선 발표(몇 시간 전): "필요한 것만"
+# (결정 0030, S4 결정 ④ 재결정). 어제를 채우려면 그날 아침(02시) 발표 D+0이 필요하다(core/outlook.py):
+# 02시 회차는 어제의 02시 발표(24시간 전),
+# 17시 회차는 오늘의 02시 발표(15시간 전). 3시간 전은 서비스 발표가 늦을 때 직전 발표로 대신하는 용도.
+# 대표 10곳은 24시간 안 8개 그대로(CATCHUP_H).
+NONREP_CATCHUP_BACK = {2: (3, 24), 17: (3, 15)}
+NONREP_CATCHUP_DEFAULT = (3, 6)  # 02시·17시가 아닌 회차(시험 실행 등)
+WB_BACKFILL_MAX = 20  # water_balance_daily 소급은 한 번에 대표 밖 지점 20곳까지(결정 0030)
+NONREP_SWITCH = "NONREP_SCENARIOS"  # Actions 변수: true 일 때만 대표 밖 지점에 3일 전망·물수지(기본 꺼짐)
 COLLECTOR = "actions"
 SOIL_UPLOAD_DAYS = 14  # 평소 회차에서 올리는 최근 일수 (--soil-backfill 이면 그해 1/1부터 전체)
 OBS_ASOS_RETRY_S = (30, 90)  # 관측만 하는 지점의 ASOS 재시도(모두 3번): 대표 지점의 (30, 90, 180)보다 짧게
@@ -231,16 +238,18 @@ class ForecastCollector:
     def catch_up(self, slot: Any) -> int:
         """앞선 CATCHUP_H 시간 안에 아직 받지 않은 발표를 한 번씩(가장 최근부터)"""
         slot = pd.Timestamp(slot)
-        got, asked = 0, 0
-        limit = None if self.representative else CATCHUP_NONREP_N  # 대표 밖은 가장 최근 앞선 발표 몇 개만
-        for back in range(3, CATCHUP_H + 1, 3):
+        got = 0
+        # 대표 10곳은 24시간 안 앞선 발표 전부(3시간 간격 8개), 대표 밖은 필요한 것만(NONREP_CATCHUP_BACK)
+        backs = (
+            range(3, CATCHUP_H + 1, 3)
+            if self.representative
+            else NONREP_CATCHUP_BACK.get(slot.hour, NONREP_CATCHUP_DEFAULT)
+        )
+        for back in backs:
             iss = slot - pd.Timedelta(hours=back)
             if iss.hour not in ISSUE_HOURS or iss in self.issues or self.fatal:
                 continue
-            if limit is not None and asked >= limit:
-                break
             st, _ = self.get_issue(iss, attempt=1)
-            asked += 1
             got += st in ("ok", "partial")
         return got
 
@@ -425,6 +434,9 @@ class SlotResult:
     fc_n: int = 0
     obs_seconds: float = 0.0
     obs_n: int = 0
+    calc_seconds: float = 0.0  # 시나리오 계산에 쓴 시간(API 기다림 제외, 결정 0030)
+    calc_n: int = 0  # 계산한 시나리오 수
+    wb_backfill: bool = False  # water_balance_daily 소급 실행인가(--wb-backfill)
 
     @property
     def failed(self) -> bool:
@@ -471,13 +483,28 @@ def run_station(
     err_all: pd.DataFrame,
     result: SlotResult,
     soil_backfill: bool = False,
+    use_scenarios: bool = True,
 ) -> dict:
-    """한 지점의 계산 조건 모두 → 결과 줄. 반환: 지점 요약"""
+    """한 지점의 계산 조건 모두 → 결과 줄. 반환: 지점 요약.
+    use_scenarios=False 면 시드된 계산 조건을 무시한다(대표 밖 지점, NONREP_SCENARIOS 꺼짐, 결정 0030)."""
     st = d.stations[stn_id]
     D = issue.normalize()
     prev = (D - pd.Timedelta(days=1)).date()
-    scen = d.scenarios_for(stn_id, D.year)
-    summary = dict(stn_id=stn_id, name=st.get("name_ko"), n_weather=len(weather), scenarios=[], error="")
+    scen = d.scenarios_for(stn_id, D.year) if use_scenarios else []
+    # 대표 밖 지점은 water_balance_daily 도 어제 포함 14일 창만 올린다(결정 0026 12번 확장, 0030).
+    # 계산은 작기 시작부터
+    # 다시 하므로 창 안 값은 전체와 같다. 소급(--soil-backfill)은 창이 없다.
+    wb_cutoff = (
+        None if soil_backfill or is_representative(st) else prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1)
+    )
+    summary = dict(
+        stn_id=stn_id,
+        name=st.get("name_ko"),
+        n_weather=len(weather),
+        scenarios=[],
+        error="",
+        representative=is_representative(st),
+    )
     forecast = collector is not None
     stab = pd.DataFrame()
     if forecast:
@@ -501,6 +528,7 @@ def run_station(
     elif forecast and (stab.empty or stab[(stab.run == issue) & (stab.run_name == name)].empty):
         svc.update(ok=False, error="24시간 안에 쓸 수 있는 발표 없음")
     methods: set[str] = set()
+    t_calc = time.perf_counter()
     for s in scen:
         crop0 = crop_params(d, s)
         crop = adjust_crop(crop0, stage_climate(weather, crop0), crop_height(d, s))
@@ -519,6 +547,8 @@ def run_station(
         end = prev if forecast and svc["ok"] else None
         wb = observed_water_balance(days, crop, soil, forecast_fill=fill, end=end) if days or end else []
         for r in wb:
+            if wb_cutoff is not None and r["date"] < wb_cutoff:
+                continue
             result.water_balance_daily.append(
                 _jsonable(dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS}))
             )
@@ -575,6 +605,8 @@ def run_station(
             except Exception as e:  # 계산 오류도 회차 실패로 남긴다(조용히 넘어가지 않음)
                 svc.update(ok=False, error=f"{type(e).__name__}: {e}"[:200])
         summary["scenarios"].append(info)
+    result.calc_seconds += time.perf_counter() - t_calc
+    result.calc_n += len(scen)
     if st.get("has_forecast") and weather and d.soils:
         soil_start = _soil_season_start(prev, backfill=soil_backfill)
         soil_days = [w for w in weather if w["date"] >= soil_start]
@@ -665,6 +697,14 @@ def obs_all_enabled(env: Mapping[str, str] | None = None) -> bool:
     return str(env.get(OBS_SWITCH, "")).strip().lower() == "true"
 
 
+def nonrep_scenarios_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """대표 밖 예보 지점에 시드된 계산 조건(사과·배추)으로 3일 전망·물수지를 만들지. Actions 변수
+    NONREP_SCENARIOS 가 true 일 때만 켜짐(기본 꺼짐, 결정 0030).
+    꺼져 있으면 시나리오가 시드돼 있어도 무시한다."""
+    env = os.environ if env is None else env
+    return str(env.get(NONREP_SWITCH, "")).strip().lower() == "true"
+
+
 def observation_stations(d: Dictionaries) -> list[str]:
     """관측 대상 = 운영 지점(is_active). 폐지·휴지 지점은 새 줄을 쓰지 않는다(결정 0024)."""
     return sorted(
@@ -734,24 +774,40 @@ class DispatchOptions:
     soil_backfill: bool
     write: bool
     skip_if_done: bool
+    wb_backfill: bool = False  # water_balance_daily 소급(--wb-backfill, 결정 0030)
+    nonrep_dry: bool = False  # 시험 실행에서만: NONREP_SCENARIOS 변수 없이도 대표 밖 전망을 계산해 본다
 
 
 def dispatch_options(
-    event: str, stations: str = "", backfill: str = "", dry_run: str = ""
+    event: str,
+    stations: str = "",
+    backfill: str = "",
+    dry_run: str = "",
+    wb_backfill: str = "",
+    nonrep_scenarios: str = "",
 ) -> DispatchOptions:
     """실행 방식(collect.yml)에서 넘어온 값 → 실제 옵션. **새 입력(지점·소급·시험 실행)은
     workflow_dispatch 에서만 쓴다.**
     예약(schedule) 실행은 입력이 어떻게 와도 지금과 같다(기본 대상, 쓰기, 끝난 회차는 건너뜀).
     지점이나 소급이나 시험 실행을 적은 수동 실행은 끝난 회차를 건너뛰지 않는다(그래야 소급·점검이 돈다)."""
     if event != "workflow_dispatch":
-        return DispatchOptions(None, False, True, True)
+        return DispatchOptions(None, False, True, True)  # 예약 실행은 입력이 어떻게 와도 같다
     ids = [t.strip() for t in str(stations or "").split(",") if t.strip()]
     for t in ids:
         if not re.fullmatch(r"[0-9]{1,5}", t):
             raise SystemExit(f"지점 번호는 숫자만 쉼표로 적습니다: {t!r}")
     bf = str(backfill or "").strip().lower() == "true"
     dry = str(dry_run or "").strip().lower() == "true"
-    return DispatchOptions(ids or None, bf, not dry, not (ids or bf or dry))
+    wb = str(wb_backfill or "").strip().lower() == "true"
+    nr = str(nonrep_scenarios or "").strip().lower() == "true"
+    if wb and bf:
+        raise SystemExit("soil_backfill 과 wb_backfill 은 동시에 켤 수 없습니다(하나씩 따로 실행)")
+    if nr and not dry:
+        raise SystemExit(
+            "nonrep_scenarios 입력은 dry_run 과 함께만 씁니다"
+            "(변수 NONREP_SCENARIOS 없이 전망을 써 버리지 않게)"
+        )
+    return DispatchOptions(ids or None, bf, not dry, not (ids or bf or dry or wb), wb, nr)
 
 
 def check_backfill_scope(
@@ -769,6 +825,111 @@ def check_backfill_scope(
             f"소급은 관측만 하는 지점을 한 번에 {OBS_BACKFILL_MAX}곳까지만 합니다(지금 {len(targets)}곳). "
             f"지점 번호(stations)를 {OBS_BACKFILL_MAX}곳 이하로 적어 주세요"
         )
+
+
+def wb_backfill_stations(d: Dictionaries, year: int | None = None) -> list[str]:
+    """water_balance_daily 소급 대상: 대표가 아니고 그해 계산 조건이 시드된 운영 지점."""
+    return [
+        s
+        for s in observation_stations(d)
+        if not is_representative(d.stations[s]) and d.scenarios_for(s, year)
+    ]
+
+
+def check_wb_backfill_scope(d: Dictionaries, stations: Sequence[str] | None, year: int | None = None) -> None:
+    """물수지 소급은 계산 조건이 시드된 대표 밖 지점 20곳까지, 지점 번호를 적어야 한다(결정 0030)."""
+    if not stations:
+        raise SystemExit(
+            f"물수지 소급은 지점 번호(stations)를 적어야 합니다"
+            f"({WB_BACKFILL_MAX}곳 이하, 계산 조건이 시드된 대표 밖 지점)"
+        )
+    ok = set(wb_backfill_stations(d, year))
+    bad = [s for s in stations if s not in ok]
+    if bad:
+        raise SystemExit(
+            f"물수지 소급 대상이 아닌 지점: {', '.join(bad)} "
+            "(대표이거나 계산 조건이 시드되지 않았거나 운영 지점이 아님)"
+        )
+    if len(stations) > WB_BACKFILL_MAX:
+        raise SystemExit(
+            f"물수지 소급은 한 번에 {WB_BACKFILL_MAX}곳까지만 합니다(지금 {len(stations)}곳). "
+            f"지점 번호(stations)를 {WB_BACKFILL_MAX}곳 이하로 적어 주세요"
+        )
+
+
+def run_wb_backfill(
+    name: str,
+    issue: Any,
+    d: Dictionaries,
+    key: str,
+    stations: Sequence[str],
+    http: kma.Http = kma.http_get,
+    clock: Clock | None = None,
+) -> SlotResult:
+    """water_balance_daily 소급(결정 0030): **예보·전망·forecast_runs 없이** ASOS만 받아
+    그해 작기 시작~어제(ASOS가 있는 마지막 날)까지 물수지를 계산한다.
+    정기 회차와 같은 날짜부터(3/1) 같은 계산을 하므로 값이 같다. 어제가 아직 ASOS에
+    없으면 그날 줄은 정기 회차가 예보로 채운다. ASOS가 실패한 지점이 있으면 문제로 남긴다(쓰지 않는다)."""
+    clock = clock or Clock()
+    issue = pd.Timestamp(issue)
+    result = SlotResult(run_name=name, issue=issue, wb_backfill=True)
+    D = issue.normalize()
+    prev = (D - pd.Timedelta(days=1)).date()
+    for stn_id in stations:
+        st = d.stations[stn_id]
+        scen = d.scenarios_for(stn_id, D.year)
+        starts = [dt.date.fromisoformat(str(s["season_start"])[:10]) for s in scen]
+        starts.append(_soil_season_start(prev))  # 예보 지점과 같은 날짜(3/1)부터 받아야 정기 회차와 값이 같다
+        start = min(starts)
+        weather, res = (
+            fetch_weather(key, stn_id, st, start, prev, http, clock, result.log)
+            if start <= prev
+            else ([], {})
+        )
+        summary = dict(
+            stn_id=stn_id,
+            name=st.get("name_ko"),
+            n_weather=len(weather),
+            scenarios=[],
+            error="",
+            representative=False,
+            asos_ok=res.get("status") == "ok" if res else True,
+            asos_last=str(weather[-1]["date"]) if weather else None,
+            asos_status=res.get("status") if res else "조회 안 함",
+        )
+        if not summary["asos_ok"]:
+            result.problems.append(
+                f"{stn_id} {st.get('name_ko') or ''} ASOS 실패({summary['asos_status']}) — 소급 안 함"
+            )
+        t_calc = time.perf_counter()
+        for s in scen:
+            crop0 = crop_params(d, s)
+            crop = adjust_crop(crop0, stage_climate(weather, crop0), crop_height(d, s))
+            soil = soil_of(s)
+            days = [w for w in weather if w["date"] >= crop.season_start]
+            wb = observed_water_balance(days, crop, soil, forecast_fill={}, end=None) if days else []
+            for r in wb:
+                result.water_balance_daily.append(
+                    _jsonable(
+                        dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS})
+                    )
+                )
+            info = dict(
+                scenario_id=s["scenario_id"],
+                crop_id=s.get("crop_id"),
+                is_default=bool(s.get("is_default")),
+                kc_mid=round(crop.kc_mid, 4),
+                kc_end=round(crop.kc_end, 4),
+            )
+            if wb:
+                info.update(
+                    last_date=str(wb[-1]["date"]), dr_mm=round(wb[-1]["dr_mm"], 1), status=wb[-1]["status"]
+                )
+            summary["scenarios"].append(info)
+        result.calc_seconds += time.perf_counter() - t_calc
+        result.calc_n += len(scen)
+        result.stations.append(summary)
+    return result
 
 
 def _grid_warning(stn_id: str, st: dict, result: SlotResult) -> None:
@@ -918,8 +1079,11 @@ def run_slot(
     soil_backfill: bool = False,
     obs_all: bool = False,
     soil_prior: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+    nonrep_scen: bool = False,
 ) -> SlotResult:
-    """한 회차 전체. stations: 돌릴 지점(없으면 수집 지점 has_forecast. 감시·slot_done 과 같은 기준).
+    """한 회차 전체. nonrep_scen: 켜면(NONREP_SCENARIOS=true) 대표 밖 예보 지점에 시드된 계산 조건으로
+    3일 전망·물수지를 만든다(꺼져 있으면 시드돼 있어도 무시, 결정 0030).
+    stations: 돌릴 지점(없으면 수집 지점 has_forecast. 감시·slot_done 과 같은 기준).
     obs_all: 켜면(OBS_ALL_STATIONS=true) 운영 지점 중 예보 지점이 아닌 곳을 "관측만 하는 지점"으로 뒤에
     더하고,
     stations 에 적힌 그런 지점도 관측만 하는 규칙으로 돈다(결정 0026). 꺼져 있으면 예전과 똑같다.
@@ -959,7 +1123,8 @@ def run_slot(
             result.stations.append(summary)
             continue
         t_fc = clock.now()
-        scen = d.scenarios_for(stn_id, D.year)
+        use_scen = nonrep_scen or is_representative(st)
+        scen = d.scenarios_for(stn_id, D.year) if use_scen else []
         collector, col = None, None
         if st.get("has_forecast"):
             _grid_warning(stn_id, st, result)
@@ -987,11 +1152,12 @@ def run_slot(
         )
         if collector is not None and collector.fatal:
             weather = []
-        # 계산 조건이 없는 대표 밖 지점은 관측만 하는 지점과 같이 weather_daily 도 최근 14일 창만 올린다
-        # (결정 0026 12번). 계산은 3/1부터 받은 기상값 전체로 하지만, 매 회차 3/1~어제를 다시 올리면
-        # 소급해 둔 3월 초 줄을 덮어쓰고 쓰기량이 늘어난다(S4-b). 소급(--soil-backfill)은 창이 없다.
+        # 대표 밖 지점은 관측·예보·계산 조건 유무와 상관없이 weather_daily 도 최근 14일 창만 올린다
+        # (결정 0026 12번, 0030에서 "계산 조건이 없는" 조건을 뺐다). 계산은 3/1부터 받은 기상값 전체로 하지만,
+        # 매 회차 3/1~어제를 다시 올리면 소급해 둔 3월 초 줄을 덮어쓰고 쓰기량이 늘어난다(S4-b).
+        # 소급(--soil-backfill)은 창이 없다.
         # 대표 10곳은 그대로(전망에 전체 시즌이 필요하다).
-        window_only = not scen and not is_representative(st) and not soil_backfill
+        window_only = not is_representative(st) and not soil_backfill
         upload_from = prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1)
         for w in weather:
             if window_only and w["date"] < upload_from:
@@ -1008,7 +1174,17 @@ def run_slot(
                 )
             )
         summary = run_station(
-            name, issue, stn_id, d, weather, col, collector, err_all, result, soil_backfill=soil_backfill
+            name,
+            issue,
+            stn_id,
+            d,
+            weather,
+            col,
+            collector,
+            err_all,
+            result,
+            soil_backfill=soil_backfill,
+            use_scenarios=use_scen,
         )
         if collector is not None:
             result.raw_files.update(collector.raw_files())
@@ -1082,6 +1258,7 @@ def timing_text(r: SlotResult) -> str:
     return (
         f"단계: 예보 지점 {r.fc_n}곳 {_duration(r.fc_seconds)}"
         f" · 관측 지점 {r.obs_n}곳 {_duration(r.obs_seconds)}"
+        f" · 시나리오 {r.calc_n}개 계산 {_duration(r.calc_seconds)}"
         f" · 예보 요청 {fcst}번(발표 단위, 쪽 수 제외) · ASOS {asos}번"
     )
 
@@ -1090,6 +1267,10 @@ def growth_text(r: SlotResult) -> str:
     """관측 물 상태 줄이 DB를 얼마나 늘리나(전부 새 줄일 때의 상한, 줄당 실측 크기 × 줄 수). 소급
     dry-run 보고용.
     이미 있는 줄은 덮어쓰므로 실제 증가는 이보다 작거나 같다."""
+    if r.wb_backfill:  # 물수지 소급(결정 0030): water_balance_daily 줄만
+        n_wb = len(r.water_balance_daily)
+        mb = n_wb * ROW_BYTES["water_balance_daily"] / 1024 / 1024
+        return f"예상 DB 증가(전부 새 줄일 때의 상한): {mb:.1f}MB (water_balance_daily {n_wb}줄)"
     n_soil, n_wx = len(r.soil_water_daily), len(r.weather_daily)
     mb = (n_soil * ROW_BYTES["soil_water_daily"] + n_wx * ROW_BYTES["weather_daily"]) / 1024 / 1024
     return (
@@ -1110,8 +1291,13 @@ def brief_text(r: SlotResult) -> str:
     if r.warnings:
         lines += [f"? {x}"[:300] for x in r.warnings[:5]]
     obs = [s for s in r.stations if s.get("obs_only")]
+    # 예보 지점이 97곳이 되면(S4) 대표 밖도 지점마다 한 줄은 알림 칸(약 4KB)에 안 들어간다 → 한 줄로 모으고
+    # 정시 성공이 아닌 지점만 따로 적는다(결정 0030). 대표 10곳은 지점마다 한 줄 그대로.
+    nonrep = [s for s in r.stations if not s.get("obs_only") and not s.get("representative", True)]
     for s in r.stations:
-        if s.get("obs_only"):  # 97곳이 되면 지점마다 한 줄은 알림 칸(약 4KB)에 안 들어간다 → 한 줄로 모음
+        if (
+            s.get("obs_only") or s in nonrep
+        ):  # 97곳이 되면 지점마다 한 줄은 알림 칸(약 4KB)에 안 들어간다 → 한 줄로 모음
             continue
         last = str(s.get("asos_last") or "")[5:] or "없음"
         parts = [s.get("result", "관측만"), f"ASOS ~{last}"]
@@ -1130,6 +1316,25 @@ def brief_text(r: SlotResult) -> str:
         if s.get("error"):
             head += f" · 오류: {s['error']}"[:200]
         lines.append(head)
+    if nonrep and r.wb_backfill:
+        bad = sum(1 for s in nonrep if not s.get("asos_ok", True))
+        lines.append(
+            f"- 물수지 소급 {len(nonrep)}곳: ASOS 성공 {len(nonrep) - bad} · 실패 {bad} · "
+            f"물수지 {len(r.water_balance_daily)}줄"
+        )
+    elif nonrep:
+        not_ok = [s for s in nonrep if s.get("result") != "정시 성공"]
+        lines.append(
+            f"- 대표 밖 예보 지점 {len(nonrep)}곳: 정시 성공 {len(nonrep) - len(not_ok)}"
+            f" · 그 밖 {len(not_ok)}"
+        )
+        for s in not_ok[:10]:
+            head = f"  - {s['stn_id']} {s.get('name') or ''}: {s.get('result', '?')}"
+            if s.get("error"):
+                head += f" · 오류: {s['error']}"[:160]
+            lines.append(head)
+        if len(not_ok) > 10:
+            lines.append(f"  - … 외 {len(not_ok) - 10}곳(전체는 실행 요약)")
     if obs:
         bad = sum(1 for s in obs if not s.get("asos_ok", True))
         lines.append(
@@ -1307,6 +1512,23 @@ def _env(name: str) -> str:
     return v
 
 
+def _write_or_check(r: SlotResult, d: Dictionaries, base: str, svc: str, write: bool) -> None:
+    """쓰는 실행은 계약 검사 뒤 DB에 쓰고(publish), 쓰지 않는 실행은 같은 검사만 미리 돌린다(결정 0028)."""
+    if write:
+        from croplib_dp.io.supabase_write import SupabaseWriter
+
+        rs_ok, rs_note = rs_source_state(base, svc)
+        publish(
+            r,
+            SupabaseWriter(base, svc),
+            taw_map(d),
+            rs_source_column=rs_ok,
+            rs_source_note=rs_note,
+        )
+    else:
+        precheck_contract(r, taw_map(d))
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="물 수집기 한 회차 (결과는 파일로, DB 쓰기는 물3)")
     p.add_argument("--slot", help="발표시각 '2026-10-24 02' (없으면 지금 회차)")
@@ -1334,17 +1556,56 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--input-dry-run", default="", help="(--event 와 함께) 수동 실행 입력: 시험 실행(true면 DB 안 씀)"
     )
+    p.add_argument(
+        "--wb-backfill",
+        action="store_true",
+        help="대표 밖 지점 water_balance_daily 소급(예보 없이 ASOS만, 20곳까지, --stations 필수)",
+    )
+    p.add_argument(
+        "--input-wb-backfill", default="", help="(--event 와 함께) 수동 실행 입력: 물수지 소급(true)"
+    )
+    p.add_argument(
+        "--input-nonrep-scenarios",
+        default="",
+        help="(--event 와 함께) 수동 실행 입력: 시험 실행에서만, 변수 없이 대표 밖 전망을 계산해 본다",
+    )
     a = p.parse_args(argv)
     if a.event is not None:
-        o = dispatch_options(a.event, a.input_stations, a.input_backfill, a.input_dry_run)
+        o = dispatch_options(
+            a.event,
+            a.input_stations,
+            a.input_backfill,
+            a.input_dry_run,
+            a.input_wb_backfill,
+            a.input_nonrep_scenarios,
+        )
         stations, soil_backfill, write, skip_if_done = o.stations, o.soil_backfill, o.write, o.skip_if_done
+        wb_backfill, nonrep_dry = o.wb_backfill, o.nonrep_dry
     else:
         stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
         soil_backfill, write, skip_if_done = a.soil_backfill, a.write, a.skip_if_done
+        wb_backfill, nonrep_dry = a.wb_backfill, False
+    nonrep_on = nonrep_scenarios_enabled() or nonrep_dry
     clock = Clock()
     name, issue = parse_slot(a.slot) if a.slot else current_slot(clock.now())
     base, svc = _env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")
     d = load_dictionaries(base, svc)
+    if wb_backfill:  # 물수지 소급: 예보·전망 없이 ASOS만(결정 0030). 쓰려면 스위치가 켜져 있어야 한다
+        check_wb_backfill_scope(d, stations, issue.year)
+        if write and not nonrep_scenarios_enabled():
+            raise SystemExit(
+                f"물수지 소급을 DB에 쓰려면 Actions 변수 {NONREP_SWITCH}=true 가 켜져 있어야 합니다 "
+                "(먼저 dry_run 으로 줄 수·예상 증가를 보세요)"
+            )
+        r = run_wb_backfill(name, issue, d, _env("DATA_GO_KR"), stations, clock=clock)
+        if write and r.problems:
+            r.warnings.append("문제가 있어 DB에 쓰지 않음 — 위 문제를 해결한 뒤 같은 입력으로 다시 실행")
+        else:
+            _write_or_check(r, d, base, svc, write)
+        out = write_outputs(r, Path(a.out))
+        print(summary_text(r))
+        print(f"결과 폴더: {out}")
+        return 1 if r.failed else 0
     obs_all = obs_all_enabled()
     check_backfill_scope(d, stations, soil_backfill, obs_all)
     if skip_if_done:
@@ -1384,20 +1645,9 @@ def main(argv: list[str] | None = None) -> int:
         soil_backfill=soil_backfill,
         obs_all=obs_all,
         soil_prior=soil_prior,
+        nonrep_scen=nonrep_on,
     )
-    if write:
-        from croplib_dp.io.supabase_write import SupabaseWriter
-
-        rs_ok, rs_note = rs_source_state(base, svc)
-        publish(
-            r,
-            SupabaseWriter(base, svc),
-            taw_map(d),
-            rs_source_column=rs_ok,
-            rs_source_note=rs_note,
-        )
-    else:
-        precheck_contract(r, taw_map(d))
+    _write_or_check(r, d, base, svc, write)
     out = write_outputs(r, Path(a.out))
     print(summary_text(r))
     print(f"결과 폴더: {out}")
