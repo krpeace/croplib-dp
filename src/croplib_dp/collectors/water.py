@@ -54,6 +54,7 @@ from croplib_dp.core.monitor import named
 from croplib_dp.core.outlook import (
     MAIN_DAYS,
     fill_from_forecast,
+    lag_days_without_forecast,
     last_observed,
     outlook_rows,
     outlook_summary,
@@ -94,6 +95,10 @@ CATCHUP_H = 24  # 함께 받는 앞선 발표 범위(시간)
 # 대표 10곳은 24시간 안 8개 그대로(CATCHUP_H).
 NONREP_CATCHUP_BACK = {2: (3, 24), 17: (3, 15)}
 NONREP_CATCHUP_DEFAULT = (3, 6)  # 02시·17시가 아닌 회차(시험 실행 등)
+# 필요한 앞선 발표(3시간 전, 02시 회차 24시간 전·17시 회차 15시간 전)를 시간 초과 등으로 못 받으면
+# 이만큼 기다렸다 다시 받는다
+# (ASOS와 같은 30초·90초, 이슈 #100). 필요하지 않은 앞선 발표는 전과 같이 한 번만 받는다.
+NEEDED_ISSUE_RETRY_S = (30, 90)
 WB_BACKFILL_MAX = 20  # water_balance_daily 소급은 한 번에 대표 밖 지점 20곳까지(결정 0030)
 NONREP_SWITCH = "NONREP_SCENARIOS"  # Actions 변수: true 일 때만 대표 밖 지점에 3일 전망·물수지(기본 꺼짐)
 COLLECTOR = "actions"
@@ -245,11 +250,20 @@ class ForecastCollector:
             if self.representative
             else NONREP_CATCHUP_BACK.get(slot.hour, NONREP_CATCHUP_DEFAULT)
         )
+        needed = set(
+            NONREP_CATCHUP_BACK.get(slot.hour, NONREP_CATCHUP_DEFAULT)
+        )  # 어제·오늘을 채우는 데 필요한 발표
         for back in backs:
             iss = slot - pd.Timedelta(hours=back)
             if iss.hour not in ISSUE_HOURS or iss in self.issues or self.fatal:
                 continue
             st, _ = self.get_issue(iss, attempt=1)
+            if back in needed:
+                for k, wait in enumerate(NEEDED_ISSUE_RETRY_S, start=2):
+                    if st != "retry" or self.fatal:
+                        break
+                    self.clock.sleep(wait)
+                    st, _ = self.get_issue(iss, attempt=k)
             got += st in ("ok", "partial")
         return got
 
@@ -569,13 +583,32 @@ def run_station(
                 owb = wb_frame(wb)
                 last = last_observed(owb, D)
                 obs_last = last if (last is not None and last < D - pd.Timedelta(days=1)) else None
+                lag_fb = False
+                if obs_last is not None:
+                    missing_days = lag_days_without_forecast(ft, obs_last, issue)
+                    if missing_days:
+                        # A(이슈 #100): 지연일의 아침 D+0 예보를 구할 수 없으면 실패하지 않고
+                        # 채운 줄(앞 7일 평균 ETo,
+                        # 강수 0)로 어제부터 출발한다. 결과는 기존 '백업' 구분으로 남긴다.
+                        obs_last, lag_fb = None, True
+                        shown = ", ".join(f"{x:%m/%d}" for x in missing_days)
+                        note = (
+                            f"{stn_id} {st.get('name_ko') or ''}: 지연일({shown}) 예보를 구할 수 없어 "
+                            "채운 값(앞 7일 평균 ETo, 강수 0)으로 전망을 출발함 — 백업"
+                        ).replace("  ", " ")
+                        if note not in result.warnings:
+                            result.warnings.append(note)
                 ol = service_outlook(
                     ft, owb, soil.taw_mm, soil.raw_mm, soil.ea, err, name, issue, obs_last=obs_last
                 )
                 days_ = ol["days"]
                 methods |= set(days_["rs_method"].dropna())
+                issue_backup = bool(days_["backup"].iloc[0])
                 svc.update(
-                    backup=bool(days_["backup"].iloc[0]), src_run=pd.Timestamp(days_["src_run"].iloc[0])
+                    backup=bool(svc.get("backup")) or issue_backup or lag_fb,
+                    src_backup=bool(svc.get("src_backup"))
+                    or issue_backup,  # 직전 발표를 쓴 경우만 src_run_at 을 남긴다
+                    src_run=pd.Timestamp(days_["src_run"].iloc[0]),
                 )
                 svc["obs_prev"] = ol["prev"].date()
                 for o in outlook_rows(ol, soil.raw_mm):
@@ -648,7 +681,7 @@ def run_station(
                 finished_at=_iso(collector.clock.now()),
                 result=res_name,
                 on_time=on_time,
-                src_run_at=_iso(svc["src_run"]) if svc.get("backup") else None,
+                src_run_at=_iso(svc["src_run"]) if svc.get("src_backup", svc.get("backup")) else None,
                 rs_method=svc["rs_method"],
                 obs_prev_date=None if svc["obs_prev"] is None else svc["obs_prev"].isoformat(),
                 attempts=max(int(col["attempts"]), 1),

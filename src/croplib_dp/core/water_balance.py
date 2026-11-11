@@ -111,7 +111,7 @@ def observed_water_balance(
                    (outlook.fill_from_forecast). 강수는 ASOS 행이 아예 없는 날에만 쓴다.
                    예보도 없으면 들어온 값(앞 7일 평균)을 쓴다.
     end: 마지막 날. 관측보다 뒤면 빈 날을 더해 예보로 채운다
-         (관측이 늦게 올 때, cropwater fcst_wb.observed_wb).
+         (관측이 늦게 올 때, cropwater fcst_wb.observed_wb). 그날 예보도 없으면 앞 7일 ETo 평균을 쓴다.
     반환 열은 `water_balance_daily`와 같고, obs_row(ASOS 행이 있었나)를 더 붙인다.
     eto_src: 관측 / 예보(D+0 예보로 채움) / 없음(앞 7일 평균 또는 값 없음).
     filled = 채운 값에 기대는 날(채운 날부터 끝 Dr이 0이 되기 전까지).
@@ -124,7 +124,7 @@ def observed_water_balance(
         last = days[-1]["date"] if days else None
         day = (last + dt.timedelta(days=1)) if last is not None else end
         while day <= end:
-            days.append(dict(date=day, eto_mm=None, rain_mm=None, filled=True, obs_row=False))
+            days.append(dict(date=day, eto_mm=None, rain_mm=None, filled=True, obs_row=False, appended=True))
             day += dt.timedelta(days=1)
     rows: list[dict] = []
     dr = soil.dr0_mm
@@ -141,6 +141,12 @@ def observed_water_balance(
             src = "예보"
             if not obs_row:
                 rain = f_rain
+        elif d.get("appended") and _missing(eto):
+            # 끝에 더한 날인데 아침 D+0 예보도 없다(지연일 대체, 이슈 #100):
+            # 앞 7일 ETo 평균으로 출발한다. 강수는 모르는 날이라 0
+            recent = [r["eto_mm"] for r in rows[-7:] if not _missing(r["eto_mm"])]
+            if recent:
+                eto = sum(recent) / len(recent)
         kc = 1.0 if crop is None else crop.kc(day)
         etc = 0.0 if _missing(eto) else kc * eto
         P = 0.0 if _missing(rain) else float(rain)

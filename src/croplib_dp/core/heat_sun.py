@@ -10,6 +10,8 @@ import datetime as dt
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
+from croplib_dp.core.daily_weather import num
+
 DEFAULT_T_BASE = 10.0
 DEFAULT_T_UPPER = 35.0
 DEFAULT_METHOD = "maxmin"
@@ -129,3 +131,42 @@ def year_table(
             row.update(day=v, cum=cum, lead=lead_days(cum, ncum, i))
         rows.append(row)
     return rows
+
+
+# ── 빈 줄 날 · 이미 끝난 날 (이슈 #104, 결정 0033) ─────────────────────────────
+# 기상청 일자료가 어떤 날을 날짜만 있는 줄(값이 모두 빔)로 돌려준 적이 있다(2026-11-10, 이슈 #100).
+# 적산온도는 최고·최저기온으로 계산하므로 둘 중 하나라도 없으면 그 날은 계산할 수 없다. 그런 줄(빈 줄 포함)을
+# 올리면 이미 올라간 옛 값을 비운 값(끝 날) 또는 평년 채움 값(가운데 날)으로 덮는다. 그래서 그 날 줄은
+# 올리지 않는다.
+# 기온이 있고 일사·강수·습도·풍속만 빈 날은 평소처럼 쓴다.
+def is_blank_row(item: Mapping) -> bool:
+    """ASOS 일자료 한 줄에서 적산온도를 계산할 기온(최고·최저)이 없다 (빈 줄 포함)"""
+    return num(item.get("maxTa")) is None or num(item.get("minTa")) is None
+
+
+def required_dates(today: dt.date) -> list[dt.date]:
+    """오늘 실행이 채워야 하는 날: 어제. 1/2·1/3 에는 작년 12/31 마감도 함께 (1/1 의 어제가 곧 12/31)."""
+    y = today - dt.timedelta(days=1)
+    last_dec = dt.date(today.year - 1, 12, 31)
+    if today.month == 1 and today.day <= 3 and y != last_dec:
+        return [y, last_dec]
+    return [y]
+
+
+def pending_stations(
+    targets: Sequence[str],
+    dates: Sequence[dt.date],
+    heat_have: set[tuple[str, dt.date]],
+    sun_have: set[tuple[str, dt.date]],
+) -> list[str]:
+    """필요한 날 값을 아직 못 채운 지점. 비어 있어야 '이미 끝난 날'이다.
+    - 적산온도: 지점마다 필요한 날마다 관측 줄(작물 공통)이 있어야 한다.
+    - 적산일사: 그 전날 일사가 있던 지점만 그날도 있어야 한다 (일사를 재지 않는 지점은 기대하지 않는다)."""
+    out = []
+    for stn in targets:
+        for d in dates:
+            prev = d - dt.timedelta(days=1)
+            if (stn, d) not in heat_have or ((stn, prev) in sun_have and (stn, d) not in sun_have):
+                out.append(stn)
+                break
+    return out

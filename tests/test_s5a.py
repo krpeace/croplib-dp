@@ -162,12 +162,19 @@ def test_17_slot_asks_3h_and_15h_earlier_issues():
     assert run["result"] == "정시 성공" and [x for x in r.water_outlook if x["stn_id"] == "301"]
 
 
-def test_the_two_most_recent_earlier_issues_cannot_fill_yesterday_and_the_outlook_fails(monkeypatch):
-    """S4 의 옛 규칙(3시간·6시간 전)으로는 02시 회차의 어제를 채울 수 없다 — 그래서 '필요한 것만'으로 바꿨다."""
+def test_the_two_most_recent_earlier_issues_cannot_fill_yesterday_so_the_outlook_falls_back_to_backup(
+    monkeypatch,
+):
+    """S4 의 옛 규칙(3시간·6시간 전)으로는 02시 회차의 어제를 예보로 채울 수 없다 — 그래서 '필요한 것만'으로 바꿨다.
+    이슈 #100 이후에는 실패하지 않고 채운 줄로 출발하는 '백업'으로 끝난다(필요한 발표를 받으면 정시 성공)."""
     monkeypatch.setattr(W, "NONREP_CATCHUP_BACK", {2: (3, 6), 17: (3, 6)})
     r, _ = _run(nonrep=True, asos_last=dt.date(2026, 6, 8))
     run = next(x for x in r.forecast_runs if x["stn_id"] == "301")
-    assert run["result"] == "실패" and "진행할 예보가 없습니다" in run["error"]
+    assert run["result"] == "백업: 직전 발표" and run["error"] is None
+    assert any("301" in w and "지연일" in w for w in r.warnings)
+    monkeypatch.undo()
+    ok, _ = _run(nonrep=True, asos_last=dt.date(2026, 6, 8))
+    assert next(x for x in ok.forecast_runs if x["stn_id"] == "301")["result"] == "정시 성공"
 
 
 # ── 소급: --wb-backfill ──────────────────────────────────────────────────
