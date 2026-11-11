@@ -9,6 +9,7 @@ PostgREST 는 한 번에 최대 1,000줄만 돌려주므로(Supabase 기본) `li
 import json
 from collections.abc import Callable
 
+from croplib_dp.io import egress
 from croplib_dp.io.dictionaries import RestGet, read_table, rest_get
 from croplib_dp.io.supabase_write import Request, http_request
 
@@ -22,6 +23,7 @@ def http_request_h(method: str, url: str, headers: dict, body: bytes) -> tuple[i
     import requests
 
     r = requests.request(method, url, headers=headers, data=body, timeout=60)
+    egress.record(url, r.content)  # HEAD 는 본문이 없어도 요청 수를 센다(결정 0031)
     return r.status_code, dict(r.headers), r.content
 
 

@@ -65,7 +65,7 @@ from croplib_dp.core.retention import ROW_BYTES, raw_prefix
 from croplib_dp.core.retention import raw_path as storage_raw_path
 from croplib_dp.core.soil_water import MissingPrior, soil_water_rows, window_needs_prior
 from croplib_dp.core.water_balance import observed_water_balance
-from croplib_dp.io import kma
+from croplib_dp.io import egress, kma
 from croplib_dp.io.coefficients import load_error_rows, load_s3_coef, load_s4_coef
 from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import (
@@ -437,6 +437,7 @@ class SlotResult:
     calc_seconds: float = 0.0  # 시나리오 계산에 쓴 시간(API 기다림 제외, 결정 0030)
     calc_n: int = 0  # 계산한 시나리오 수
     wb_backfill: bool = False  # water_balance_daily 소급 실행인가(--wb-backfill)
+    egress_line: str = ""  # DB에서 내려받은 바이트 한 줄(io/egress, 결정 0031). main 이 채운다
 
     @property
     def failed(self) -> bool:
@@ -1236,6 +1237,7 @@ def summary_text(r: SlotResult) -> str:
     lines += [
         "",
         timing_text(r),
+        *([r.egress_line] if r.egress_line else []),
         f"DB 올리기: {'완료' if r.uploaded else '안 함'}",
         *(["계약 검사: 통과 (쓰지 않고 미리 검사함)"] if r.contract_checked and not r.problems else []),
         f"줄 수: forecast_runs {len(r.forecast_runs)}, weather_daily {len(r.weather_daily)}, "
@@ -1342,6 +1344,8 @@ def brief_text(r: SlotResult) -> str:
             f"토양 {sum(s.get('n_soil', 0) for s in obs)}줄"
         )
     lines.append(timing_text(r))
+    if r.egress_line:
+        lines.append(r.egress_line)
     lines.append(
         f"DB 올리기: {'완료' if r.uploaded else '안 함'} · 전망 {len(r.water_outlook)}줄 · "
         f"요약 {len(r.water_outlook_summary)}줄 · 물수지 {len(r.water_balance_daily)}줄"
@@ -1602,6 +1606,7 @@ def main(argv: list[str] | None = None) -> int:
             r.warnings.append("문제가 있어 DB에 쓰지 않음 — 위 문제를 해결한 뒤 같은 입력으로 다시 실행")
         else:
             _write_or_check(r, d, base, svc, write)
+        r.egress_line = egress.summary_line()
         out = write_outputs(r, Path(a.out))
         print(summary_text(r))
         print(f"결과 폴더: {out}")
@@ -1648,6 +1653,7 @@ def main(argv: list[str] | None = None) -> int:
         nonrep_scen=nonrep_on,
     )
     _write_or_check(r, d, base, svc, write)
+    r.egress_line = egress.summary_line()  # 올리기 응답까지 센 뒤(결정 0031)
     out = write_outputs(r, Path(a.out))
     print(summary_text(r))
     print(f"결과 폴더: {out}")

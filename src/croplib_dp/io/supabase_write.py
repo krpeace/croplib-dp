@@ -13,6 +13,8 @@ import json
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from croplib_dp.io import egress
+
 Request = Callable[
     [str, str, dict, bytes], tuple[int, bytes]
 ]  # (method, url, headers, body) → (status, body)
@@ -23,6 +25,9 @@ def http_request(method: str, url: str, headers: dict, body: bytes) -> tuple[int
     import requests
 
     r = requests.request(method, url, headers=headers, data=body, timeout=60)
+    egress.record(
+        url, r.content
+    )  # 쓰기 응답(return=representation)·rpc·storage 응답도 내려받은 바이트(결정 0031)
     return r.status_code, r.content
 
 

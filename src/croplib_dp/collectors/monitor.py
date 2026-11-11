@@ -24,6 +24,7 @@ from croplib_dp.core.monitor import (
     report,
 )
 from croplib_dp.core.retention import COUNT_TABLES, estimate_db_mb
+from croplib_dp.io import egress
 from croplib_dp.io.db_stats import http_request_h, row_count, rpc_db_size
 from croplib_dp.io.dictionaries import RestGet, read_pages, read_table, rest_get
 from croplib_dp.io.github_issue import IssueAlerts, Request, http_request
@@ -255,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     text, action = run_monitor(state, sink, now=now)
     print(text)
     print(f"이슈: {action}")
+    print(egress.summary_line())  # 이 감시가 DB에서 내려받은 바이트(결정 0031)
     return 0
 
 

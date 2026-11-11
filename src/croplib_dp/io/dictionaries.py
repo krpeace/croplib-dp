@@ -12,6 +12,7 @@ from typing import Any
 
 from croplib_dp.core.daily_weather import StationMeta
 from croplib_dp.core.water_balance import CropParams, Soil
+from croplib_dp.io import egress
 from croplib_dp.io.coastal import coastal_krs
 
 TABLES = ("stations", "crops", "crop_seasons", "crop_kc_sets", "soil_types", "scenarios")
@@ -22,6 +23,7 @@ def rest_get(url: str, headers: dict) -> tuple[int, bytes]:
     import requests
 
     r = requests.get(url, headers=headers, timeout=30)
+    egress.record(url, r.content)  # 내려받은 바이트 실측(결정 0031)
     return r.status_code, r.content
 
 
