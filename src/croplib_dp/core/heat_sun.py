@@ -10,6 +10,8 @@ import datetime as dt
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
+from croplib_dp.core.daily_weather import num
+
 DEFAULT_T_BASE = 10.0
 DEFAULT_T_UPPER = 35.0
 DEFAULT_METHOD = "maxmin"
@@ -129,3 +131,42 @@ def year_table(
             row.update(day=v, cum=cum, lead=lead_days(cum, ncum, i))
         rows.append(row)
     return rows
+
+
+# ── 빈 줄 날 · 이미 끝난 날 (이슈 #104, 결정 0033) ─────────────────────────────
+# 기상청 일자료가 어떤 날을 날짜만 있는 줄(값이 모두 빔)로 돌려준 적이 있다(2026-11-10, 이슈 #100).
+# 비 안 온 날은 강수 칸만 비므로 기온·습도·풍속·일사 중 하나라도 값이 있으면 정상 줄이다.
+BLANK_ROW_KEYS = ("maxTa", "minTa", "avgTa", "avgRhm", "avgWs", "sumGsr")
+
+
+def is_blank_row(item: Mapping) -> bool:
+    """ASOS 일자료 한 줄에 쓸 값이 하나도 없다 (날짜만 있는 줄)"""
+    return all(num(item.get(k)) is None for k in BLANK_ROW_KEYS)
+
+
+def required_dates(today: dt.date) -> list[dt.date]:
+    """오늘 실행이 채워야 하는 날: 어제. 1/2·1/3 에는 작년 12/31 마감도 함께 (1/1 의 어제가 곧 12/31)."""
+    y = today - dt.timedelta(days=1)
+    last_dec = dt.date(today.year - 1, 12, 31)
+    if today.month == 1 and today.day <= 3 and y != last_dec:
+        return [y, last_dec]
+    return [y]
+
+
+def pending_stations(
+    targets: Sequence[str],
+    dates: Sequence[dt.date],
+    heat_have: set[tuple[str, dt.date]],
+    sun_have: set[tuple[str, dt.date]],
+) -> list[str]:
+    """필요한 날 값을 아직 못 채운 지점. 비어 있어야 '이미 끝난 날'이다.
+    - 적산온도: 지점마다 필요한 날마다 관측 줄(작물 공통)이 있어야 한다.
+    - 적산일사: 그 전날 일사가 있던 지점만 그날도 있어야 한다 (일사를 재지 않는 지점은 기대하지 않는다)."""
+    out = []
+    for stn in targets:
+        for d in dates:
+            prev = d - dt.timedelta(days=1)
+            if (stn, d) not in heat_have or ((stn, prev) in sun_have and (stn, d) not in sun_have):
+                out.append(stn)
+                break
+    return out

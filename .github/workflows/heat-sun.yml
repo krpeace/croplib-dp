@@ -4,6 +4,9 @@ name: heat-sun
 # 한 해 표를 만들고, 계약 검사(v1.4)를 통과하면 heat_daily·sun_daily 에 덮어쓴다.
 # 예약은 두 번 걸어 둔다(GitHub 예약 실행이 늦거나 건너뛰는 일이 있어서). 덮어쓰기라 두 번 돌아도 결과가 같다.
 # 새해 1월 1~3일에는 작년도 12/31까지 다시 계산해 마감한다(결정 0018). 그날은 DB 에 쓰는 줄이 두 배다.
+# 늦게 도는 GitHub 예약 실행은 필요한 날(어제) 값을 운영 지점 전부가 이미 갖고 있으면 건너뛴다(--skip-if-done, 결정 0033).
+# 한 곳이라도 비었거나 DB 를 못 읽으면 건너뛰지 않는다. pg_cron 이 깨우는 09:20 실행과 사람이 누른 실행은 건너뛰지 않는다.
+# 기상청이 어떤 날을 값 없는 빈 줄로 주면 그 날 줄은 올리지 않는다(옛 값을 null 로 덮지 않음).
 # 사람이 Actions 화면에서 눌러 시험할 수도 있다 (write 를 끄면 DB 에 쓰지 않음).
 # 대상은 운영 지점(is_active) 전부. 지난 해 ASOS 일자료는 바뀌지 않아 actions/cache 로 남겨 두고(결정 0017),
 # 매일은 올해만 받는다. 캐시가 있으면 15분 이내가 목표, 캐시가 비었을 때(처음·키 만료)는 오래 걸려 120분까지 둔다.
@@ -58,10 +61,13 @@ jobs:
           STATIONS: ${{ inputs.stations }}
           # 예약 실행은 항상 쓰고, 사람이 누를 때는 write 입력을 따른다
           WRITE: ${{ github.event_name == 'schedule' || inputs.write }}
+          # 예약(schedule) 실행만 '이미 끝난 날'을 건너뛴다
+          SKIP_IF_DONE: ${{ github.event_name == 'schedule' }}
         run: |
           args=(--out out --cache-dir .cache)
           if [ -n "$STATIONS" ]; then args+=(--stations "$STATIONS"); fi
           if [ "$WRITE" = "true" ]; then args+=(--write); fi
+          if [ "$SKIP_IF_DONE" = "true" ]; then args+=(--skip-if-done); fi
           set +e
           for attempt in 1 2; do
             python -m croplib_dp.collectors.heat_sun "${args[@]}" 2> err.txt

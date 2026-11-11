@@ -27,12 +27,19 @@ from pathlib import Path
 from croplib_dp.collectors.water import ASOS_RETRY_S, Clock, RunLog, _env
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.daily_weather import num
-from croplib_dp.core.heat_sun import calc_gdd, normals_by_day, year_table
+from croplib_dp.core.heat_sun import (
+    calc_gdd,
+    is_blank_row,
+    normals_by_day,
+    pending_stations,
+    required_dates,
+    year_table,
+)
 from croplib_dp.core.radiation import clean_observed_rs, has_enough_normals
 from croplib_dp.io import kma
 from croplib_dp.io.asos_cache import AsosCache, is_complete
 from croplib_dp.io.contract import SPECS, check_rows
-from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries
+from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries, read_table
 
 NORMAL_YEARS = 10
 PREV_YEAR_DAYS = 3  # 1월 1~3일은 작년도 다시 계산한다 (12/31 관측이 늦게 올라올 때를 위해)
@@ -59,6 +66,7 @@ class HeatSunResult:
     sun_daily: list[dict] = field(default_factory=list)
     blocks: list[YearBlock] = field(default_factory=list)  # 해마다 한 묶음 (오래된 해 → 올해)
     problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)  # 실패는 아니지만 사람이 알아야 할 일 (건너뜀·빈 줄 등)
     log: RunLog = field(default_factory=RunLog)
     uploaded: bool = False
     cache_used: bool = False  # --cache-dir 를 줬나
@@ -133,7 +141,11 @@ def build_station(
     ]
     this_year = [d for d in temp_days if d.year == year]
     last_obs = max(this_year) if this_year else None
+    # 값이 하나도 없는 '빈 줄' 날은 그 날 줄을 올리지 않는다.
+    # 올리면 이미 올라간 옛 값을 비운 값으로 덮는다(이슈 #104)
+    blank = {d.isoformat() for d, it in by_day.items() if d.year == year and is_blank_row(it)}
     heat, summary = [], dict(stn_id=stn_id, last_obs=str(last_obs) if last_obs else None, crops={})
+    summary["blank"] = sorted(blank)
     for crop_id, t_base in crops.items():
         g = {
             d: calc_gdd(num(it.get("avgTa")), num(it.get("maxTa")), num(it.get("minTa")), t_base)
@@ -143,6 +155,8 @@ def build_station(
         obs = {d: v for d, v in g.items() if d.year == year}
         rows = year_table(year, obs, normal, last_obs)
         for x in rows:
+            if x["date"].isoformat() in blank:
+                continue
             heat.append(
                 dict(
                     stn_id=stn_id,
@@ -177,6 +191,8 @@ def build_station(
         summary["sun"] = "자료 없음"
     elif has_enough_normals(normal_rs):
         for x in year_table(year, {d: v for d, v in rs.items() if d.year == year}, normal_rs, last_obs):
+            if x["date"].isoformat() in blank:
+                continue
             sun.append(
                 dict(
                     stn_id=stn_id,
@@ -271,6 +287,39 @@ def run(
     return r
 
 
+def read_done(table: str, dates: list[dt.date]) -> set[tuple[str, dt.date]]:
+    """DB 에 이미 올라간 관측 줄의 (지점, 날짜). 실패하면 오류를 낸다(부르는 쪽이 평소처럼 돌린다).
+    heat_daily 는 작물 공통만 본다. 둘 다 관측 줄(filled = false)에 값이 있는 것만 센다."""
+    url, key = _env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")
+    cond = "date=in.(" + ",".join(d.isoformat() for d in dates) + ")&filled=eq.false"
+    if table == "heat_daily":
+        q = f"select=stn_id,date&crop_id=eq.common&gdd_cum=not.is.null&{cond}"
+    else:
+        q = f"select=stn_id,date&rs_cum_mj=not.is.null&{cond}"
+    rows = read_table(url, key, table, query=q + "&limit=5000")
+    return {(x["stn_id"], dt.date.fromisoformat(x["date"])) for x in rows}
+
+
+def skip_check(d: Dictionaries, today: dt.date, read=None) -> tuple[bool, str]:
+    """(건너뛸까, 사람이 읽는 이유). 필요한 날 값을 운영 지점 전부가 이미 갖고 있을 때만 건너뛴다.
+    한 곳이라도 비었거나 DB 를 못 읽으면 건너뛰지 않는다 — 아침에 못 채운 지점을 늦은 실행이 채워야 한다."""
+    read = read or read_done
+    targets = active_stations(d)
+    if not targets:
+        return False, ""
+    req = required_dates(today)
+    try:
+        heat = read("heat_daily", req)
+        sun = read("sun_daily", req + [x - dt.timedelta(days=1) for x in req])
+    except Exception as e:
+        return False, f"건너뛸지 확인 못 함({type(e).__name__}: {str(e)[:120]}) — 평소처럼 실행"
+    left = pending_stations(targets, req, heat, sun)
+    if left:
+        return False, ""
+    days = ", ".join(x.isoformat() for x in req)
+    return True, f"건너뜀: {days} 값을 운영 지점 {len(targets)}곳 모두 이미 갖고 있음 — 받지도 쓰지도 않음"
+
+
 def check(r: HeatSunResult) -> list[str]:
     return check_rows("heat_daily", r.heat_daily) + check_rows("sun_daily", r.sun_daily)
 
@@ -304,6 +353,23 @@ def _new_year_line(r: HeatSunResult) -> str:
     return f"새해 {b.year}: {state} (heat {heat}줄 · sun {sun}줄)"
 
 
+def blank_text(stations: list[dict]) -> str:
+    """기상청이 값 없는 빈 줄로 준 날: 그 날 줄은 올리지 않았다고 한 줄로 알린다 (조용히 넘기지 않는다)"""
+    by_day: dict[str, int] = {}
+    for s in stations:
+        for d in s.get("blank") or []:
+            by_day[d] = by_day.get(d, 0) + 1
+    if not by_day:
+        return ""
+    days = sorted(by_day)
+    shown = ", ".join(f"{d}({by_day[d]}곳)" for d in days[:5]) + (" 외" if len(days) > 5 else "")
+    n = len({s["stn_id"] for s in stations if s.get("blank")})
+    return (
+        f"빈 줄 날 {n}곳: {shown} — 그 날 줄은 올리지 않음 "
+        "(옛 값을 지우지 않는다, 값이 올라오면 다음 실행이 채움)"
+    )
+
+
 def brief_text(r: HeatSunResult) -> str:
     """짧은 요약 (실행 화면 알림용): 지점마다 한 줄.
     1/1~3 에는 지점 줄을 작년 마감 기준으로 보여 주고, 새해는 한 줄만 덧붙인다."""
@@ -312,6 +378,10 @@ def brief_text(r: HeatSunResult) -> str:
         f"# 적산온도·적산일사 {main.year} (평년 {main.normal_from}–{main.normal_to}, 계산 {CALC_VERSION})"
     ]
     lines += [f"! {p}"[:300] for p in r.problems[:5]]
+    lines += [f"* {n}"[:300] for n in r.notes]
+    blank = blank_text(main.stations)
+    if blank:
+        lines.append(blank)
     if r.cache_used:
         lines.append(f"ASOS 캐시: 읽음 {r.cache_hit_years}해 · 새로 받아 남김 {r.cache_fetched_years}해")
     for s in main.stations:
@@ -360,11 +430,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--stations", help="지점 번호 쉼표 목록 (없으면 운영 지점 전부)")
     p.add_argument("--cache-dir", help="지난 해 ASOS 일자료를 남겨 두고 다시 쓰는 폴더 (없으면 매번 다 받기)")
     p.add_argument("--write", action="store_true", help="계약 검사를 통과하면 Supabase에 쓰기")
+    p.add_argument(
+        "--skip-if-done",
+        action="store_true",
+        help="(--write 와 함께, 지점 지정 없이) 필요한 날 값을 운영 지점 전부가 이미 갖고 있으면 건너뛰기",
+    )
     a = p.parse_args(argv)
     d = load_dictionaries(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
     stations = [s.strip() for s in a.stations.split(",")] if a.stations else None
     cache = AsosCache(a.cache_dir) if a.cache_dir else None
+    notes: list[str] = []
+    if a.skip_if_done and a.write and not stations:
+        today = Clock().now().date()
+        skip, why = skip_check(d, today, read_done)
+        if skip:
+            ny = today.year
+            r = HeatSunResult(year=ny, normal_from=ny - NORMAL_YEARS, normal_to=ny - 1)
+            r.blocks = [YearBlock(today.year, r.normal_from, r.normal_to)]
+            r.notes.append(why)
+            out = write_outputs(r, Path(a.out))
+            print(brief_text(r))
+            print(f"결과 폴더: {out}")
+            return 0
+        if why:
+            notes.append(why)
     r = run(d, _env("DATA_GO_KR"), stations=stations, cache=cache)
+    r.notes += notes
     if a.write:
         from croplib_dp.io.supabase_write import SupabaseWriter
 
