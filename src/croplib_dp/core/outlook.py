@@ -130,6 +130,16 @@ def day_forecast(ft: pd.DataFrame, day: Any, etc_col: str = "ETc_main"):
     return m.sort_values("run").iloc[-1] if len(m) else None
 
 
+def lag_days_without_forecast(ft: pd.DataFrame, obs_last: Any, run: Any, etc_col: str = "ETc_main") -> list:
+    """관측이 없는 지연일(마지막 관측일 다음날 ~ 회차 날짜 전날) 중
+    아침 D+0 예보(또는 그날을 대상으로 한 02시까지의 발표)를 구할 수 없는 날.
+    비어 있지 않으면 전망이 '진행할 예보가 없습니다'로 실패하므로,
+    부르는 쪽이 채운 줄로 출발한다(이슈 #100)."""
+    D = pd.Timestamp(run).normalize()
+    days = pd.date_range(pd.Timestamp(obs_last) + pd.Timedelta(days=1), D - pd.Timedelta(days=1))
+    return [x for x in days if day_forecast(ft, x, etc_col) is None]
+
+
 def path(dr0: float, etc: list, rain: list, taw: float, raw: float) -> list:
     """출발 고갈량 dr0에서 관수 없이 날마다 wb_step → 끝 고갈량 목록"""
     out, dr = [], dr0
