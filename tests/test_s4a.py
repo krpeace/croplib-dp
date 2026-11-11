@@ -210,6 +210,7 @@ def test_retention_weekly_cap_is_raised_and_the_report_points_to_s6():
 
 # ── 감시: 지점별 회차 기록 (P8) ──────────────────────────────────────────
 def test_monitor_reads_every_recent_run_not_the_latest_twenty():
+    """최신 20줄이 아니라 지점별 최신 줄이 들어오는 기간으로 읽는다. 기간은 이슈 #101에서 48시간 → 최신 2회차로 줄였다."""
     db = FakeDb({"101": YESTERDAY, "216": YESTERDAY})
     M.read_state(URL, "srv", db, now=NOW)
     (u,) = [x for x in db.urls if "/rest/v1/forecast_runs" in x]
@@ -217,15 +218,7 @@ def test_monitor_reads_every_recent_run_not_the_latest_twenty():
     assert "limit" not in q or q["limit"] != "20"
     assert q["run_at"].startswith("gte.") and q["collector"] == "eq.actions"
     since = pd.Timestamp(q["run_at"].removeprefix("gte."))
-    assert since.tzinfo is not None
-    assert (
-        abs(
-            (
-                since.tz_convert("Asia/Seoul").tz_localize(None) - (NOW - pd.Timedelta(hours=48))
-            ).total_seconds()
-        )
-        < 1
-    )
+    assert since.tzinfo is not None and since == pd.Timestamp(M.runs_since(NOW))
 
 
 def _run_row(stn, hour="02", result="정시 성공"):
