@@ -7,6 +7,8 @@
     (core/radiation.py, 결정 0020)
   - 기압: 관측 현지기압(avgPa), 없으면 고도로 추정
   - 강수: ASOS는 비가 오지 않은 날 일강수 칸이 비어 있으므로 0. 행 자체가 없는 날은 비워 둔다(None)
+  - 값이 전부 빈 행(날짜만 있는 줄)은 행이 없는 날로 본다:
+    끝의 빈 줄은 결과에 없고(아직 없음), 가운데는 빠진 날이다.
   - 첫날~끝날 사이에 빠진 날짜는 행을 넣는다. ETo를 구하지 못한 날은 앞 7일 ETo 평균으로 채우고 filled = True.
     채운 날이 연속 7일을 넘으면 8일째부터 ETo를 비운다(None, filled = True)
 입력은 ASOS 응답의 item(문자열 값) 목록이다. 조회는 io/에서 한다.
@@ -105,6 +107,17 @@ def _one_day(item: Mapping[str, Any], st: StationMeta, valid_rs: float | None) -
     )
 
 
+# 일자료 행에서 이 값이 모두 비어 있으면 "날짜만 있는 빈 줄"이다.
+# 기상청 일자료 API가 아직 자료가 없는(또는 거둬들인) 날을
+# 날짜만 있는 줄로 돌려준 적이 있다(2026-11-11 17시 회차: 어제 행이 97곳 전부 빈 줄, 이슈 #100).
+# 비 안 온 날은 강수 칸만 비므로 기온·습도·풍속이 하나라도 있으면 정상 행이다.
+EMPTY_ROW_KEYS = ("maxTa", "minTa", "avgTa", "avgRhm", "avgWs")
+
+
+def is_empty_row(item: Mapping[str, Any]) -> bool:
+    return all(num(item.get(k)) is None for k in EMPTY_ROW_KEYS)
+
+
 def _empty_day(day: dt.date) -> dict:
     """ASOS 행이 없는 날: 값은 모두 비우고 ETo만 채운다"""
     return dict(
@@ -130,7 +143,11 @@ def daily_weather(items: Iterable[Mapping[str, Any]], station: StationMeta) -> l
     ETo 결측은 앞 7일 평균으로 채우되 연속 7일까지만 채우고, 8일째부터는 비운다(None, filled = True)."""
     raw: dict[dt.date, Mapping[str, Any]] = {}
     for it in items:
+        if is_empty_row(it):  # 빈 줄 = 행이 없는 날(끝의 빈 줄은 "아직 없음", 가운데는 빠진 날, 이슈 #100)
+            continue
         raw[_parse_date(it["tm"])] = it  # 같은 날이 두 번 오면 마지막 값
+    if not raw:
+        return []
     # 지점의 일사는 달력 월 단위 규칙까지 보고 걸러야 해서, 날마다 계산하기 전에 한꺼번에 정리한다
     valid_rs = clean_observed_rs({d: num(it.get("sumGsr")) for d, it in raw.items()}, station.lat)
     by_day = {d: _one_day(it, station, valid_rs[d]) for d, it in raw.items()}
