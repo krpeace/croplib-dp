@@ -13,11 +13,10 @@ from typing import Any
 
 import pandas as pd
 
-from croplib_dp.collectors.water import COLLECTOR, default_soil_code, kst_now, obs_all_enabled
+from croplib_dp.collectors.water import COLLECTOR, current_slot, default_soil_code, kst_now, obs_all_enabled
 from croplib_dp.core.grid import check_station_grid
 from croplib_dp.core.monitor import (
     OBS_LOOKBACK_DAYS,
-    RUNS_WINDOW_H,
     check_health,
     db_size_line,
     estimate_fallback_alerts,
@@ -43,6 +42,19 @@ def read_krei_reports(base: str, key: str, http: RestGet = rest_get, now=None) -
     return read_table(base, key, "report", http, query, schema="krei")
 
 
+def runs_since(now) -> str:
+    """회차 기록을 읽기 시작할 시각(UTC): 최신 회차와 그 앞 회차(발표 02시·17시)가
+    모두 들어오는 시각에서 1시간 여유. 최신 회차는 시작 시각(발표 + 10분)이 지난
+    가장 최근 회차(`current_slot`). 회차가 아직 돌고 있어 줄이 없으면
+    그 앞 회차 줄만 읽히지만 그 줄이 지점별 최신이다."""
+    _, latest = current_slot(pd.Timestamp(now))
+    previous = latest - pd.Timedelta(
+        hours=15 if latest.hour == 17 else 9
+    )  # 17:00 → 02:00, 02:00 → 전날 17:00
+    start = (previous - pd.Timedelta(hours=1)).tz_localize("Asia/Seoul").tz_convert("UTC")
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def read_state(
     base: str,
     key: str,
@@ -60,12 +72,11 @@ def read_state(
       (어제·작물 공통 값이 있는 지점 목록 → 운영 지점과 비교). 지점이 늘어도 매시간 호출 수가 늘지 않는다."""
     now = pd.Timestamp(now) if now is not None else kst_now()
     yesterday = (now - pd.Timedelta(days=1)).date()
-    # 최신 몇 줄이 아니라 최근 RUNS_WINDOW_H시간 전부(쪽 나눠 읽음):
+    # 최신 몇 줄이 아니라 최신 2회차 전부(쪽 나눠 읽음):
     # 예보 지점이 늘어도 지점마다 최신 줄이 들어온다
     # (S4, 결정 0029). 한 회차가 지점 수만큼 줄을 만들므로 "최신 20줄"은 20곳을 넘으면 일부 지점을 못 본다.
-    since = (
-        pd.Timestamp(now).tz_localize("Asia/Seoul").tz_convert("UTC") - pd.Timedelta(hours=RUNS_WINDOW_H)
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 판정에 필요한 것은 지점별 가장 최근 줄뿐이라 48시간 4회차 대신 최신 2회차만 읽는다(이슈 #101).
+    since = runs_since(now)
     runs = read_pages(
         base,
         key,
