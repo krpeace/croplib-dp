@@ -112,6 +112,62 @@ def test_row_with_only_rain_blank_is_a_normal_row():
     assert "2026-10-24" in _dates(r.heat_daily, stn_id="101", crop_id="common")
 
 
+class PartBlankAsos(FakeAsos):
+    """어제 줄에서 지정한 칸만 비운다 (나머지 칸은 그대로)"""
+
+    def __init__(self, day, blank_keys, **kw):
+        super().__init__(**kw)
+        self.day, self.blank_keys = day.isoformat(), blank_keys
+
+    def __call__(self, url, timeout):
+        code, body = super().__call__(url, timeout)
+        doc = json.loads(body)
+        for it in doc["response"]["body"]["items"]["item"]:
+            if it["tm"] == self.day:
+                it.update({k: "" for k in self.blank_keys})
+                it.setdefault("avgRhm", "55.0")  # 가짜 습도 (FakeAsos 는 습도를 주지 않는다)
+        return code, json.dumps(doc).encode()
+
+
+def test_day_with_only_sunlight_blank_is_written_as_usual():
+    """일사만 빈 날(기온은 있음): 그 날 적산온도 줄은 값과 함께 쓴다. 일사 줄은 채워서 쓴다(지금과 같음)."""
+    y = dt.date(2026, 10, 24)
+    r = H.run(dicts_with_common(), KEY, http=PartBlankAsos(y, ["sumGsr"]), clock=FakeClock(TODAY))
+    heat = next(
+        x
+        for x in r.heat_daily
+        if x["stn_id"] == "101" and x["crop_id"] == "common" and x["date"] == "2026-10-24"
+    )
+    assert heat["gdd_cum"] is not None and heat["filled"] is False
+    assert "2026-10-24" in _dates(r.sun_daily, stn_id="101")  # 일사 줄도 지우지 않는다
+    assert "빈 줄" not in H.brief_text(r)
+
+
+def test_day_without_max_min_temperature_is_not_written_even_if_humidity_is_there():
+    """기온(최고·최저)이 없는 날은 습도가 있어도 적산온도를 계산할 수 없다 → 그 날 줄을 올리지 않는다
+    (끝 날이면 옛 값을 null 로 덮는 같은 사고가 되므로)."""
+    y = dt.date(2026, 10, 24)
+    api = PartBlankAsos(y, ["maxTa", "minTa", "avgTa", "sumGsr"])
+    r = H.run(dicts_with_common(), KEY, http=api, clock=FakeClock(TODAY))
+    assert "2026-10-24" not in _dates(r.heat_daily, stn_id="101", crop_id="common")
+    assert "2026-10-24" not in _dates(r.sun_daily, stn_id="101")
+    assert "빈 줄" in H.brief_text(r)
+
+
+def test_day_with_temperature_but_humidity_wind_and_rain_blank_is_written_as_usual():
+    """기온이 있으면 습도·풍속·강수가 비어도 평소처럼 쓴다."""
+    y = dt.date(2026, 10, 24)
+    api = PartBlankAsos(y, ["avgRhm", "avgWs", "sumRn"])
+    r = H.run(dicts_with_common(), KEY, http=api, clock=FakeClock(TODAY))
+    row = next(
+        x
+        for x in r.heat_daily
+        if x["stn_id"] == "101" and x["crop_id"] == "common" and x["date"] == "2026-10-24"
+    )
+    assert row["gdd_cum"] is not None and row["filled"] is False
+    assert "빈 줄" not in H.brief_text(r)
+
+
 def test_absent_row_is_still_written_as_before():
     """줄 자체가 없는 날(빈 줄이 아님)은 지금처럼 쓴다 — 이번 수정은 '날짜만 있는 빈 줄'에만 해당."""
     r = _run(missing={dt.date(2026, 5, 5)})

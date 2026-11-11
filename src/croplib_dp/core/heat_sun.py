@@ -135,13 +135,13 @@ def year_table(
 
 # ── 빈 줄 날 · 이미 끝난 날 (이슈 #104, 결정 0033) ─────────────────────────────
 # 기상청 일자료가 어떤 날을 날짜만 있는 줄(값이 모두 빔)로 돌려준 적이 있다(2026-11-10, 이슈 #100).
-# 비 안 온 날은 강수 칸만 비므로 기온·습도·풍속·일사 중 하나라도 값이 있으면 정상 줄이다.
-BLANK_ROW_KEYS = ("maxTa", "minTa", "avgTa", "avgRhm", "avgWs", "sumGsr")
-
-
+# 적산온도는 최고·최저기온으로 계산하므로 둘 중 하나라도 없으면 그 날은 계산할 수 없다. 그런 줄(빈 줄 포함)을
+# 올리면 이미 올라간 옛 값을 비운 값(끝 날) 또는 평년 채움 값(가운데 날)으로 덮는다. 그래서 그 날 줄은
+# 올리지 않는다.
+# 기온이 있고 일사·강수·습도·풍속만 빈 날은 평소처럼 쓴다.
 def is_blank_row(item: Mapping) -> bool:
-    """ASOS 일자료 한 줄에 쓸 값이 하나도 없다 (날짜만 있는 줄)"""
-    return all(num(item.get(k)) is None for k in BLANK_ROW_KEYS)
+    """ASOS 일자료 한 줄에서 적산온도를 계산할 기온(최고·최저)이 없다 (빈 줄 포함)"""
+    return num(item.get("maxTa")) is None or num(item.get("minTa")) is None
 
 
 def required_dates(today: dt.date) -> list[dt.date]:

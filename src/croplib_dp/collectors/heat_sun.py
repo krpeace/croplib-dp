@@ -141,7 +141,7 @@ def build_station(
     ]
     this_year = [d for d in temp_days if d.year == year]
     last_obs = max(this_year) if this_year else None
-    # 값이 하나도 없는 '빈 줄' 날은 그 날 줄을 올리지 않는다.
+    # 기온(최고·최저)이 없는 '빈 줄' 날은 그 날 줄을 올리지 않는다.
     # 올리면 이미 올라간 옛 값을 비운 값으로 덮는다(이슈 #104)
     blank = {d.isoformat() for d, it in by_day.items() if d.year == year and is_blank_row(it)}
     heat, summary = [], dict(stn_id=stn_id, last_obs=str(last_obs) if last_obs else None, crops={})
@@ -365,7 +365,7 @@ def blank_text(stations: list[dict]) -> str:
     shown = ", ".join(f"{d}({by_day[d]}곳)" for d in days[:5]) + (" 외" if len(days) > 5 else "")
     n = len({s["stn_id"] for s in stations if s.get("blank")})
     return (
-        f"빈 줄 날 {n}곳: {shown} — 그 날 줄은 올리지 않음 "
+        f"빈 줄(기온 없음) 날 {n}곳: {shown} — 그 날 줄은 올리지 않음 "
         "(옛 값을 지우지 않는다, 값이 올라오면 다음 실행이 채움)"
     )
 
