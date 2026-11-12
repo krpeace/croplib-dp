@@ -81,13 +81,67 @@ def test_blank_day_is_reported_not_silent():
     assert not r.failed  # 실패는 아니다 (다음 실행이 채운다)
 
 
-def test_blank_day_in_the_middle_is_also_not_written_but_cumulative_goes_on():
-    """중간에 낀 빈 줄 날도 올리지 않는다. 쌓는 값은 평년으로 이어 간다 (뒤 날 줄은 정상)."""
+def test_blank_day_in_the_middle_is_written_as_a_normal_filled_row():
+    """가운데 낀 빈 날(이후 날 관측이 있음)은 평년 채움 줄로 쓴다 (#109). 끝 날만 안 쓴다."""
     r = _run(blank=[dt.date(2026, 5, 5)])
-    d = _dates(r.heat_daily, stn_id="101", crop_id="common")
-    assert "2026-05-05" not in d and {"2026-05-04", "2026-05-06"} <= d
+    row = next(
+        x
+        for x in r.heat_daily
+        if x["stn_id"] == "101" and x["crop_id"] == "common" and x["date"] == "2026-05-05"
+    )
+    assert row["filled"] is True and row["gdd_day"] == row["gdd_normal_day"] and row["gdd_cum"] is not None
+    sun = next(x for x in r.sun_daily if x["stn_id"] == "101" and x["date"] == "2026-05-05")
+    assert sun["filled"] is True and sun["rs_cum_mj"] is not None
     after = next(x for x in r.heat_daily if x["stn_id"] == "101" and x["date"] == "2026-10-24")
     assert after["gdd_cum"] is not None
+    assert len(r.heat_daily) == 2 * 3 * 365  # 가운데 빈 날은 줄 수를 줄이지 않는다
+
+
+def test_trailing_blank_day_is_not_written_but_a_blank_day_before_a_later_observation_is():
+    """같은 입력에서 11/10 이 가운데 낀 날(11/11 관측이 있음)이면 쓰고, 끝 날이면 쓰지 않는다 (11/10 재현)."""
+    when = pd.Timestamp("2026-11-12 09:20")
+    blank = [dt.date(2026, 11, 10)]
+    mid = H.run(dicts_with_common(), KEY, http=BlankDaysAsos(blank_days=blank), clock=FakeClock(when))
+    tail = H.run(
+        dicts_with_common(), KEY, http=BlankDaysAsos(blank_days=blank), clock=FakeClock("2026-11-11 09:20")
+    )  # 어제 = 11/10: 끝 날
+    assert "2026-11-10" in _dates(mid.heat_daily, stn_id="101", crop_id="common")
+    assert "2026-11-10" in _dates(mid.sun_daily, stn_id="101")
+    assert "2026-11-10" not in _dates(tail.heat_daily, stn_id="101", crop_id="common")
+    assert "2026-11-10" not in _dates(tail.sun_daily, stn_id="101")
+
+
+def test_existing_null_row_in_db_is_overwritten_by_the_filled_row():
+    """DB 에 이미 있는 11/10 null 줄(#106 이전 늦은 실행이 덮은 것)은 같은 키의 채움 줄로 덮인다."""
+    when = pd.Timestamp("2026-11-12 09:20")
+    r = H.run(
+        dicts_with_common(),
+        KEY,
+        http=BlankDaysAsos(blank_days=[dt.date(2026, 11, 10)]),
+        clock=FakeClock(when),
+    )
+    sent = {}
+
+    class W:
+        def upsert(self, table, rows, on_conflict, returning=False):
+            sent[table] = list(rows)
+            return []
+
+    H.publish(r, W())
+    assert r.uploaded
+    key = ("101", "common", "2026-11-10")
+    rows = [x for x in sent["heat_daily"] if (x["stn_id"], x["crop_id"], x["date"]) == key]
+    assert len(rows) == 1 and rows[0]["gdd_cum"] is not None and rows[0]["filled"] is True
+    assert [x for x in sent["sun_daily"] if (x["stn_id"], x["date"]) == ("101", "2026-11-10")]
+
+
+def test_brief_reports_only_trailing_blank_days_of_the_last_seven_days():
+    """요약은 최근 7일 끝 날의 빈 줄만 알린다. 과거 가운데 빈 날은 알리지 않는다."""
+    r = _run(blank=[dt.date(2026, 5, 5), dt.date(2026, 10, 24)])
+    text = H.brief_text(r)
+    assert "2026-10-24" in text and "2026-05-05" not in text
+    r2 = _run(blank=[dt.date(2026, 5, 5)])  # 끝 날은 정상
+    assert "빈 줄" not in H.brief_text(r2)
 
 
 def test_normal_days_are_all_written_when_nothing_is_blank():
