@@ -42,6 +42,7 @@ from croplib_dp.io.contract import SPECS, check_rows
 from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries, read_table
 
 NORMAL_YEARS = 10
+BLANK_REPORT_DAYS = 7  # 요약에 알리는 끝 날 빈 줄의 최근 일수
 PREV_YEAR_DAYS = 3  # 1월 1~3일은 작년도 다시 계산한다 (12/31 관측이 늦게 올라올 때를 위해)
 HEAT_KEY = SPECS["heat_daily"].key
 SUN_KEY = SPECS["sun_daily"].key
@@ -141,9 +142,14 @@ def build_station(
     ]
     this_year = [d for d in temp_days if d.year == year]
     last_obs = max(this_year) if this_year else None
-    # 기온(최고·최저)이 없는 '빈 줄' 날은 그 날 줄을 올리지 않는다.
-    # 올리면 이미 올라간 옛 값을 비운 값으로 덮는다(이슈 #104)
-    blank = {d.isoformat() for d, it in by_day.items() if d.year == year and is_blank_row(it)}
+    # 기온(최고·최저)이 없는 '빈 줄' 날 중 마지막 관측일 뒤(끝 날)는 그 날 줄을 올리지 않는다.
+    # 올리면 이미 올라간 옛 값을 비운 값으로 덮는다(이슈 #104). 마지막 관측일 앞에 낀 빈 날은
+    # 평년 채움 줄(filled = true)로 쓴다 — 건너뛰면 DB 에 남은 null 줄이 영영 안 바뀐다(이슈 #109).
+    blank = {
+        d.isoformat()
+        for d, it in by_day.items()
+        if d.year == year and is_blank_row(it) and (last_obs is None or d > last_obs)
+    }
     heat, summary = [], dict(stn_id=stn_id, last_obs=str(last_obs) if last_obs else None, crops={})
     summary["blank"] = sorted(blank)
     for crop_id, t_base in crops.items():
@@ -281,6 +287,9 @@ def run(
             continue
         for b in r.blocks:  # 받은 자료 한 벌로 해마다 계산한다
             heat, sun, summary = build_station(stn_id, items, crops, b.year, b.normal_from, b.normal_to, lat)
+            block_end = min(end, dt.date(b.year, 12, 31))  # 요약은 최근 7일 끝 날의 빈 줄만 알린다
+            recent = (block_end - dt.timedelta(days=BLANK_REPORT_DAYS - 1)).isoformat()
+            summary["blank"] = [d for d in summary["blank"] if d >= recent]
             r.heat_daily += heat
             r.sun_daily += sun
             b.stations.append(dict(summary, name=name))
