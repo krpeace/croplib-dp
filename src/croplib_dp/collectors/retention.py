@@ -22,6 +22,7 @@ import gzip
 import json
 import os
 import sys
+import time
 import urllib.parse
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -53,6 +54,11 @@ ALERT_TITLE = "[용량·보관 경고] 저장 공간과 전망 표 보관"
 ALERT_LABEL = "용량 경고"
 OUT_NAME = "retention"
 RUN_EMBED = "forecast_runs!inner(run_at,run_name,stn_id,collector)"
+# Storage 는 같은 경로를 덮어쓴 직후 잠시 옛 내용을 줄 수 있다(CDN 반영 지연, 최대 약 60초). 2026-11-15 첫 자동 실행이 이것으로
+# 멈췄다(이슈 #117). 한 번 달랐다고 바로 멈추지 않고 맞을 때까지 이 간격(초)으로 최대 5번 읽는다(대기 합계 110초/파일).
+# 비교 기준(바이트 전체 sha256, 기존 파일은 목록 크기)은 그대로이고, 끝내 다르면 지금처럼 멈춘다. 첫 읽기는 기다리지 않는다.
+VERIFY_WAITS_S = (0, 5, 15, 30, 60)
+SLEEP: Callable[[float], None] = time.sleep  # 시험에서 바꿔 끼운다(tests/conftest.py): 기다리지 않고 기록만
 
 
 class RetentionError(RuntimeError):
@@ -115,6 +121,8 @@ class Plan:
     xz: dict = field(default_factory=lambda: dict(n=0, gz_bytes=0, xz_bytes=0, ratio=None))
     xz_total_saving_bytes: float = 0.0
     raw_total_bytes: int = 0  # raw 버킷 전체 파일 크기 합(Storage 용량 경고용)
+    # 다시 읽어서 맞춘 일(조용히 넘기지 않고 보고에 남긴다, #117)
+    notes: list[str] = field(default_factory=list)
 
     @property
     def total_rows(self) -> int:
@@ -132,6 +140,7 @@ class ApplyResult:
     raw_deleted: int
     raw_path_cleared: int
     archives: list[str]
+    notes: list[str] = field(default_factory=list)  # 다시 읽어서 맞춘 일(#117)
 
 
 @dataclass
@@ -207,12 +216,60 @@ def _expired_rows_two_step(env: Env, table: str, end_quoted: str) -> list[tuple[
     return out
 
 
+def _read_existing(env: Env, path: str, listed_size: int | None, notes: list[str]) -> bytes | None:
+    """기존 보관 파일 읽기. 목록(DB 메타데이터)의 크기와 내려받은 길이가 같을 때까지 다시 읽는다(#117).
+    옛 내용으로 합치면 이미 보관한 줄(DB 에서는 이미 지움)이 덮어쓴 파일에서 사라지므로, 끝내 다르면 멈춘다."""
+    seen: list[int | None] = []
+    for k, wait in enumerate(VERIFY_WAITS_S, start=1):
+        if wait:
+            SLEEP(wait)
+        data = env.storage.download(BUCKET, path)
+        size = None if data is None else len(data)
+        if size == listed_size:
+            if k > 1:
+                notes.append(
+                    f"{path}: 기존 보관 파일을 {k}번째 읽기에서 목록 크기({listed_size}바이트)와 맞게 받았습니다 "
+                    f"(앞 {k - 1}번은 옛 내용·크기 불일치: {seen})"
+                )
+            return data
+        seen.append(size)
+    raise RetentionError(
+        f"기존 보관 파일을 읽지 못했습니다: {BUCKET}/{path} (목록 크기 {listed_size}바이트, "
+        f"받은 크기 {seen} — {len(seen)}번 읽어도 맞지 않아 덮어쓰지 않고 멈춥니다)"
+    )
+
+
+def _verify_upload(env: Env, m: "MonthPlan", notes: list[str]) -> bytes:
+    """올린 보관 파일을 다시 내려받아 바이트 전체의 sha256 이 올린 것과 같을 때까지 읽는다(#117).
+    덮어쓴 직후에는 옛 내용이 잠시 내려올 수 있다. 끝내 다르면 지금처럼 멈춘다(지우지 않음)."""
+    trail: list[str] = []
+    back: bytes | None = None
+    for k, wait in enumerate(VERIFY_WAITS_S, start=1):
+        if wait:
+            SLEEP(wait)
+        back = env.storage.download(BUCKET, m.path)
+        if back is not None and R.sha256(back) == m.sha256:
+            if k > 1:
+                notes.append(
+                    f"{m.path}: 올린 보관 파일을 {k}번째 내려받기에서 확인했습니다 (앞 {k - 1}번은 다른 내용: {trail})"
+                )
+            return back
+        trail.append("없음" if back is None else f"{len(back)}바이트")
+    got = "받은 파일 없음" if back is None else f"받은 {len(back)}바이트·sha {R.sha256(back)[:12]}"
+    raise RetentionError(
+        f"{m.path}: 올린 보관 파일을 다시 내려받아 확인하지 못했습니다(내려받은 파일이 올린 것과 다름). 이 뒤로 지우지 않습니다 — "
+        f"기대 {len(m.data)}바이트·sha {m.sha256[:12]}, {got}, {len(trail)}번 시도 (시도별 받은 크기: {trail})"
+    )
+
+
 def build_plan(env: Env, now: Any, through: dt.date | None = None, xz_sample: int = XZ_SAMPLE) -> Plan:
     now = pd.Timestamp(now)
     through = through or R.max_through(now)
     R.check_through(through, now)
     end = R.through_end_utc(through)
     plan = Plan(now=now, through=through)
+    # 보관 파일의 목록 크기(DB 메타데이터). 보관할 달이 있을 때만 한 번 읽는다
+    listed: dict[str, int] | None = None
     for table in TABLES:
         pairs = _expired_rows(env, table, end)
         plan.rows[table] = len(pairs)
@@ -223,7 +280,9 @@ def build_plan(env: Env, now: Any, through: dt.date | None = None, xz_sample: in
         for month in sorted(by_month):
             path = R.archive_path(table, month)
             new_rows = [R.flatten(table, r, run) for r, run in by_month[month]]
-            old = env.storage.download(BUCKET, path)
+            if listed is None:
+                listed = {f["path"]: f["size"] for f in env.storage.list_files(BUCKET, R.ARCHIVE_ROOT)}
+            old = _read_existing(env, path, listed.get(path), plan.notes)
             try:
                 existing = R.decode_archive(table, old) if old is not None else []
             except Exception as e:  # 기존 보관 파일이 깨졌으면 덮어쓰지 않고 멈춘다
@@ -347,6 +406,11 @@ def report_markdown(plan: Plan) -> str:
     L += [
         "",
         f"- 이번에 올릴 보관 파일 크기 합계(gz): {gz_total:,}B ({_mb(gz_total)})",
+    ]
+    if plan.notes:  # 기존 보관 파일을 읽을 때 옛 내용이 내려와 다시 읽은 경우(#117)
+        L += ["- 기존 보관 파일을 **다시 읽어서** 맞췄습니다(덮어쓴 직후 옛 내용이 내려옴):"]
+        L += [f"  - {n}" for n in plan.notes]
+    L += [
         "",
         "## Storage 사용량 (`raw` 버킷)",
         "",
@@ -413,13 +477,10 @@ def apply(
         )
     deleted = {t: 0 for t in TABLES}
     archives: list[str] = []
+    notes = list(plan.notes)
     for m in sorted(plan.months, key=lambda x: (x.month, x.table)):
         env.storage.upload(BUCKET, m.path, m.data)
-        back = env.storage.download(BUCKET, m.path)
-        if back is None or R.sha256(back) != m.sha256:
-            raise RetentionError(
-                f"{m.path}: 올린 보관 파일을 다시 내려받아 확인하지 못했습니다(내려받은 파일이 올린 것과 다름). 이 뒤로 지우지 않습니다"
-            )
+        back = _verify_upload(env, m, notes)
         rows_back = R.decode_archive(m.table, back)
         if len(rows_back) != m.merged_rows:
             raise RetentionError(
@@ -451,7 +512,12 @@ def apply(
                 env.writer.patch("forecast_runs", f"raw_path=in.{_in(part)}", {"raw_path": None}, "run_id")
             )
     return ApplyResult(
-        through=through, deleted=deleted, raw_deleted=raw_deleted, raw_path_cleared=cleared, archives=archives
+        through=through,
+        deleted=deleted,
+        raw_deleted=raw_deleted,
+        raw_path_cleared=cleared,
+        archives=archives,
+        notes=notes,
     )
 
 
@@ -468,6 +534,9 @@ def apply_markdown(res: ApplyResult, now: Any) -> str:
         "- forecast_runs: 삭제 0",
         f"- 대표 밖 원문 삭제 {res.raw_deleted}개, forecast_runs.raw_path 비움 {res.raw_path_cleared}줄",
     ]
+    if res.notes:  # 덮어쓴 직후 옛 내용이 내려와 다시 읽어 맞춘 경우(#117). 조용히 넘기지 않는다
+        L += ["", "## 다시 읽어서 맞춘 일 (덮어쓴 직후 옛 내용이 내려옴, 결정 0022)", ""]
+        L += [f"- {n}" for n in res.notes]
     return "\n".join(L) + "\n"
 
 

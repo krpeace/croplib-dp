@@ -40,6 +40,13 @@ class FakeSupabase:
         self.size_override: dict[str, int] = {}  # Storage 파일 경로 → 크기(큰 파일을 흉내)
         self.head_calls: list[str] = []
         self.no_embed = False  # True 면 조인(forecast_runs!inner) 조회가 400 으로 실패한다
+        # 덮어쓴 직후·옛 캐시 흉내 (이슈 #117): 목록(크기)은 DB 메타데이터라 늘 맞고, 내려받기만 늦게 맞는다
+        self.get_queue: dict[
+            str, list
+        ] = {}  # 경로 → 앞으로의 내려받기 결과(bytes, None=없음). 다 쓰면 실제 내용
+        self.stale_after_overwrite: dict[str, int] = {}  # 경로 → 덮어쓴 뒤 n번은 덮어쓰기 전 내용을 준다
+        self._stale: dict[tuple[str, str], list[bytes]] = {}
+        self.gets: dict[str, int] = {}  # 경로 → 내려받기 횟수
 
     # ── 표 ────────────────────────────────────────────────────────────
     def _run(self, run_id):
@@ -184,9 +191,19 @@ class FakeSupabase:
         if method == "POST":
             if p in self.upload_fail:
                 return 500, b"fail"
+            if (bucket, p) in self.storage and self.stale_after_overwrite.get(p):
+                self._stale[(bucket, p)] = [self.storage[(bucket, p)]] * self.stale_after_overwrite[p]
             self.storage[(bucket, p)] = body
             return 200, b"{}"
         if method == "GET":
+            self.gets[p] = self.gets.get(p, 0) + 1
+            if self.get_queue.get(p):
+                first = self.get_queue[p].pop(0)
+                if first is None:
+                    return 400, b'{"statusCode":"404","error":"not_found","message":"Object not found"}'
+                return 200, first
+            if self._stale.get((bucket, p)):
+                return 200, self._stale[(bucket, p)].pop(0)
             if (bucket, p) not in self.storage:
                 return 400, b'{"statusCode":"404","error":"not_found","message":"Object not found"}'
             data = self.storage[(bucket, p)]

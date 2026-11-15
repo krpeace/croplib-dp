@@ -497,3 +497,115 @@ def test_archive_can_rebuild_cum3_forecast_error_with_observed_eto():
     assert len(cum) >= 1
     rmse = float(((cum.fcst - cum.obs) ** 2).mean() ** 0.5)
     assert rmse == pytest.approx(0.3, abs=1e-9)  # 예보 3.0·3.1·3.2 합 9.3 대 관측 9.0
+
+
+# ── 덮어쓴 직후 옛 내용이 내려오는 경우 (이슈 #117, 2026-11-15 첫 자동 실행 오류) ──────────────────
+# Storage 는 덮어쓴 직후 잠시 옛 내용을 줄 수 있다(CDN). 비교 기준(바이트 전체 sha256)은 그대로 두고 맞을 때까지 다시 읽는다.
+# 목록의 파일 크기는 DB 메타데이터라 늘 맞으므로, 기존 보관 파일을 읽을 때는 그 크기와 길이를 맞춰 본다.
+def _old_file(f, scenario="S1"):
+    """이미 보관돼 있던 한 줄이 든 10월 파일을 만들고 돌려준다. 그 줄(A)은 DB에 없다."""
+    row = dict(f.tables["water_outlook"][3], scenario_id=scenario)
+    arch = R.flatten("water_outlook", row, f.tables["forecast_runs"][1])
+    f.storage[("raw", OUT_PATH)] = R.encode_archive("water_outlook", [arch])
+    return arch
+
+
+def _keys_in(f):
+    rows = R.decode_archive("water_outlook", f.storage[("raw", OUT_PATH)])
+    return {R.row_key("water_outlook", r) for r in rows}
+
+
+def test_overwrite_with_stale_reads_is_verified_after_retries_and_then_deletes(sleeps):
+    f = _fake()
+    _old_file(f)
+    f.stale_after_overwrite = {OUT_PATH: 2}  # 덮어쓴 뒤 두 번은 옛 내용
+    res = _apply(f)
+    assert res.deleted == {"water_outlook": 12, "water_outlook_summary": 4}
+    assert f.gets[OUT_PATH] == 1 + 3  # 계획에서 기존 파일 1번 + 올린 뒤 확인 3번(옛 내용 2번 → 맞음)
+    assert sleeps == [5, 15]  # 첫 읽기는 바로, 그다음 5초·15초 기다림
+    assert any(OUT_PATH in n and "3번째" in n for n in res.notes)  # 조용히 넘기지 않고 남긴다
+    assert OUT_PATH in apply_md(res)
+
+
+def apply_md(res):
+    return RT.apply_markdown(res, NOW)
+
+
+def test_overwrite_that_stays_stale_stops_with_numbers_and_deletes_nothing_of_that_month(sleeps):
+    f = _fake()
+    _old_file(f)
+    f.stale_after_overwrite = {OUT_PATH: 99}
+    with pytest.raises(RT.RetentionError, match="내려받") as e:
+        _apply(f)
+    msg = str(e.value)
+    assert OUT_PATH in msg
+    # 기대·받은 바이트 수와 sha 앞 12자, 시도 횟수가 오류 문구에 들어 있다
+    import re
+
+    assert re.search(r"기대 \d+바이트·sha [0-9a-f]{12}, 받은 \d+바이트·sha [0-9a-f]{12}, 5번 시도", msg)
+    assert sleeps[-4:] == [5, 15, 30, 60] and f.gets[OUT_PATH] == 1 + 5
+    assert {1, 2, 3} <= {r["run_id"] for r in f.tables["water_outlook"]}  # 10월 줄은 그대로(지운 것 없음)
+    assert {1, 2, 3} <= {r["run_id"] for r in f.tables["water_outlook_summary"]}
+
+
+def test_overwrite_first_download_missing_then_ok_passes(sleeps):
+    f = _fake()
+    f.get_queue = {
+        SEP_PATH: [None, None]
+    }  # 계획의 기존 파일 읽기(없음이 맞음) 1번 + 올린 뒤 첫 확인은 아직 안 보임
+    res = _apply(f)
+    assert res.deleted["water_outlook"] == 12
+    assert sleeps == [5] and f.gets[SEP_PATH] == 3
+    assert any(SEP_PATH in n and "2번째" in n for n in res.notes)
+
+
+def test_normal_path_reads_once_and_never_waits(sleeps):
+    f = _fake()
+    res = _apply(f)
+    assert sleeps == [] and res.notes == []  # 정상 경로는 그대로: 대기 0, 기록할 것 없음
+    assert f.gets[SEP_PATH] == 2 and f.gets[OUT_PATH] == 2  # 계획 1번 + 확인 1번
+
+
+def test_existing_archive_read_stale_is_retried_so_older_rows_are_not_lost(sleeps):
+    """보완: 기존 보관 파일을 처음엔 옛 내용으로 줘도(목록 크기와 길이가 다름) 다시 읽어 맞는 내용과 합친다.
+    옛 내용으로 합쳤다면 이미 보관한 줄(DB에선 이미 지움)이 파일에서 사라진다."""
+    f = _fake()
+    a = _old_file(f, "S1")
+    b = dict(a, scenario_id="S9")  # 이미 보관돼 있는 두 번째 줄(DB에는 없다)
+    current = R.encode_archive("water_outlook", R.sort_rows("water_outlook", [a, b]))
+    old = f.storage[("raw", OUT_PATH)]
+    f.storage[("raw", OUT_PATH)] = current  # 목록 크기는 현재 내용(a+b)의 길이
+    f.get_queue = {OUT_PATH: [old, old]}  # 처음 두 번 읽기는 옛 내용(a 한 줄)
+    res = _apply(f)
+    keys = _keys_in(f)
+    assert R.row_key("water_outlook", a) in keys and R.row_key("water_outlook", b) in keys
+    assert sleeps[:2] == [5, 15]
+    assert any(OUT_PATH in n and "기존" in n and "3번째" in n for n in res.notes)
+
+
+def test_existing_archive_read_that_never_matches_the_listing_stops_before_any_write(sleeps):
+    f = _fake()
+    a = _old_file(f, "S1")
+    b = dict(a, scenario_id="S9")
+    current = R.encode_archive("water_outlook", R.sort_rows("water_outlook", [a, b]))
+    old = f.storage[("raw", OUT_PATH)]
+    f.storage[("raw", OUT_PATH)] = current
+    f.get_queue = {OUT_PATH: [old] * 10}  # 끝내 옛 내용
+    before = {t: len(v) for t, v in f.tables.items()}
+    with pytest.raises(RT.RetentionError, match="기존 보관 파일"):
+        _apply(f)
+    assert f.writes == [] and {t: len(v) for t, v in f.tables.items()} == before  # 올리기·지우기 0
+    assert f.storage[("raw", OUT_PATH)] == current  # 덮어쓰지 않았다
+
+
+def test_dry_run_plan_reports_a_retried_existing_read_and_still_writes_nothing(sleeps):
+    f = _fake()
+    a = _old_file(f)
+    b = dict(a, scenario_id="S9")
+    current = R.encode_archive("water_outlook", R.sort_rows("water_outlook", [a, b]))
+    old = f.storage[("raw", OUT_PATH)]
+    f.storage[("raw", OUT_PATH)] = current
+    f.get_queue = {OUT_PATH: [old]}
+    p = RT.build_plan(_env(f), NOW)
+    assert f.writes == [] and any(OUT_PATH in n for n in p.notes)
+    assert "다시 읽" in RT.report_markdown(p) and OUT_PATH in RT.report_markdown(p)
