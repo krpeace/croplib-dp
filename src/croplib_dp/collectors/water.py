@@ -99,6 +99,16 @@ NONREP_CATCHUP_DEFAULT = (3, 6)  # 02시·17시가 아닌 회차(시험 실행 �
 # 이만큼 기다렸다 다시 받는다
 # (ASOS와 같은 30초·90초, 이슈 #100). 필요하지 않은 앞선 발표는 전과 같이 한 번만 받는다.
 NEEDED_ISSUE_RETRY_S = (30, 90)
+# 마감(발표 + 90분) 뒤에 도는 지연 재실행도 서비스 발표 첫 시도가 일시 오류(시간 초과·서버 오류)면
+# 이만큼 기다렸다 다시 받는다 (이슈 #107·#118, 결정 0036).
+# 2026-11-12 08:28 늦은 예약 실행에서 서귀포(189)가 시간 초과 한 번으로 `백업: 직전 발표`가 됐다.
+# 정시 회차(마감 안)는 이 값을 쓰지 않는다. 비우면(`()`) 재시도가 꺼져 예전 동작(한 번만 받기)으로 돌아간다.
+LATE_SERVICE_RETRY_S = (30, 90)
+# 한 회차 안에서 위 새 재시도에 쓸 수 있는 시간 합계(대기 + 그 재시도 요청에 걸린 시간, 초).
+# 재시도를 시작하기 전에 `쓴 시간 + 대기 > 상한`이면 그 재시도는 하지 않고 기록한다.
+# 느린 API 날 97곳이 차례로 재시도하며 회차가 몇 시간으로 늘어나는 것을 막는다
+# (최악: 상한 + 시간 초과 한 번 ≈ 300 + 34초). 기존 재시도(필요한 앞선 발표·ASOS)는 이 상한에 세지 않는다.
+RETRY_BUDGET_S = 300
 WB_BACKFILL_MAX = 20  # water_balance_daily 소급은 한 번에 대표 밖 지점 20곳까지(결정 0030)
 NONREP_SWITCH = "NONREP_SCENARIOS"  # Actions 변수: true 일 때만 대표 밖 지점에 3일 전망·물수지(기본 꺼짐)
 COLLECTOR = "actions"
@@ -195,6 +205,23 @@ class RunLog:
         )
 
 
+@dataclass
+class RetryBudget:
+    """지연 재실행 서비스 발표 재시도에 쓴 시간·횟수·상한에 걸려 못 한 지점 (이슈 #118, 결정 0036)"""
+
+    limit_s: float = field(default_factory=lambda: RETRY_BUDGET_S)
+    spent_s: float = 0.0  # 재시도의 대기 + 그 재시도 요청에 걸린 시간 합계
+    retries: int = 0  # 실제로 한 재시도 수
+    skipped: list[str] = field(default_factory=list)  # 상한 때문에 재시도를 못 한 지점 번호
+
+    def allows(self, wait_s: float) -> bool:
+        return self.spent_s + wait_s <= self.limit_s
+
+    def charge(self, seconds: float) -> None:
+        self.spent_s += seconds
+        self.retries += 1
+
+
 # ── 단기예보 받기 ───────────────────────────────────────────────────────
 class ForecastCollector:
     """격자 하나의 단기예보를 받는다. 받은 발표는 계산에 쓸 항목만(usable_items) 모아 둔다."""
@@ -208,8 +235,11 @@ class ForecastCollector:
         clock: Clock,
         log: RunLog,
         representative: bool = True,
+        budget: "RetryBudget | None" = None,
     ):
         self.key, self.nx, self.ny, self.http, self.clock, self.log = key, int(nx), int(ny), http, clock, log
+        # 지연 재실행의 서비스 발표 재시도에 쓸 회차 공통 예산(#118). 없으면(기본) 그 재시도는 안 한다.
+        self.budget = budget
         # 대표 10곳은 앞선 발표 8개·원문 전부(`fcst/`),
         # 대표 밖은 앞선 발표 2개·서비스 발표 원문만(`fcst-ext/`, 90일)
         self.representative = representative
@@ -267,6 +297,35 @@ class ForecastCollector:
             got += st in ("ok", "partial")
         return got
 
+    def _late_retries(
+        self, issue: pd.Timestamp, st: str, chk: dict | None, out: dict
+    ) -> tuple[str, dict | None]:
+        """마감 뒤 지연 재실행에서 서비스 발표 첫 시도가 일시 오류(`retry`)면
+        LATE_SERVICE_RETRY_S 만큼 기다렸다 다시 받는다.
+        `ok`·`partial`·`incomplete`·`nodata`·`fatal` 은 다시 받지 않는다(필요한 앞선 발표와 같은 규칙).
+        시작 전에 `쓴 시간 + 대기 > 상한`이면 그 재시도는 하지 않고 `out["retry_skipped"]` 에 남긴다
+        (조용히 넘기지 않음). 시작한 재시도는 끝까지 한다. 시간은 `clock` 으로 잰다."""
+        assert self.budget is not None
+        for wait in LATE_SERVICE_RETRY_S:
+            if st != "retry" or self.fatal:
+                break
+            if not self.budget.allows(wait):
+                out["retry_skipped"] = True
+                break
+            t0 = self.clock.now()
+            self.clock.sleep(wait)
+            out["attempts"] += 1
+            st, chk = self.get_issue(issue, out["attempts"])
+            self.budget.charge((self.clock.now() - t0).total_seconds())
+            out["last"] = st
+            if chk is not None and chk["required_ok"]:
+                out["required_ok"] = True
+                if out["received_at"] is None:
+                    out["received_at"] = self.clock.now()
+            if st == "ok":
+                out.update(complete8=True, received_at=self.clock.now())
+        return st, chk
+
     def collect_service(self, issue: Any, wait: bool = True) -> dict:
         """서비스 발표를 마감까지 받기. wait=False면 지금 한 번만(시험 실행).
         반환 dict(received_at, complete8, required_ok, attempts, last, late)"""
@@ -301,6 +360,8 @@ class ForecastCollector:
             if not caught:  # 첫 시도 뒤: 직전 발표를 먼저 확보
                 self.catch_up(issue)
                 caught = True
+            if out["late"] and wait and self.budget is not None:
+                st, chk = self._late_retries(issue, st, chk, out)
             if st in ("ok", "fatal"):
                 break
         if not caught:
@@ -450,6 +511,8 @@ class SlotResult:
     obs_n: int = 0
     calc_seconds: float = 0.0  # 시나리오 계산에 쓴 시간(API 기다림 제외, 결정 0030)
     calc_n: int = 0  # 계산한 시나리오 수
+    # 지연 재실행 서비스 발표 재시도에 쓴 시간·횟수·상한에 걸린 지점(#118, 결정 0036). 정시 회차는 비어 있다
+    retry_budget: RetryBudget = field(default_factory=RetryBudget)
     wb_backfill: bool = False  # water_balance_daily 소급 실행인가(--wb-backfill)
     egress_line: str = ""  # DB에서 내려받은 바이트 한 줄(io/egress, 결정 0031). main 이 채운다
 
@@ -1172,9 +1235,12 @@ def run_slot(
                 clock,
                 result.log,
                 representative=is_representative(st),
+                budget=result.retry_budget,
             )
             col = collector.collect_service(issue, wait=wait)
             col["started_at"] = started
+            if col.get("retry_skipped"):  # 상한 때문에 재시도를 못 한 지점(요약에 번호를 남긴다)
+                result.retry_budget.skipped.append(stn_id)
         starts = [dt.date.fromisoformat(str(s["season_start"])[:10]) for s in scen]
         if st.get("has_forecast") and d.soils:
             starts.append(_soil_season_start(prev, backfill=soil_backfill))
@@ -1290,12 +1356,22 @@ def timing_text(r: SlotResult) -> str:
     """한 회차의 단계별 시간·지점 수·호출 수. 예보 지점을 20곳씩 켤 때 회차 시간·호출 수를 실측하는 근거다."""
     fcst = sum(1 for e in r.log.entries if e["kind"] == "fcst")
     asos = sum(1 for e in r.log.entries if e["kind"] == "asos")
-    return (
+    line = (
         f"단계: 예보 지점 {r.fc_n}곳 {_duration(r.fc_seconds)}"
         f" · 관측 지점 {r.obs_n}곳 {_duration(r.obs_seconds)}"
         f" · 시나리오 {r.calc_n}개 계산 {_duration(r.calc_seconds)}"
         f" · 예보 요청 {fcst}번(발표 단위, 쪽 수 제외) · ASOS {asos}번"
     )
+    # 지연 재실행의 서비스 발표 재시도(이슈 #118). 쓰지 않은 회차는 문구가 하나도 안 붙는다
+    b = r.retry_budget
+    if b.retries:
+        line += f" · 지연 재시도 {b.retries}번 (대기·요청 {b.spent_s:.0f}초)"
+    if b.skipped:
+        line += (
+            f"\n지연 재시도 상한({b.limit_s:.0f}초) 도달: "
+            f"{len(b.skipped)}곳은 서비스 발표 재시도를 하지 못함 — " + ", ".join(b.skipped)
+        )
+    return line
 
 
 def growth_text(r: SlotResult) -> str:
