@@ -21,8 +21,10 @@ EPS = 1e-9
 
 def calc_gdd(avg_ta, max_ta, min_ta, t_base=DEFAULT_T_BASE, t_upper=DEFAULT_T_UPPER, method=DEFAULT_METHOD):
     """하루 GDD (cropweather temp_core.calc_gdd 그대로). 입력이 비면 None.
-    maxmin = max((최고+최저)/2 − 기준, 0) (기본, FAO56rev),
-    avg = max(평균 − 기준, 0), aquacrop = 상한 반영."""
+    maxmin = max((최고+최저)/2 − 기준, 0) (기본, 기본형: McMaster & Wilhelm 1997 Method 1, 상한 없음),
+    avg = max(평균 − 기준, 0),
+    aquacrop = 일평균으로 판정해 상한 반영 (FAO56rev Paredes 2025 Eq. 2와 같은 꼴.
+    판정에는 기상청 일평균기온을 쓴다)."""
     if method == "maxmin":
         if max_ta is None or min_ta is None:
             return None
