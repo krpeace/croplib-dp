@@ -230,6 +230,21 @@ def test_main_cache_dir_option(tmp_path, monkeypatch):
     for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "DATA_GO_KR"):
         monkeypatch.setenv(k, KEY if k == "DATA_GO_KR" else "x")
     monkeypatch.setattr(H, "load_dictionaries", lambda *a, **k: _dicts())
+    # main 은 이제 뷰 crop_accum_series 도 읽는다(이슈 #127).
+    # 가짜 DB 주소로는 읽을 수 없어 한 줄짜리 가짜 뷰를 끼운다.
+    monkeypatch.setattr(
+        H,
+        "read_series_rows",
+        lambda *a, **k: [
+            dict(
+                crop_id="apple",
+                season_type_id="apple-main",
+                heat_t_base_c=4,
+                heat_cum_start_mmdd="01-01",
+                sun_cum_start_mmdd="01-01",
+            )
+        ],
+    )
     api = FakeAsos()
     real_run = H.run
     monkeypatch.setattr(
