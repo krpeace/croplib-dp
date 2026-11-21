@@ -290,8 +290,15 @@ E2_COUNTS = {
 
 
 def test_estimate_reproduces_the_measured_57mb_from_the_e2_row_counts():
-    # 줄 수를 읽는 표 10개 = E2 의 8개 + 적산 계열 새 표 2개(이슈 #127, E2 때는 없던 표라 줄 수 0 으로 본다)
-    assert set(R.COUNT_TABLES) == set(E2_COUNTS) | {"heat_series_daily", "sun_series_daily"}
+    # 줄 수를 읽는 표 13개 = E2 의 8개 + 적산 계열 새 표 2개(#127) + 농장 결과 표 3개(#131)
+    # (E2 때는 없던 표라 줄 수 0 으로 본다)
+    assert set(R.COUNT_TABLES) == set(E2_COUNTS) | {
+        "heat_series_daily",
+        "sun_series_daily",
+        "farm_water_daily",
+        "farm_water_outlook",
+        "farm_water_outlook_summary",
+    }
     assert R.estimate_db_mb(E2_COUNTS) == pytest.approx(57.0, abs=1.0)  # E2 실측 전체 57MB
 
 

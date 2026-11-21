@@ -18,6 +18,7 @@
   주 지표는 처음 3개 대상일, 마지막 날은 참고.
 """
 
+import datetime as dt
 import math
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -140,11 +141,12 @@ def lag_days_without_forecast(ft: pd.DataFrame, obs_last: Any, run: Any, etc_col
     return [x for x in days if day_forecast(ft, x, etc_col) is None]
 
 
-def path(dr0: float, etc: list, rain: list, taw: float, raw: float) -> list:
-    """출발 고갈량 dr0에서 관수 없이 날마다 wb_step → 끝 고갈량 목록"""
+def path(dr0: float, etc: list, rain: list, taw: float, raw: float, zero: list | None = None) -> list:
+    """출발 고갈량 dr0에서 날마다 wb_step → 끝 고갈량 목록 (rain 에 그날 관수를 더해 넘긴다).
+    zero[i] 가 참인 날은 그날 끝 Dr 을 0 으로 둔다(시설 재배 농장의 첫 기록 날, 이슈 #131)."""
     out, dr = [], dr0
-    for e, p in zip(etc, rain, strict=True):
-        dr = wb_step(dr, p, e, taw, raw)[3]
+    for i, (e, p) in enumerate(zip(etc, rain, strict=True)):
+        dr = 0.0 if (zero is not None and zero[i]) else wb_step(dr, p, e, taw, raw)[3]
         out.append(dr)
     return out
 
@@ -184,18 +186,20 @@ def run_paths(dr0: float, x: dict, taw: float, raw: float) -> dict:
     n = len(x["etc"])
     irr = x.get("irr") or [0.0] * n
     known = x.get("known") or [False] * n
+    zero = x.get("zero")
 
     def w(rain):
         return [a + b for a, b in zip(rain, irr, strict=True)]
 
     return dict(
-        center=path(dr0, x["etc"], w(x["rain_exp"]), taw, raw),
+        center=path(dr0, x["etc"], w(x["rain_exp"]), taw, raw, zero),
         early=path(
             dr0,
             [e * (1 + r) for e, r in zip(x["etc"], x["rel"], strict=True)],
             w([p if k else 0.0 for p, k in zip(x["rain"], known, strict=True)]),
             taw,
             raw,
+            zero,
         ),
         late=path(
             dr0,
@@ -203,20 +207,31 @@ def run_paths(dr0: float, x: dict, taw: float, raw: float) -> dict:
             w(x["rain"]),
             taw,
             raw,
+            zero,
         ),
     )
 
 
-def _run_inputs(g: pd.DataFrame, pre: list, etc_col: str) -> dict:
+def _run_inputs(
+    g: pd.DataFrame,
+    pre: list,
+    etc_col: str,
+    irr_future: Mapping[dt.date, float] | None = None,
+    dr_zero: dt.date | None = None,
+) -> dict:
     raw_rain = g["rain"].astype(float).fillna(0.0)
+    dates = [pd.Timestamp(t).date() for t in g["target"]]
+    irr_future = irr_future or {}
     exp_rain = (g["rain_exp"].astype(float).fillna(raw_rain) if "rain_exp" in g else raw_rain).fillna(0.0)
     return dict(
         etc=[p["etc"] for p in pre] + list(g[etc_col].astype(float)),
         rain=[p["rain"] for p in pre] + list(raw_rain),
         rain_exp=[p["rain_exp"] for p in pre] + list(exp_rain),
         rel=[p["rel"] for p in pre] + list(g["rel"]),
-        irr=[p.get("irr", 0.0) for p in pre] + [0.0] * len(g),
+        irr=[p.get("irr", 0.0) for p in pre] + [float(irr_future.get(x, 0.0)) for x in dates],
         known=[bool(p.get("rain_known", False)) for p in pre] + [False] * len(g),
+        zero=[bool(p.get("zero", False)) for p in pre]
+        + [dr_zero is not None and x == dr_zero for x in dates],
     )
 
 
@@ -299,8 +314,16 @@ def service_outlook(
     run: Any,
     etc_col: str = "ETc_main",
     obs_last: Any = None,
+    irr_future: Mapping[dt.date, float] | None = None,
+    dr_zero: dt.date | None = None,
+    rain_zero: bool = False,
 ) -> dict:
     """한 서비스 발표의 전망.
+    rain_zero: 비를 Dr 계산에 넣지 않는다(시설 재배 농장의 첫 기록 이후, 이슈 #131).
+               전망 줄의 비 열(rain_fcst_mm · rain_expected_mm)은 예보 값을 기록으로 둔다. 없으면 지금과 같다.
+    irr_future: {날짜: 순관수량 mm} 오늘(회차 날짜)의 관수 기록 — 농장 계산용(이슈 #131). 아침 회차는 오늘이
+                대상일 첫째(lead 0) 단계에, 저녁 회차는 출발일(오늘) 계산에 들어간다. 없으면 지금과 같다.
+    dr_zero: 그날 끝 Dr 을 0 으로 두는 날 — 시설 재배 농장의 첫 기록 날(이슈 #131). 없으면 지금과 같다.
     obs_last: 관측이 있는 마지막 날(없으면 D−1).
               그 뒤 D−1까지는 관측이 아직 없는 날 → 아침 D+0 예보로 먼저 진행.
     반환: dict(days=대상일 표, start=출발 고갈량(중심), dr_obs_prev, prev, pre, lag_days,
@@ -331,8 +354,14 @@ def service_outlook(
             else None
         )
         irr = float(o.loc[day, "I_net"]) if (kind == "lag" and has) else 0.0
-        pre.append(dict(_pre_day(m, day, etc_col, rain_obs, irr), kind=kind))
-    x = _run_inputs(d, pre, etc_col)
+        if kind == "today" and irr_future:
+            irr = float(irr_future.get(day.date(), 0.0))  # 오늘 기록(저녁 회차의 출발일)
+        zero = dr_zero is not None and day.date() == dr_zero
+        pre.append(dict(_pre_day(m, day, etc_col, rain_obs, irr), kind=kind, zero=zero))
+    x = _run_inputs(d, pre, etc_col, irr_future, dr_zero)
+    if rain_zero:
+        n_in = len(x["etc"])
+        x["rain"], x["rain_exp"], x["known"] = [0.0] * n_in, [0.0] * n_in, [False] * n_in
     dr0 = float(o.loc[prev, "Dr"])
     res = run_paths(dr0, x, taw, raw)
     n0 = len(pre)
@@ -345,8 +374,13 @@ def service_outlook(
     starts = {k: (res[k][n0 - 1] if n0 else dr0) for k in ("center", "early", "late")}
     start = starts["center"]
     # 관수 필요 예상일은 서비스 엑셀처럼 주 지표 3일만 본다(마지막 참고일은 보지 않음, 2026-10-25 사용자 결정)
+    # 아침 회차에서 오늘(lead 0)에 이미 물을 줬다면 어제 끝 Dr 이 커도 "지금 관수 필요"가 아니다
+    # (농장, 이슈 #131)
+    today_done = run_name != "저녁" and (
+        float((irr_future or {}).get(D.date(), 0.0)) > 0 or (dr_zero is not None and dr_zero == D.date())
+    )
     need = {
-        k: (0 if starts[k] >= raw else first_need(res[k][n0 : n0 + MAIN_DAYS], raw))
+        k: (0 if (starts[k] >= raw and not today_done) else first_need(res[k][n0 : n0 + MAIN_DAYS], raw))
         for k in ("center", "early", "late")
     }
     cum3 = _cum3(d, err, run_name, etc_col)

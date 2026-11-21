@@ -55,6 +55,31 @@ def runs_since(now) -> str:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+FARM_COLS = "requested_at,done_at,result"
+
+
+def read_farm_status(base: str, key: str, http: RestGet = rest_get, now=None) -> list[dict]:
+    """농장 계산 상태 중 경고 후보만 읽는다(이슈 #131): 실패 · 한 번도 처리 안 됨 · 최근 3일 안 요청.
+    농장 번호는 읽지도 않는다(경고에 쓰지 않으므로). 표 전체를 매시 읽지 않아 내려받는 양이 작다.
+    3일보다 오래 전 요청이 done_at 보다 뒤에 남은 경우(계산 상태 쓰기가 계속 실패)는
+    계산 작업이 직접 빨갛게 알린다."""
+    now = pd.Timestamp(now) if now is not None else kst_now()
+    since = (
+        (now - pd.Timedelta(days=3))
+        .tz_localize("Asia/Seoul")
+        .tz_convert("UTC")
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    cond = f"or=(result.eq.failed,done_at.is.null,requested_at.gte.{since})"
+    return read_pages(
+        base,
+        key,
+        "farm_calc_status",
+        http,
+        f"select={FARM_COLS}&{cond}&order=requested_at.desc.nullslast,farm_id",
+    )
+
+
 def read_state(
     base: str,
     key: str,
@@ -62,6 +87,7 @@ def read_state(
     now=None,
     include_krei: bool = False,
     obs_all: bool = False,
+    include_farm: bool = False,
 ) -> dict[str, Any]:
     """최근 서버 회차 기록, 지점 이름, 관측 마지막 날, 적산온도 어제 값 유무(, 선택 시 KREI 발행물 상태).
     - 관측(weather_daily)은 수집하는 지점(has_forecast)만, 지점마다 묻지 않고 한 번에 본다
@@ -146,6 +172,12 @@ def read_state(
         except Exception as e:
             out["krei_reports"] = None
             out["krei_error"] = str(e)
+    if include_farm:
+        try:
+            out["farm_status"] = read_farm_status(base, key, http, now=now)
+        except Exception as e:
+            out["farm_status"] = None
+            out["farm_error"] = f"{type(e).__name__}: {str(e)[:120]}"
     return out
 
 
@@ -205,6 +237,8 @@ def run_monitor(state: dict[str, Any], alerts_sink: IssueAlerts | None, now=None
         grid_status=state.get("grid_status"),
         obs_last=state.get("obs_last"),
         expected_run_stations=state.get("expected_run_stations"),
+        farm_status=state.get("farm_status"),
+        farm_error=state.get("farm_error"),
     )
     alerts += estimate_fallback_alerts(state.get("db_size"))  # 정확한 값을 못 읽고 추정으로 떨어졌으면 경고
     text = report(alerts, now)
@@ -261,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
         now=now,
         include_krei=True,
         obs_all=obs_all_enabled(),
+        include_farm=True,
     )
     state.update(db_size_state(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")))
     sink = IssueAlerts(_env("GITHUB_REPOSITORY"), _env("GITHUB_TOKEN"))

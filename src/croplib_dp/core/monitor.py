@@ -22,6 +22,9 @@ warn (경고) — 서비스는 되지만 기록해 둘 것
   - krei    : 매달 8일 23:59 KST 뒤(9일 00:00~)에도 원예 4부류(과일·과채·엽근채소·양념채소)의 이번 달 월보가
               fetched 가 아니거나, fetch_status = 'failed' 인 건이 있음 (결정 0019)
               (판독 불가 no_text·partial 월보는 별도 목록 이슈에 자동 댓글로 알리므로 감시 경고에서 제외)
+  - farm    : 농장 계산(farm_calc.yml, 이슈 #131) — ① 계산 실패(result = failed)인 농장이 있음
+              ② 요청이 FARM_PENDING_H(2)시간 넘게 처리 안 됨(requested_at > done_at 또는 done_at 없음).
+              곳 수와 가장 오래된 대기 시간만 적는다(농장 번호 · 정보 없음). 못 읽으면 "조회 실패" 경고
 빠진 지점이 많으면(MAX_NAMED 곳 넘음) "N곳 — 앞 10곳 …" 으로 줄인다 (이슈·메일 가독성).
 """
 
@@ -54,13 +57,14 @@ MAX_NAMED = 10  # 경고 문구에 이름을 다 적는 지점 수의 한도
 # 지점별 최신 줄을 보려고 최신 몇 줄이 아니라 회차로 읽는다
 # (이슈 #101: 48시간 4회차 388줄 79KB → 2회차 194줄 약 40KB)
 RUNS_SLOTS = 2
+FARM_PENDING_H = 2  # 농장 계산 요청이 이 시간 넘게 처리 안 되면 경고 (회원 저장은 보통 2분 안에 처리)
 OBS_LOOKBACK_DAYS = 5  # 관측만 하는 지점의 표 최신성을 볼 때 읽는 날 수 (어제 포함). 없으면 "5일 넘게"
 
 
 @dataclass(frozen=True)
 class Alert:
     level: str  # "error" | "warn"
-    code: str  # stale | failed | late | asos | obs | grid | heat | krei | dbsize
+    code: str  # stale | failed | late | asos | obs | grid | heat | krei | dbsize | farm
     text: str
 
     @property
@@ -83,6 +87,41 @@ def named(missing: list[str], names: Mapping[str, str]) -> str:
     if len(missing) <= MAX_NAMED:
         return ns
     return f"{len(missing)}곳 — 앞 {MAX_NAMED}곳 {ns} …"
+
+
+def _check_farm(now: pd.Timestamp, rows: Iterable[Mapping[str, Any]]) -> list[Alert]:
+    """농장 계산 경고(이슈 #131). 경고 열쇠(' — ' 앞)에 곳 수를 안 넣어 수가 바뀌어도 새 댓글이 없다."""
+    rows = list(rows)
+    out: list[Alert] = []
+    failed = [r for r in rows if r.get("result") == "failed"]
+    if failed:
+        out.append(
+            Alert(
+                "warn",
+                "farm",
+                f"농장 계산 실패 — {len(failed)}곳(farm_calc_status.result = failed, 이유는 error 열)",
+            )
+        )
+    waits = []
+    for r in rows:
+        if r.get("requested_at") is None:
+            continue
+        req = kst(r["requested_at"])
+        if r.get("done_at") is not None and req <= kst(r["done_at"]):
+            continue  # 이미 처리함
+        age_h = (now - req).total_seconds() / 3600
+        if age_h > FARM_PENDING_H:
+            waits.append(age_h)
+    if waits:
+        out.append(
+            Alert(
+                "warn",
+                "farm",
+                f"농장 계산 대기 지연 — {len(waits)}곳이 {FARM_PENDING_H}시간 넘게 처리 안 됨"
+                f"(가장 오래된 {max(waits):.0f}시간)",
+            )
+        )
+    return out
 
 
 def _check_krei(now: pd.Timestamp, krei_reports: Iterable[Mapping[str, Any]]) -> list[Alert]:
@@ -188,6 +227,8 @@ def check_health(
     grid_status: Mapping[str, str] | None = None,
     obs_last: Mapping[str, dt.date | None] | None = None,
     expected_run_stations: Iterable[str] | None = None,
+    farm_status: Iterable[Mapping[str, Any]] | None = None,
+    farm_error: str | None = None,
 ) -> list[Alert]:
     """now: 한국 시각. runs: 서버 회차 기록(forecast_runs, 최근 것부터 아니어도 됨).
     weather_last: 수집 지점(has_forecast)별 weather_daily 마지막 날짜.
@@ -202,7 +243,9 @@ def check_health(
     넘기지 않거나(스위치 꺼짐) 비면 보지 않는다.
     expected_run_stations: 최근 회차 기록이 있어야 하는 예보 지점(has_forecast + DB 격자 있음).
     이 지점인데 기록이
-    하나도 없으면 경고(S4: 지점이 늘면 감시가 지점별 최신 줄을 읽는다). 넘기지 않으면 보지 않는다."""
+    하나도 없으면 경고(S4: 지점이 늘면 감시가 지점별 최신 줄을 읽는다). 넘기지 않으면 보지 않는다.
+    farm_status: farm_calc_status 줄(result · requested_at · done_at). 넘기지 않으면 보지 않는다(이슈 #131).
+    farm_error: 농장 계산 상태를 못 읽은 이유. 있으면 "조회 실패" 경고."""
     names = station_names or {}
     now = pd.Timestamp(now)
     alerts: list[Alert] = []
@@ -307,6 +350,11 @@ def check_health(
         alerts.append(Alert("warn", "krei", f"KREI 상태 조회 실패 — {first_line}"))
     elif krei_reports is not None:
         alerts.extend(_check_krei(now, krei_reports))
+    if farm_error:
+        first_line = (str(farm_error).strip().splitlines() or ["이유 없음"])[0]
+        alerts.append(Alert("warn", "farm", f"농장 계산 상태 조회 실패 — {first_line}"))
+    elif farm_status is not None:
+        alerts.extend(_check_farm(now, farm_status))
     if db_size_error:
         first_line = (str(db_size_error).strip().splitlines() or ["이유 없음"])[0]
         alerts.append(Alert("warn", "dbsize", f"DB 용량 조회 실패 — {first_line}"))
