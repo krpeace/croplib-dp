@@ -5,10 +5,12 @@ pandas 없이 날짜순 목록으로 같은 계산을 한다.
 
 상태 판정 (데이터 계약 v1, 위에서부터 처음 맞는 것)
   dormant  휴면기   Kc ≤ 0 (작기 밖)
+  etc_only 쓰는 물  시설 재배(is_protected) 조건의 작기 안: 판정하지 않고 ETc 만 낸다 (이슈 #128, 결정 0039)
   wet      과습     관측 물수지 날이고 끝 Dr이 0 (0.05 mm 미만 = 0.1 mm 단위로 0)
   need     관수 필요 Dr ≥ RAW
   caution  주의     Dr ≥ 주의 기준 (기본 RAW × 0.5)
   normal   보통     그 밖
+시설 재배는 지붕 아래라 비를 넣지 않고 Dr 도 계산하지 않는다: dormant → etc_only 두 가지뿐이다.
 이 기준은 운영하면서 다듬는다. 바꾸면 core/__init__.py 의 CALC_VERSION 을 올린다.
 """
 
@@ -21,7 +23,8 @@ from typing import Any
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.fao56 import kc_of_date, raw_mm, taw_mm, wb_step
 
-STATUSES = ("need", "caution", "normal", "wet", "dormant")  # 데이터 계약 v1 상태 코드
+ETC_ONLY = "etc_only"  # 시설 재배 공개 조건: 판정 없이 "쓰는 물"(ETc)만 (데이터 계약 v2.1)
+STATUSES = ("need", "caution", "normal", "wet", "dormant", ETC_ONLY)  # 데이터 계약 상태 코드
 CAUTION_RATIO = 0.5  # 주의 기준 = RAW × 0.5 (포장용수량과 RAW의 중간)
 WET_ZERO_MM = 0.05  # 과습: 끝 Dr이 이보다 작으면 0으로 본다 (부동소수 오차 포함)
 
@@ -103,6 +106,7 @@ def observed_water_balance(
     forecast_fill: Mapping[dt.date, tuple[float, float]] | None = None,
     end: dt.date | None = None,
     tainted0: bool = False,
+    protected: bool = False,
 ) -> list[dict]:
     """날짜순 일 기상값(date, eto_mm, rain_mm, filled) → 날마다 관측 물수지.
     crop이 None이면 Kc = 1 (기준작물, cropwater_multi와 같음).
@@ -116,7 +120,11 @@ def observed_water_balance(
     eto_src: 관측 / 예보(D+0 예보로 채움) / 없음(앞 7일 평균 또는 값 없음).
     filled = 채운 값에 기대는 날(채운 날부터 끝 Dr이 0이 되기 전까지).
     tainted0: 첫날 앞에서 이미 채운 값에 기대고 있었나(창 재계산에서 시작점 줄의 filled 를 넘길 때).
-    기본은 아님."""
+    기본은 아님.
+    protected: 시설 재배(`crop_seasons.is_protected`). 참이면 비를 계산에 넣지 않고 Dr 도 계산하지 않는다:
+    작기 안(Kc > 0)은 etc_only, 작기 밖은 dormant, ETo·Kc·ETc 는 채우고 Dr 관련 열(dr_prev_mm·ks·etc_adj_mm·
+    dp_mm·dr_mm)은 None, irr_net_mm 은 0. rain_mm 에는 바깥 비 값을 기록으로 남긴다. filled 는 그날 값이
+    채움(관측 ETo 없음)이면 참(Dr 사슬이 없다). 기본(거짓)은 노지 계산 그대로다."""
     irrigation = irrigation or {}
     forecast_fill = forecast_fill or {}
     days = list(days)
@@ -149,6 +157,28 @@ def observed_water_balance(
                 eto = sum(recent) / len(recent)
         kc = 1.0 if crop is None else crop.kc(day)
         etc = 0.0 if _missing(eto) else kc * eto
+        if protected:
+            rows.append(
+                dict(
+                    date=day,
+                    kc=kc,
+                    eto_mm=eto,
+                    eto_src=src,
+                    etc_mm=etc,
+                    rain_mm=rain,
+                    irr_net_mm=0.0,
+                    dr_prev_mm=None,
+                    ks=None,
+                    etc_adj_mm=None,
+                    dp_mm=None,
+                    dr_mm=None,
+                    status="dormant" if kc <= 0 else ETC_ONLY,
+                    filled=filled_day,
+                    obs_row=obs_row,
+                    calc_version=CALC_VERSION,
+                )
+            )
+            continue
         P = 0.0 if _missing(rain) else float(rain)
         i_net = float(irrigation.get(day, 0.0)) * soil.ea
         ks, etc_adj, dp, dr_new = wb_step(dr, P, etc, soil.taw_mm, soil.raw_mm, i_net)

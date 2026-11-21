@@ -60,6 +60,7 @@ from croplib_dp.core.outlook import (
     outlook_summary,
     pooled_errors,
     service_outlook,
+    service_outlook_etc_only,
     wb_frame,
 )
 from croplib_dp.core.retention import ROW_BYTES, raw_prefix
@@ -550,6 +551,44 @@ def _soil_season_start(day: dt.date, backfill: bool = False) -> dt.date:
     return dt.date(day.year, 1, 1) if (backfill or day.month < 3) else dt.date(day.year, 3, 1)
 
 
+def season_protection(
+    d: Dictionaries, s: Mapping[str, Any], result: "SlotResult", stn_id: str
+) -> bool | None:
+    """조건의 작형이 시설 재배(`crop_seasons.is_protected`)인가 (이슈 #128, 결정 0039).
+    사전 줄에 is_protected 가 없거나 비어 있으면(열 이름이 바뀌었거나 읽는 열이 빠짐) None 을 돌려주고
+    문제로 남긴다: 조용히 거짓(노지)으로 두면 시설 포도에 바깥 비를 넣고 보통 판정을 하기 때문이다.
+    부르는 쪽이 그 조건을 건너뛴다."""
+    v = (d.seasons.get(s["season_type_id"]) or {}).get("is_protected")
+    if v is None:
+        result.problems.append(
+            f"{stn_id} {s['scenario_id']}: 작형 {s['season_type_id']}의 is_protected 를 읽지 못해"
+            "(열이 없거나 비어 있음) 이 조건은 계산하지 않음"
+        )
+        return None
+    return _is_true(v)
+
+
+def _scenario_info(d: Dictionaries, s: Mapping[str, Any], crop: Any, protected: bool, wb: list[dict]) -> dict:
+    """지점 요약의 조건 한 줄. 시설 재배는 Dr 대신 마지막 날 ETc(쓰는 물)를 싣는다."""
+    info = dict(
+        scenario_id=s["scenario_id"],
+        crop_id=s.get("crop_id"),
+        is_default=bool(s.get("is_default")),
+        season_name=(d.seasons.get(s["season_type_id"]) or {}).get("name_ko"),
+        protected=protected,
+        kc_mid=round(crop.kc_mid, 4),
+        kc_end=round(crop.kc_end, 4),
+    )
+    if wb:
+        last = wb[-1]
+        info.update(last_date=str(last["date"]), status=last["status"])
+        if protected:
+            info.update(dr_mm=None, etc_mm=round(last["etc_mm"], 2))
+        else:
+            info.update(dr_mm=round(last["dr_mm"], 1))
+    return info
+
+
 def run_station(
     name: str,
     issue: pd.Timestamp,
@@ -609,6 +648,9 @@ def run_station(
     t_calc = time.perf_counter()
     for s in scen:
         crop0 = crop_params(d, s)
+        protected = season_protection(d, s, result, stn_id)
+        if protected is None:  # is_protected 를 못 읽음: 노지로 가정하지 않고 이 조건은 계산하지 않는다
+            continue
         crop = adjust_crop(crop0, stage_climate(weather, crop0), crop_height(d, s))
         soil = soil_of(s)
         days = [w for w in weather if w["date"] >= crop.season_start]
@@ -623,47 +665,46 @@ def run_station(
                 ft = ft_all.drop(index=rows.index[rows["ETc_main"].isna()])  # 대체 발표가 담지 못한 마지막 날
                 fill = fill_from_forecast(ft)
         end = prev if forecast and svc["ok"] else None
-        wb = observed_water_balance(days, crop, soil, forecast_fill=fill, end=end) if days or end else []
+        wb = (
+            observed_water_balance(days, crop, soil, forecast_fill=fill, end=end, protected=protected)
+            if days or end
+            else []
+        )
         for r in wb:
             if wb_cutoff is not None and r["date"] < wb_cutoff:
                 continue
             result.water_balance_daily.append(
                 _jsonable(dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS}))
             )
-        info = dict(
-            scenario_id=s["scenario_id"],
-            crop_id=s.get("crop_id"),
-            is_default=bool(s.get("is_default")),
-            kc_mid=round(crop.kc_mid, 4),
-            kc_end=round(crop.kc_end, 4),
-        )
-        if wb:
-            info.update(
-                last_date=str(wb[-1]["date"]), dr_mm=round(wb[-1]["dr_mm"], 1), status=wb[-1]["status"]
-            )
+        info = _scenario_info(d, s, crop, protected, wb)
         if ft is not None and svc["ok"] and wb:
             try:
-                owb = wb_frame(wb)
-                last = last_observed(owb, D)
-                obs_last = last if (last is not None and last < D - pd.Timedelta(days=1)) else None
                 lag_fb = False
-                if obs_last is not None:
-                    missing_days = lag_days_without_forecast(ft, obs_last, issue)
-                    if missing_days:
-                        # A(이슈 #100): 지연일의 아침 D+0 예보를 구할 수 없으면 실패하지 않고
-                        # 채운 줄(앞 7일 평균 ETo,
-                        # 강수 0)로 어제부터 출발한다. 결과는 기존 '백업' 구분으로 남긴다.
-                        obs_last, lag_fb = None, True
-                        shown = ", ".join(f"{x:%m/%d}" for x in missing_days)
-                        note = (
-                            f"{stn_id} {st.get('name_ko') or ''}: 지연일({shown}) 예보를 구할 수 없어 "
-                            "채운 값(앞 7일 평균 ETo, 강수 0)으로 전망을 출발함 — 백업"
-                        ).replace("  ", " ")
-                        if note not in result.warnings:
-                            result.warnings.append(note)
-                ol = service_outlook(
-                    ft, owb, soil.taw_mm, soil.raw_mm, soil.ea, err, name, issue, obs_last=obs_last
-                )
+                if protected:
+                    # 시설 재배: 비를 넣지 않고 Dr 도 계산하지 않으므로 Dr 이어 계산용 준비(관측 물수지 표 ·
+                    # 지연일 채움)를 하지 않고, 회차 기록(obs_prev_date · 백업)도 노지 조건의 값 그대로 둔다
+                    ol = service_outlook_etc_only(ft, err, name, issue)
+                else:
+                    owb = wb_frame(wb)
+                    last = last_observed(owb, D)
+                    obs_last = last if (last is not None and last < D - pd.Timedelta(days=1)) else None
+                    if obs_last is not None:
+                        missing_days = lag_days_without_forecast(ft, obs_last, issue)
+                        if missing_days:
+                            # A(이슈 #100): 지연일의 아침 D+0 예보를 구할 수 없으면 실패하지 않고
+                            # 채운 줄(앞 7일 평균 ETo,
+                            # 강수 0)로 어제부터 출발한다. 결과는 기존 '백업' 구분으로 남긴다.
+                            obs_last, lag_fb = None, True
+                            shown = ", ".join(f"{x:%m/%d}" for x in missing_days)
+                            note = (
+                                f"{stn_id} {st.get('name_ko') or ''}: 지연일({shown}) 예보를 구할 수 없어 "
+                                "채운 값(앞 7일 평균 ETo, 강수 0)으로 전망을 출발함 — 백업"
+                            ).replace("  ", " ")
+                            if note not in result.warnings:
+                                result.warnings.append(note)
+                    ol = service_outlook(
+                        ft, owb, soil.taw_mm, soil.raw_mm, soil.ea, err, name, issue, obs_last=obs_last
+                    )
                 days_ = ol["days"]
                 methods |= set(days_["rs_method"].dropna())
                 issue_backup = bool(days_["backup"].iloc[0])
@@ -673,7 +714,8 @@ def run_station(
                     or issue_backup,  # 직전 발표를 쓴 경우만 src_run_at 을 남긴다
                     src_run=pd.Timestamp(days_["src_run"].iloc[0]),
                 )
-                svc["obs_prev"] = ol["prev"].date()
+                if not protected:
+                    svc["obs_prev"] = ol["prev"].date()
                 for o in outlook_rows(ol, soil.raw_mm):
                     result.water_outlook.append(
                         _jsonable(
@@ -698,7 +740,8 @@ def run_station(
                         )
                     )
                 )
-                info.update(start_dr_mm=round(ol["start"], 1), need=ol["need"])
+                if not protected:
+                    info.update(start_dr_mm=round(ol["start"], 1), need=ol["need"])
             except Exception as e:  # 계산 오류도 회차 실패로 남긴다(조용히 넘어가지 않음)
                 svc.update(ok=False, error=f"{type(e).__name__}: {e}"[:200])
         summary["scenarios"].append(info)
@@ -758,6 +801,8 @@ def run_station(
 
 
 def _start_day(ol: dict) -> dt.date:
+    if ol.get("etc_only"):
+        return ol["start_date"].date()
     return (ol["pre"][-1]["date"] if ol["pre"] else ol["prev"]).date()
 
 
@@ -1001,27 +1046,24 @@ def run_wb_backfill(
         t_calc = time.perf_counter()
         for s in scen:
             crop0 = crop_params(d, s)
+            protected = season_protection(d, s, result, stn_id)
+            if protected is None:  # is_protected 를 못 읽음: 노지로 가정하지 않고 계산하지 않는다
+                continue
             crop = adjust_crop(crop0, stage_climate(weather, crop0), crop_height(d, s))
             soil = soil_of(s)
             days = [w for w in weather if w["date"] >= crop.season_start]
-            wb = observed_water_balance(days, crop, soil, forecast_fill={}, end=None) if days else []
+            wb = (
+                observed_water_balance(days, crop, soil, forecast_fill={}, end=None, protected=protected)
+                if days
+                else []
+            )
             for r in wb:
                 result.water_balance_daily.append(
                     _jsonable(
                         dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS})
                     )
                 )
-            info = dict(
-                scenario_id=s["scenario_id"],
-                crop_id=s.get("crop_id"),
-                is_default=bool(s.get("is_default")),
-                kc_mid=round(crop.kc_mid, 4),
-                kc_end=round(crop.kc_end, 4),
-            )
-            if wb:
-                info.update(
-                    last_date=str(wb[-1]["date"]), dr_mm=round(wb[-1]["dr_mm"], 1), status=wb[-1]["status"]
-                )
+            info = _scenario_info(d, s, crop, protected, wb)
             summary["scenarios"].append(info)
         result.calc_seconds += time.perf_counter() - t_calc
         result.calc_n += len(scen)
@@ -1324,8 +1366,10 @@ def summary_text(r: SlotResult) -> str:
                         f"HTTP {e['http']} 코드 {e['code']} {e['msg'] or ''} {e['note'] or ''}".rstrip()
                     )
         for c in s["scenarios"]:
+            # 시설 재배는 Dr 이 없고 쓰는 물(마지막 날 ETc)만 있다
+            water = f"쓰는 물 {c.get('etc_mm')} mm" if c.get("protected") else f"Dr {c.get('dr_mm')} mm"
             lines.append(
-                f"  - {c['scenario_id']}: {c.get('last_date')} Dr {c.get('dr_mm')} mm {c.get('status')}"
+                f"  - {c['scenario_id']}: {c.get('last_date')} {water} {c.get('status')}"
                 + (f", 전망 출발 {c['start_dr_mm']} mm, 관수 필요 예상 {c['need']}" if "need" in c else "")
                 + f" (Kc 중기 {c['kc_mid']}, 후기 {c['kc_end']})"
             )
@@ -1390,7 +1434,8 @@ def growth_text(r: SlotResult) -> str:
     )
 
 
-CROP_KO = {"apple": "사과", "kimchi_cabbage": "배추"}
+# 작형 이름이 없을 때 대신 쓰는 작물 이름
+CROP_KO = {"apple": "사과", "kimchi_cabbage": "배추", "grape": "포도"}
 
 
 def brief_text(r: SlotResult) -> str:
@@ -1415,10 +1460,15 @@ def brief_text(r: SlotResult) -> str:
         for c in s.get("scenarios", []):
             if not c.get("is_default"):
                 continue
-            crop = CROP_KO.get(c.get("crop_id"), c.get("crop_id") or "")
-            p = f"{crop} {c.get('status', '?')}"
-            if c.get("dr_mm") is not None and c.get("status") != "dormant":
-                p += f" {c['dr_mm']:.0f}mm"
+            # 작형 이름(crop_seasons.name_ko)으로 적는다: 포도 비가림·시설가온처럼
+            # 한 작물의 작형이 둘 이상이어도 구별된다. 이름이 없으면 작물 이름(CROP_KO)
+            crop = c.get("season_name") or CROP_KO.get(c.get("crop_id"), c.get("crop_id") or "")
+            if c.get("status") == "etc_only" and c.get("etc_mm") is not None:
+                p = f"{crop} 쓰는 물 {c['etc_mm']:.1f}mm"  # 시설 재배: 판정 없이 쓰는 물만
+            else:
+                p = f"{crop} {c.get('status', '?')}"
+                if c.get("dr_mm") is not None and c.get("status") != "dormant":
+                    p += f" {c['dr_mm']:.0f}mm"
             need = (c.get("need") or {}).get("center")
             if need is not None:
                 p += f" 예상일 {need}"

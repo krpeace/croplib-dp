@@ -13,13 +13,13 @@
 |---|---|---|
 | `core/fao56.py` | FAO-56 식: ETo(식6), 풍속 환산, 일사, Kc 곡선·기후보정, 하루 물수지(식84~88), 결측일 | `fao56_core.py` |
 | `core/daily_weather.py` | ASOS 하루 값 → 일 기상값·ETo, 빠진 날 채우기 (`weather_daily` 한 줄) | `cropwater_multi.compute_station` |
-| `core/water_balance.py` | 관측 물수지와 상태 판정, 계약 상태 코드, 빠진 날은 아침 D+0 예보로 채움 (`water_balance_daily` 한 줄) | `fcst_wb.observed_wb`, `soil_status` |
+| `core/water_balance.py` | 관측 물수지와 상태 판정, 계약 상태 코드, 빠진 날은 아침 D+0 예보로 채움 (`water_balance_daily` 한 줄). 시설 재배(`protected=True`)는 비를 넣지 않고 Dr 없이 `etc_only`/`dormant`와 ETc만(결정 0039) | `fcst_wb.observed_wb`, `soil_status` |
 | `core/soil_water.py` | 작물 공통(흙만 본 물 상태, 계약 v1.5): 고정 조건(Zr 0.5 m, Kc 1.0, p 0.40), 해마다 3/1 Dr = 0 재시작(12~2월 `winter`), 남은 물 비율(`aw_pct`), 상태 코드 6종(`winter`·`pool`·`ample`·`fair`·`dry`·`very_dry`), `days_to_dry` (`soil_water_daily` 한 줄) | `cropwater_multi` + 결정 0014 |
 | `core/kc.py` | Kc 기후보정: 생육 중기·후기 평균 풍속·최저습도 (10일 미만이면 기본값) | `cropwater_station` Kc 자동집계 |
 | `core/forecast_daily.py` | 단기예보 항목 → 대상일별 하루 입력, 받은 발표 확인, 직전 발표로 대신하기 | `fcst_archive`, `kma_fcst.check_issue` |
 | `core/solar.py` | 예보로 일사량 추정 (S1·S3·S4) | `rs_model` |
 | `core/forecast_eto.py` | 예보 ETo·ETc (S4 고정 계수, 안 되면 S3) | `cropwater_fcst.forecast_table` |
-| `core/outlook.py` | 3일 전망: 오차표, 세 경로(중심·빠르면·늦으면), 아침·저녁 출발, 관측 지연 (`water_outlook` 한 줄), 요약: 관수 필요 예상일(주 지표 3일)·권장 관수량·3일 합 (`water_outlook_summary` 한 줄) | `fcst_wb.service_outlook`, 서비스 엑셀 "관수 전망" |
+| `core/outlook.py` | 시설 재배 전망 `service_outlook_etc_only`(Dr 없이 ETc · 3일 합만, 결정 0039), 3일 전망: 오차표, 세 경로(중심·빠르면·늦으면), 아침·저녁 출발, 관측 지연 (`water_outlook` 한 줄), 요약: 관수 필요 예상일(주 지표 3일)·권장 관수량·3일 합 (`water_outlook_summary` 한 줄) | `fcst_wb.service_outlook`, 서비스 엑셀 "관수 전망" |
 | `core/heat_sun.py` | 적산온도(GDD, maxmin)·도달일, 같은 날 평균 평년, 누적 시작(기본 1/1)~12/31 한 해 표(`year_table(start=)`, 결측은 평년으로 채움), 평년보다 며칠 빠른가 (`heat_daily`·`sun_daily` + 적산 계열 새 표), 적산 계열 묶기(`group_heat_series`·`group_sun_series`, 기준온도는 Decimal로 비교, 결정 0038), 기온 없는 빈 줄 판정(`is_blank_row`)·건너뛰기 판정(`required_dates`·`pending_stations`, 결정 0033) | cropweather `temp_core.calc_gdd`·`gdd_reaching_dates` |
 | `core/grid.py` | 예보 격자(순수 함수): 위경도 → 기상청 단기예보 격자(Lambert 정각원추, `kma_lcc_5km_v1`), 반올림 경계 근접 판정, 지점 격자 점검(`ok`·`differs`·`missing`·`unchecked`), `forecast_ready`(has_forecast + DB 격자 있음, DB 값이 기준), 운영 지점 격자 표·겹침 (결정 0025) |
 | `core/retention.py` | 전망 표 월 보관·원문 보관 기간 규칙(순수 함수): 14일 기준(한국 날짜)·월·보관 파일 경로·열·합치기·결정적 csv.gz, 대표 밖 원문 90일 판정(`fcst-ext/`만), gzip·xz 원문 읽기, xz 절감 추정 (결정 0022) | 새로 만듦 |
@@ -62,7 +62,7 @@ cropwater 운영 수집기(`cropwater_ops.py`)는 현장 PC의 파일(엑셀·CS
 | `io/kma.py` | 단기예보·ASOS 조회: 키 인코딩, 여러 쪽 이어 받기, 응답 해석(JSON·XML 오류), 결과 구분(ok·nodata·retry·fatal), 기록에서 키 감추기 |
 | `io/dictionaries.py` | Supabase에서 사전 자료 6개 표 읽기, 계산 입력(StationMeta·CropParams·Soil)으로 바꾸기 |
 | `io/asos_cache.py` | 지난 해 ASOS 일자료 파일 캐시(`<폴더>/asos/<지점>/<해>.json`). 계산에 쓰는 5칸만 저장, 12/31까지 다 받은 해(또는 관측 없는 해)만 남김. 깨진 파일은 없는 것으로 보고, 쓰기 실패는 넘어감 (결정 0017) |
-| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄. `--stations`가 없으면 **수집 지점(`has_forecast`)만** 돈다(결정 0017). Actions 변수 `OBS_ALL_STATIONS=true`면 운영 지점 중 예보 지점이 아닌 곳을 **관측만 하는 지점**으로 뒤에 더한다: 작물 공통 12토성만, `forecast_runs`·사과·배추·전망 없음, 평소 회차는 최근 14일 줄만 올림, ASOS 실패는 경고(결정 0026) 마감 뒤에 도는 지연 재실행은 서비스 발표 첫 시도가 일시 오류면 30초·90초 뒤 두 번 더 받고, 회차 전체 재시도 시간에 300초 상한을 둔다(요약 `단계:` 줄에 재시도 수·시간, 상한에 걸린 지점; 정시 회차·기존 재시도는 그대로, 결정 0036, #118). |
+| `collectors/water.py` | 한 회차: 서비스 발표 재시도(발표 + 10분부터 0~80분, 마감 + 90분) → 앞선 24시간 발표 → 지점마다 ASOS(작기 시작 또는 3/1 ~ 어제) → 계산 → DB 표 모양의 줄. `--stations`가 없으면 **수집 지점(`has_forecast`)만** 돈다(결정 0017). Actions 변수 `OBS_ALL_STATIONS=true`면 운영 지점 중 예보 지점이 아닌 곳을 **관측만 하는 지점**으로 뒤에 더한다: 작물 공통 12토성만, `forecast_runs`·사과·배추·전망 없음, 평소 회차는 최근 14일 줄만 올림, ASOS 실패는 경고(결정 0026) 마감 뒤에 도는 지연 재실행은 서비스 발표 첫 시도가 일시 오류면 30초·90초 뒤 두 번 더 받고, 회차 전체 재시도 시간에 300초 상한을 둔다(요약 `단계:` 줄에 재시도 수·시간, 상한에 걸린 지점; 정시 회차·기존 재시도는 그대로, 결정 0036, #118). 조건마다 `crop_seasons.is_protected`를 읽어 시설 재배는 `etc_only`(쓰는 물) 갈래로 계산하고, 못 읽으면 그 조건은 계산하지 않고 문제로 남김. 알림은 작형 이름(`crop_seasons.name_ko`)으로 적음 (결정 0039) |
 
 - 회차 결과(`forecast_runs.result`): 정시 성공 / 백업: S3 / 백업: 직전 발표 / 지연 수집 / 실패. 예보 지점(`has_forecast`)만 회차 기록과 작물 공통(`soil_water_daily`, 12토성)을 남긴다. 기본 대상이 `has_forecast` 지점뿐이라 예보 없는 지점은 `--stations`로 따로 지정했을 때만 돌고, 그때는 관측 물수지만 계산하며 ASOS 결과는 수집 기록(`collect_log.jsonl`)과 요약에 남긴다. 수집 지점이 0곳이면 회차를 실패로 남긴다.
 - **관측만 하는 지점**(결정 0026, 기본 꺼짐): 운영 지점 중 `has_forecast`가 아닌 곳. 대표 지점이 끝난 뒤 돈다. ASOS는 1/1~어제 한 번(재시도 30초·90초 2번, 단계 20분 상한, 실패는 회차 실패가 아니라 경고), 토성 12종 `soil_water_daily`와 `weather_daily`만 만든다. 평소 회차는 최근 14일만 올리고 창 시작 전날 Dr·DP·`filled`를 `soil_water_daily`에서 읽어(`load_soil_prior`) 이어 계산한다(없으면 1/1부터 전체 재계산 + 경고, 올리는 건 창만). 소급(`--soil-backfill`)은 한 번에 20곳까지. `slot_done`은 예보 지점만 보고 이 지점들은 기다리지 않는다(비면 감시 `obs` 경고 `N일째`로만 알림). `weather_daily.rs_source` 칸이 DB에 없으면 그 칸만 빼고 올린다(경고).

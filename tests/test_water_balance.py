@@ -28,7 +28,9 @@ def _days(eto, rain, filled=None):
 
 # ── 상태 판정 ─────────────────────────────────────────────────────────
 def test_status_codes_match_contract():
-    assert STATUSES == ("need", "caution", "normal", "wet", "dormant")
+    # 데이터 계약 v2.1 에서 etc_only(시설 재배 공개 조건, 판정 없이 쓰는 물만)가 더해졌다 (이슈 #128).
+    # 앞의 다섯 코드는 그대로
+    assert STATUSES == ("need", "caution", "normal", "wet", "dormant", "etc_only")
 
 
 def test_soil_status_wet_and_dry():

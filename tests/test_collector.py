@@ -148,6 +148,7 @@ def _dicts() -> Dictionaries:
             l_mid_d=90,
             l_late_d=30,
             is_default=True,
+            is_protected=False,
         ),
         dict(
             season_type_id="kimchi_cabbage-summer",
@@ -158,6 +159,7 @@ def _dicts() -> Dictionaries:
             l_mid_d=25,
             l_late_d=10,
             is_default=True,
+            is_protected=False,
         ),
     ]
     kc = [

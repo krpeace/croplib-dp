@@ -27,7 +27,7 @@ import pandas as pd
 
 from croplib_dp.core import CALC_VERSION
 from croplib_dp.core.fao56 import wb_step
-from croplib_dp.core.water_balance import CAUTION_RATIO, WET_ZERO_MM, soil_status
+from croplib_dp.core.water_balance import CAUTION_RATIO, ETC_ONLY, WET_ZERO_MM, soil_status
 
 MAIN_DAYS = 3  # 서비스 주 지표: 처음 3개 대상일
 ERR_MIN_N = 15  # 오차표: 월 칸 표본이 이보다 적으면 전체 월 값을 씀
@@ -220,6 +220,74 @@ def _run_inputs(g: pd.DataFrame, pre: list, etc_col: str) -> dict:
     )
 
 
+def _forecast_days(
+    ft: pd.DataFrame, err: pd.DataFrame | None, run_name: str, run: Any, etc_col: str
+) -> pd.DataFrame:
+    """한 서비스 발표의 대상일 표(오차 · ± 오차 붙임). 노지 · 시설 전망이 같이 쓴다."""
+    d = ft[(ft.run_name == run_name) & (ft.run == pd.Timestamp(run))].sort_values("lead_day").copy()
+    if d.empty:
+        raise ValueError(f"{run_name} {run} 발표가 예보표에 없습니다")
+    if d[etc_col].isna().any():
+        raise ValueError(f"{run_name} {run} 발표의 예보 ETc가 비어 있습니다(필수 요소 결측)")
+    d["month"] = pd.to_datetime(d.target).dt.month
+    # 직전 발표로 대신한 행은 대체 발표 종류·선행일의 오차
+    en = d["err_name"] if "err_name" in d else pd.Series(run_name, index=d.index)
+    el = d["err_lead"] if "err_lead" in d else d["lead_day"]
+    e = [err_lookup(err, "day", n_, k, m) for n_, k, m in zip(en, el, d.month, strict=True)]
+    d["eto_rmse"], d["rel"], d["err_n"], d["err_src"] = (
+        [x[0] for x in e],
+        [x[1] for x in e],
+        [x[2] for x in e],
+        [x[3] for x in e],
+    )
+    d["etc_err"] = d[etc_col] * d.rel  # ± 오차 = 예보 ETc × 상대 오차 r
+    return d
+
+
+def _cum3(d: pd.DataFrame, err: pd.DataFrame | None, run_name: str, etc_col: str) -> tuple:
+    """주 지표 3일 ETc 합 (3일 ETc 합, ± 오차, 출처, 상대 오차). service_outlook 과 같이 쓴다."""
+    main = d[d.main]
+    c3 = err_lookup(err, "cum3", run_name, int(main.lead_day.iloc[0]), int(main.month.iloc[0]))
+    if "err_name" in main and bool(main.get("backup", pd.Series(False)).any()):
+        cb = err_lookup(
+            err, "cum3", str(main.err_name.iloc[0]), int(main.err_lead.iloc[0]), int(main.month.iloc[0])
+        )
+        c3 = cb if cb[3] != "기본값" else c3  # 대체 발표 칸이 오차표에 없으면 서비스 발표 칸
+    s3 = float(main[etc_col].sum())
+    cum3 = (s3, s3 * c3[1], c3[3], c3[1])
+    return cum3
+
+
+def service_outlook_etc_only(
+    ft: pd.DataFrame, err: pd.DataFrame | None, run_name: str, run: Any, etc_col: str = "ETc_main"
+) -> dict:
+    """시설 재배(is_protected) 조건의 전망 (이슈 #128, 결정 0039): 비를 넣지 않고 Dr 도 계산하지 않는다.
+    ETo·ETc 예보와 ± 오차, 3일 ETc 합(cum3)만 낸다. Dr 세 경로·관수 필요 예상일·권고는 만들지 않는다
+    (Dr_*·start·advice 는 비어 있다). 출발 날짜(start_date)는 노지와 같다: 아침은 어제, 저녁은 오늘."""
+    d = _forecast_days(ft, err, run_name, run, etc_col)
+    D = pd.Timestamp(run).normalize()
+    for k in ("center", "early", "late"):
+        d[f"Dr_{k}"] = np.nan
+    d["order"] = range(1, len(d) + 1)
+    d["main"] = d.order <= MAIN_DAYS
+    start_date = D if run_name == "저녁" else D - pd.Timedelta(days=1)
+    return dict(
+        days=d,
+        start=np.nan,
+        dr_obs_prev=np.nan,
+        prev=start_date,
+        start_date=start_date,
+        pre=[],
+        lag_days=[],
+        need={"center": None, "early": None, "late": None},
+        cum3=_cum3(d, err, run_name, etc_col),
+        advice=(np.nan, np.nan),
+        run_name=run_name,
+        run=pd.Timestamp(run),
+        etc_only=True,
+    )
+
+
 def service_outlook(
     ft: pd.DataFrame,
     owb: pd.DataFrame,
@@ -238,23 +306,7 @@ def service_outlook(
     반환: dict(days=대상일 표, start=출발 고갈량(중심), dr_obs_prev, prev, pre, lag_days,
               need{center, early, late},
               cum3=(3일 ETc 합, ± 오차, 출처, 상대 오차), advice=(순관수량, 공급 관수량))"""
-    d = ft[(ft.run_name == run_name) & (ft.run == pd.Timestamp(run))].sort_values("lead_day").copy()
-    if d.empty:
-        raise ValueError(f"{run_name} {run} 발표가 예보표에 없습니다")
-    if d[etc_col].isna().any():
-        raise ValueError(f"{run_name} {run} 발표의 예보 ETc가 비어 있습니다(필수 요소 결측)")
-    d["month"] = pd.to_datetime(d.target).dt.month
-    # 직전 발표로 대신한 행은 대체 발표 종류·선행일의 오차
-    en = d["err_name"] if "err_name" in d else pd.Series(run_name, index=d.index)
-    el = d["err_lead"] if "err_lead" in d else d["lead_day"]
-    e = [err_lookup(err, "day", n_, k, m) for n_, k, m in zip(en, el, d.month, strict=True)]
-    d["eto_rmse"], d["rel"], d["err_n"], d["err_src"] = (
-        [x[0] for x in e],
-        [x[1] for x in e],
-        [x[2] for x in e],
-        [x[3] for x in e],
-    )
-    d["etc_err"] = d[etc_col] * d.rel  # ± 오차 = 예보 ETc × 상대 오차 r
+    d = _forecast_days(ft, err, run_name, run, etc_col)
     D = pd.Timestamp(run).normalize()
     o = owb.set_index("date")
     prev = pd.Timestamp(obs_last) if obs_last is not None else D - pd.Timedelta(days=1)
@@ -297,15 +349,7 @@ def service_outlook(
         k: (0 if starts[k] >= raw else first_need(res[k][n0 : n0 + MAIN_DAYS], raw))
         for k in ("center", "early", "late")
     }
-    main = d[d.main]
-    c3 = err_lookup(err, "cum3", run_name, int(main.lead_day.iloc[0]), int(main.month.iloc[0]))
-    if "err_name" in main and bool(main.get("backup", pd.Series(False)).any()):
-        cb = err_lookup(
-            err, "cum3", str(main.err_name.iloc[0]), int(main.err_lead.iloc[0]), int(main.month.iloc[0])
-        )
-        c3 = cb if cb[3] != "기본값" else c3  # 대체 발표 칸이 오차표에 없으면 서비스 발표 칸
-    s3 = float(main[etc_col].sum())
-    cum3 = (s3, s3 * c3[1], c3[3], c3[1])
+    cum3 = _cum3(d, err, run_name, etc_col)
     k_need = need["center"]
     dr_need = start if k_need == 0 else (float(d.Dr_center.iloc[k_need - 1]) if k_need else np.nan)
     advice = (dr_need, dr_need / ea) if not pd.isna(dr_need) else (np.nan, np.nan)
@@ -330,8 +374,10 @@ def _num(v: Any) -> float | None:
 
 def outlook_rows(ol: dict, raw: float) -> list[dict]:
     """서비스 전망 → `water_outlook` 줄 목록 (run_id, scenario_id는 쓰는 쪽이 붙인다).
-    상태는 예보 날 기준(과습 판정 안 함). pop_pct는 그날 가장 높은 강수확률(%)."""
+    상태는 예보 날 기준(과습 판정 안 함). pop_pct는 그날 가장 높은 강수확률(%).
+    시설 재배 전망(ol["etc_only"])은 그날 Kc > 0이면 etc_only, 아니면 dormant (dr_* 는 비어 있다)."""
     rows = []
+    etc_only = bool(ol.get("etc_only"))
     for r in ol["days"].itertuples():
         pop = getattr(r, "pop_max", None)
         rows.append(
@@ -347,7 +393,11 @@ def outlook_rows(ol: dict, raw: float) -> list[dict]:
                 dr_center_mm=_num(r.Dr_center),
                 dr_early_mm=_num(r.Dr_early),
                 dr_late_mm=_num(r.Dr_late),
-                status=soil_status(r.Dr_center, raw, r.Kc, observed=False),
+                status=(
+                    ("dormant" if _num(r.Kc) is not None and r.Kc <= 0 else ETC_ONLY)
+                    if etc_only
+                    else soil_status(r.Dr_center, raw, r.Kc, observed=False)
+                ),
                 calc_version=CALC_VERSION,
             )
         )
@@ -378,18 +428,25 @@ def outlook_summary(ol: dict, raw: float, kc_start: float | None, kc_today: floa
     """서비스 전망 → `water_outlook_summary` 한 줄 (run_id, scenario_id는 쓰는 쪽이 붙인다).
     서비스 엑셀 "관수 전망" 위쪽과 같다.
     kc_start: 출발 날짜의 Kc (과습 판정용 — 작기 안이고 관측 물수지 날일 때만 과습).
-    kc_today: 회차 발표 날짜(한국 날짜)의 Kc (휴면기 판정용)."""
+    kc_today: 회차 발표 날짜(한국 날짜)의 Kc (휴면기 판정용).
+    시설 재배 전망(ol["etc_only"])은 status_start 가 dormant(발표 날 Kc ≤ 0) 또는 etc_only 이고,
+    dr_start_mm·need_*_in·advice_* 는 비어 있으며 etc_sum_mm(3일 ETc 합)은 채운다."""
     d = ol["days"]
     main = d[d["main"]]
     pre = ol["pre"]
-    start_date = (pre[-1]["date"] if pre else ol["prev"]).date()
+    etc_only = bool(ol.get("etc_only"))
+    start_date = (ol["start_date"] if etc_only else (pre[-1]["date"] if pre else ol["prev"])).date()
     net, gross = ol["advice"]
     rain_exp = main["rain_exp"] if "rain_exp" in main else main["rain"]
     return dict(
         horizon_days=MAIN_DAYS,
         start_date=start_date,
         dr_start_mm=_num(ol["start"]),
-        status_start=_start_status(ol["start"], raw, kc_start, kc_today, observed=not pre),
+        status_start=(
+            ("dormant" if _num(kc_today) is not None and kc_today <= 0 else ETC_ONLY)
+            if etc_only
+            else _start_status(ol["start"], raw, kc_start, kc_today, observed=not pre)
+        ),
         need_center_in=ol["need"]["center"],
         need_early_in=ol["need"]["early"],
         need_late_in=ol["need"]["late"],
