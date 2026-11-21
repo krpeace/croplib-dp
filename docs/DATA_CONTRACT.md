@@ -8,6 +8,13 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 
 현재 맞춘 계약 버전: v1.5 (2026-10-28, 작물 공통 토양 물 상태 `soil_water_daily`, `soil_types.is_estimated` 및 추정 3종, `crops.common`, CropMon#35·결정 0014). v1.4: 적산온도 `heat_daily`·적산일사 `sun_daily`, 작물 사전 `t_base_c` (2026-10-26). v1.3: 3일 전망 요약 `water_outlook_summary` (2026-10-28, 구조 그대로·문구만: `status_start` 휴면기 판정 기준 = 회차 발표 날짜, CropMon#37·결정 0015). v1.2: 3일 전망 선행일 0~4, 원자료 버킷 `raw`. 업로드 전 검사는 `io/contract.py`. 계산 결과의 열 이름과 상태 코드를 맞췄다. 재배 방식별 Kc(`crop_kc_sets`)는 기후보정 전 표값이고, 보정은 `core/kc.py`가 한다.
 
+## 시설 재배 공개 조건 `etc_only` (계약 v2.1, CropMon PR #185·결정 0039)
+- `crop_seasons.is_protected = true`(포도 비가림 · 시설가온)는 지붕 아래라 **비를 계산에 넣지 않고**, 공개 조건은 **판정하지 않고 "쓰는 물"(ETc)만** 낸다. 사과 · 고랭지배추는 거짓이라 바뀌지 않는다.
+- 상태 값 `etc_only`: `water_balance_daily.status` · `water_outlook.status` · `water_outlook_summary.status_start`. 판정 순서 `dormant`(작기 밖, Kc ≤ 0) → `etc_only` → 그 밖. `water_outlook`은 지금처럼 `wet` 없음.
+- 물수지: ETo · Kc · ETc는 채우고 `irr_net_mm = 0`, **Dr 관련 열(`dr_prev_mm` · `ks` · `etc_adj_mm` · `dp_mm` · `dr_mm`)은 모두 비움**(작기 밖 `dormant` 줄도). `rain_mm`에는 바깥 비 값을 기록으로 남기고 화면이 시설 포도에서 지운다.
+- 전망: `water_outlook`은 ETo · ETc · `etc_err_mm`만 채우고 `dr_*`는 비움. `water_outlook_summary`는 `dr_start_mm` · `need_*_in` · `advice_*`를 비우고 **`etc_sum_mm`(3일 ETc 합) · `etc_sum_err_mm`은 채움**("3일 동안 약 ○톤").
+- 사전 `crop_seasons`에서 `is_protected`를 읽지 못하면(열이 없거나 `null`) 그 조건은 계산하지 않고 수집 결과 문제 목록에 남긴다(거짓으로 대신하지 않음).
+
 ## 적산 계열 `heat_series_daily`·`sun_series_daily` (계약 v2.2, CropMon PR #188·결정 0038)
 - 적산온도는 작목 기준온도와 기상청 기온만으로 계산하므로, 값을 가르는 것은 **기준온도**와 **누적 시작 월-일**(`cum_start_mmdd`, `'MM-DD'`) 둘뿐이다(= 적산 계열). `crop_id`는 없다.
 - `heat_series_daily` 키 `(stn_id, t_base_c, cum_start_mmdd, date)`, 값 열은 `heat_daily`와 같다(`gdd_day`·`gdd_cum`·`gdd_normal_day`·`gdd_normal_cum`·`lead_days`·`normal_from`·`normal_to`·`filled`·`calc_version`). `t_base_c`는 자릿수 없는 `numeric`(-10~30).

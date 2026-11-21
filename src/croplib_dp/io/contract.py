@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 CONTRACT_VERSION = "v1.5"
-STATUS = ("need", "caution", "normal", "wet", "dormant")
+# etc_only: 시설 재배 공개 조건의 작기 안(판정 없이 "쓰는 물"만, Dr 열은 비움, 이슈 #128·계약 v2.1)
+STATUS = ("need", "caution", "normal", "wet", "dormant", "etc_only")
 SOIL_WATER_STATUS = ("winter", "pool", "ample", "fair", "dry", "very_dry")
 # 하루 강수량 상한(mm). 국내 일강수 최고 기록은 870.5 mm(2002-08-31 강릉)이고, 2026-08-17 294 거제에서도
 # 하루 654.3 mm 가 실제로 관측됐다(옛 상한 500 mm 에 걸려 소급이 막힘). 결정 0027.
@@ -154,7 +155,8 @@ SPECS: dict[str, TableSpec] = {
             "pop_pct": (0, 100),
             "rain_expected_mm": (0, DAILY_RAIN_MAX_MM),
         },
-        enums={"status": ("need", "caution", "normal", "dormant")},  # 예보 날은 과습을 판정하지 않는다
+        # 예보 날은 과습을 판정하지 않는다
+        enums={"status": ("need", "caution", "normal", "dormant", "etc_only")},
         key=("run_id", "scenario_id", "target_date"),
     ),
 }
