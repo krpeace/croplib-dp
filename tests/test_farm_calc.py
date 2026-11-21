@@ -10,6 +10,7 @@ import copy
 import datetime as dt
 import json
 import sys
+import urllib.parse
 from collections import Counter
 from pathlib import Path
 
@@ -804,3 +805,46 @@ def test_status_write_failure_is_counted_and_makes_the_run_fail(world):
     db.put_status = boom
     res = go(db, world)
     assert res.n_status_fail == 1 and res.failed and "계산 상태를 못 씀 1곳" in F.brief_text(res)
+
+
+# ── FarmDb 읽기 주소: 값의 '+' 가 빈칸으로 읽히지 않게 인코딩한다 (이슈 #133) ─────────────────
+class UrlSpy:
+    """읽기 주소를 기록하고 빈 목록을 돌려주는 가짜 http (쪽 나눔이 한 번에 끝난다)"""
+
+    def __init__(self):
+        self.urls: list[str] = []
+
+    def __call__(self, url, headers):
+        self.urls.append(url)
+        return 200, b"[]"
+
+
+@pytest.mark.parametrize(
+    "since",
+    ["2026-11-18T17:55:13.489175+00:00", "2026-11-18T17:55:13Z", "2026-11-19T02:55:13+09:00"],
+)
+def test_farm_db_runs_encodes_the_timestamp_in_the_query(since):
+    spy = UrlSpy()
+    FarmDb("https://x.example", "k", http=spy).runs(since)
+    assert len(spy.urls) == 1
+    query = spy.urls[0].split("?", 1)[1]
+    assert "run_at=gte." in query
+    # 보낸 글자에 날것의 '+' 가 없고(주소 질의에서 '+' 는 빈칸으로 읽힌다), 되읽으면 원래 시각이다
+    assert "+" not in query
+    if "+" in since:
+        assert "%2B" in query
+    got = urllib.parse.parse_qs(query)["run_at"]
+    assert got == ["gte." + since]
+    assert pd.Timestamp(got[0].removeprefix("gte.")) == pd.Timestamp(since)
+
+
+def test_farm_db_station_ids_are_encoded_but_numeric_ones_are_unchanged():
+    spy = UrlSpy()
+    db = FarmDb("https://x.example", "k", http=spy)
+    db.weather("108", "2026-06-01")
+    db.latest_fetched("108")
+    assert all("stn_id=eq.108" in u for u in spy.urls) and len(spy.urls) == 2
+    spy.urls.clear()
+    db.weather("a b&c+d", "2026-06-01")  # 숫자가 아닌 값이 와도 다른 조건으로 새지 않는다
+    q = urllib.parse.parse_qs(spy.urls[0].split("?", 1)[1])
+    assert q["stn_id"] == ["eq.a b&c+d"] and q["date"] == ["gte.2026-06-01"]
