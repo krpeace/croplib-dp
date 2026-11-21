@@ -8,6 +8,14 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 
 현재 맞춘 계약 버전: v1.5 (2026-10-28, 작물 공통 토양 물 상태 `soil_water_daily`, `soil_types.is_estimated` 및 추정 3종, `crops.common`, CropMon#35·결정 0014). v1.4: 적산온도 `heat_daily`·적산일사 `sun_daily`, 작물 사전 `t_base_c` (2026-10-26). v1.3: 3일 전망 요약 `water_outlook_summary` (2026-10-28, 구조 그대로·문구만: `status_start` 휴면기 판정 기준 = 회차 발표 날짜, CropMon#37·결정 0015). v1.2: 3일 전망 선행일 0~4, 원자료 버킷 `raw`. 업로드 전 검사는 `io/contract.py`. 계산 결과의 열 이름과 상태 코드를 맞췄다. 재배 방식별 Kc(`crop_kc_sets`)는 기후보정 전 표값이고, 보정은 `core/kc.py`가 한다.
 
+## 적산 계열 `heat_series_daily`·`sun_series_daily` (계약 v2.2, CropMon PR #188·결정 0038)
+- 적산온도는 작목 기준온도와 기상청 기온만으로 계산하므로, 값을 가르는 것은 **기준온도**와 **누적 시작 월-일**(`cum_start_mmdd`, `'MM-DD'`) 둘뿐이다(= 적산 계열). `crop_id`는 없다.
+- `heat_series_daily` 키 `(stn_id, t_base_c, cum_start_mmdd, date)`, 값 열은 `heat_daily`와 같다(`gdd_day`·`gdd_cum`·`gdd_normal_day`·`gdd_normal_cum`·`lead_days`·`normal_from`·`normal_to`·`filled`·`calc_version`). `t_base_c`는 자릿수 없는 `numeric`(-10~30).
+- `sun_series_daily` 키 `(stn_id, cum_start_mmdd, date)`, 값 열은 `sun_daily`와 같다.
+- 계열 목록은 뷰 `crop_accum_series`(작형마다 한 줄 + 작물 공통 한 줄: `crop_id`, `season_type_id`, `heat_t_base_c`, `heat_cum_start_mmdd`, `sun_cum_start_mmdd`)에서 읽는다. 시설가온은 `heat_*`가 비어 적산온도를 내지 않는다.
+- **누적 시작 전 날은 줄을 쓰지 않는다.** 누적·평년 누적·`lead_days`는 누적 시작부터 센다. 일값은 시작이 달라도 같다. 식·평년·빈 날 처리는 옛 표와 같다. (5, 01-01) 계열 = `heat_daily`의 `crop_id = common` 줄, `sun_series_daily`의 01-01 계열 = `sun_daily`.
+- 쓰기 순서는 옛 표 → 새 표. 새 표가 실패해도 옛 표는 그대로 두고 수집 결과(문제 목록)에 남긴다. 옛 표는 3단계(CropMon 화면 전환) 전까지 지금 그대로 쓴다. 업로드 전 검사는 `io/contract.py`의 `SPECS`.
+
 ## `soil_water_daily` (계약 v1.5, CropMon#35·결정 0014)
 - 키: `(stn_id, soil_code, date)`. 대표 10곳(`has_forecast`) × 토성 12종(FAO-56 Table 19 9종 + Saxton & Rawls 추정 3종). `OBS_ALL_STATIONS=true`면 운영 지점(`is_active`) 전부(관측만 하는 지점은 이 표와 `weather_daily`만, 결정 0026). CropMon 계약서의 "대표 10곳" 문구 정정은 CropMon 요청 P5.
 - 고정 조건: 겉흙 깊이 Zr = 0.5 m, Kc = 1.0, p = 0.40, 해마다 3/1에 Dr = 0(포장용수량)으로 시작해 11/30까지 계산. 12~2월은 `status = 'winter'`, `dr_mm`·`aw_pct`·`dp_mm`·`days_to_dry`는 빈 칸.

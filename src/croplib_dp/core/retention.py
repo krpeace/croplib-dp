@@ -62,6 +62,8 @@ ROW_BYTES = {
     "heat_daily": 219,
     "soil_water_daily": 253,
     "sun_daily": 187,
+    "heat_series_daily": 219,  # 이슈 #127 추정(옛 표와 같은 열 수). 새 표에 줄이 쌓이면 실측으로 바꾼다
+    "sun_series_daily": 187,
     "water_balance_daily": 376,
     "water_outlook": 247,
     "weather_daily": 301,
@@ -70,7 +72,7 @@ ROW_BYTES = {
 }
 SYSTEM_MB = 12.0  # E2: 전체 57MB − 10표 합계 45MB
 EXTRA_MB = 1.0  # 줄 수를 세지 않는 작은 표(krei.report·storage.objects) 약 1MB (E2 2026-11-08)
-COUNT_TABLES = tuple(ROW_BYTES)  # 줄 수를 읽어 크기를 추정하는 표 8개
+COUNT_TABLES = tuple(ROW_BYTES)  # 줄 수를 읽어 크기를 추정하는 표 10개 (이슈 #127 전에는 8개)
 
 # 용량 경고선 (#61 Q4, 2026-11-08 승인). DB 한도 500MB, Storage 한도 1GB(확인됨 2026-11-08)
 DB_WARN_MB, DB_ERR_MB = 400.0, 450.0  # 정확한 크기(CropMon#77 db_size_bytes())를 읽었을 때

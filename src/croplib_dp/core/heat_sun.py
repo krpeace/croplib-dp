@@ -7,8 +7,11 @@ DB·API·파일을 모르는 순수 함수만 둔다.
 """
 
 import datetime as dt
+import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from decimal import Decimal
+from typing import Any
 
 from croplib_dp.core.daily_weather import num
 
@@ -90,6 +93,86 @@ def normals_by_day(values: Mapping[dt.date, float | None], year_from: int, year_
     return {k: sum(v) / len(v) for k, v in acc.items()}
 
 
+# ── 적산 계열 (이슈 #127, 결정 0038) ─────────────────────────────────────────
+# 적산온도는 작목 기준온도와 기상청 기온만으로 계산한다. 값을 가르는 것은 작물이 아니라 기준온도와
+# 누적 시작 월-일 둘뿐이라, 이 짝을 "적산 계열"이라 부른다. 계열 목록은 DB 뷰 crop_accum_series 에서 읽는다.
+VIEW = "crop_accum_series"
+
+
+def parse_mmdd(s: Any) -> tuple[int, int]:
+    """'MM-DD' 글자 → (월, 일). 형식이 틀리거나 없는 날짜, 윤일(02-29)이면 ValueError.
+    02-29 는 평년에 없는 날이라 누적 시작일로 쓸 수 없다."""
+    if not isinstance(s, str) or not re.fullmatch(r"\d{2}-\d{2}", s):
+        raise ValueError(f"누적 시작일 형식이 'MM-DD'가 아닙니다: {s!r}")
+    month, day = int(s[:2]), int(s[3:])
+    if (month, day) == (2, 29):
+        raise ValueError("누적 시작일은 02-29 로 둘 수 없습니다 (평년에 없는 날)")
+    try:
+        dt.date(2001, month, day)  # 평년 기준으로 있는 날인지
+    except ValueError:
+        raise ValueError(f"없는 날짜입니다: {s!r}") from None
+    return month, day
+
+
+def _t_base_number(v: Any) -> Any:
+    """뷰의 기준온도 → JSON 으로 보낼 수 있는 숫자. int·float 은 받은 그대로, Decimal·글자는 숫자로."""
+    if isinstance(v, bool):
+        raise ValueError(f"기준온도가 숫자가 아닙니다: {v!r}")
+    if isinstance(v, int | float):
+        return v
+    if isinstance(v, Decimal):
+        return float(v)
+    return float(str(v))
+
+
+def t_base_key(v: Any) -> Decimal:
+    """기준온도를 묶고 비교할 때 쓰는 열쇠(Decimal). 4 · 4.0 · '4.00' 은 같은 열쇠다."""
+    return Decimal(str(_t_base_number(v))).normalize()
+
+
+def group_heat_series(rows: Iterable[Mapping]) -> tuple[list[tuple[Any, str]], list[str]]:
+    """뷰 줄 → ([(기준온도, 'MM-DD')] 중복 없이 기준온도·시작일 순, 문제 목록).
+    기준온도와 시작일이 둘 다 있는 줄만 적산온도 계열이다(시설가온은 둘 다 비어 있어 제외).
+    같은 기준온도는 Decimal 로 비교해 한 계열로 묶고, 보낼 값은 처음 받은 값 그대로 둔다.
+    쓸 수 없는 줄(형식이 틀린 시작일 · 숫자가 아닌 기준온도)은 건너뛰고 문제로 알린다."""
+    found: dict[tuple[Decimal, str], Any] = {}
+    problems: list[str] = []
+    for r in rows:
+        tb, start = r.get("heat_t_base_c"), r.get("heat_cum_start_mmdd")
+        if tb is None or start is None:
+            continue
+        who = f"{r.get('crop_id')}/{r.get('season_type_id')}"
+        try:
+            parse_mmdd(start)
+            value = _t_base_number(tb)
+            key = (t_base_key(tb), start)
+        except (ValueError, ArithmeticError) as e:
+            problems.append(
+                f"뷰 {VIEW} {who}: 적산온도 계열을 쓸 수 없음(기준온도 {tb!r}, 시작 {start!r}): {e}"
+            )
+            continue
+        found.setdefault(key, value)
+    return [(found[k], k[1]) for k in sorted(found)], problems
+
+
+def group_sun_series(rows: Iterable[Mapping]) -> tuple[list[str], list[str]]:
+    """뷰 줄 → (적산일사 누적 시작 'MM-DD' 중복 없이 순서대로, 문제 목록). 일사는 기준온도가 없다."""
+    found: set[str] = set()
+    problems: list[str] = []
+    for r in rows:
+        start = r.get("sun_cum_start_mmdd")
+        if start is None:
+            continue
+        try:
+            parse_mmdd(start)
+        except ValueError as e:
+            who = f"{r.get('crop_id')}/{r.get('season_type_id')}"
+            problems.append(f"뷰 {VIEW} {who}: 적산일사 계열을 쓸 수 없음(시작 {start!r}): {e}")
+            continue
+        found.add(start)
+    return sorted(found), problems
+
+
 def lead_days(cum: float | None, normal_cum: Sequence[float], i: int) -> int | None:
     """평년보다 며칠 빠른가 (+ 빠름, − 늦음). 올해 i번째 날 누적(cum)에 평년 누적이 처음 닿는 날 − i.
     평년이 그해 안에 닿지 못하면 None."""
@@ -108,14 +191,18 @@ def year_table(
     obs: Mapping[dt.date, float | None],
     normal: Mapping[tuple[int, int], float],
     last_obs: dt.date | None,
+    start: tuple[int, int] = (1, 1),
 ) -> list[dict]:
-    """그해 1월 1일 ~ 12월 31일 한 줄씩:
-    day(그날 값), cum(1월 1일부터 합), normal_day, normal_cum, filled, lead.
+    """누적 시작(start, 기본 1월 1일) ~ 12월 31일 한 줄씩:
+    day(그날 값), cum(시작일부터 합), normal_day, normal_cum(시작일부터 합), filled, lead.
     last_obs 까지는 올해 값을 쌓고, 결측 날은 평년 값으로 채워 filled = True. 그 뒤 날은 올해 값이 비어 있다.
-    평년 값이 없는 날(예: 평년 기간에 그 날 자료가 하나도 없음)은 0으로 쌓는다."""
+    평년 값이 없는 날(예: 평년 기간에 그 날 자료가 하나도 없음)은 0으로 쌓는다.
+    시작일 앞 날은 줄을 만들지 않는다. 누적 · 평년 누적 · lead(며칠 빠른가)는 시작일부터 센다 (이슈 #127).
+    일값(day · normal_day)은 시작이 달라도 같다."""
+    first = dt.date(year, *start)
     days = [
-        dt.date(year, 1, 1) + dt.timedelta(days=k)
-        for k in range((dt.date(year, 12, 31).toordinal() - dt.date(year, 1, 1).toordinal()) + 1)
+        first + dt.timedelta(days=k)
+        for k in range((dt.date(year, 12, 31).toordinal() - first.toordinal()) + 1)
     ]
     ncum, s = [], 0.0
     for d in days:
