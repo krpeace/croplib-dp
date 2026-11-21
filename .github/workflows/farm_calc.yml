@@ -1,0 +1,97 @@
+name: farm_calc
+
+# 농장 계산 작업 (회원 농장 물수지 · 3일 전망 · 관수 기록, 이슈 #131, 결정 0040).
+# 깨우는 방법 둘 (하는 일은 같다):
+#   1) 회원이 농장 · 관수 기록을 저장하면 CropMon(DB 트리거 · 매분 보충 예약)이 이 작업을 **입력 없이** 부른다(2분 창).
+#      스위치 ops.farm_calc_wake.enabled 는 꺼져 있고, 이 파일이 병합된 뒤 사용자가 켠다:
+#        update ops.farm_calc_wake set enabled = true;
+#   2) 물 수집(collect)이 끝나면 이어서 돈다(정기 회차 02시 · 17시 뒤 모든 농장을 다시 계산). collect.yml 은 안 고친다.
+# 한 번 도는 일: 대기 중인 농장 ∪ 오래된 농장(done_at 이 그 지점 최신 회차보다 앞섬)을 계산한다. 모든 실행이 둘을 다 하므로
+# 같은 이름의 실행이 줄 서서 하나만 남아도(아래 concurrency) 손해가 없고, collect 가 세 번 끝나도 두 번째부터는 거의 바로 끝난다.
+# 공공 API(ASOS · 단기예보)는 부르지 않는다: 관측은 DB weather_daily, 예보는 같은 회차의 공개 전망 줄에서 읽는다.
+# 모든 농장의 작기 줄을 고치는 sync_all_farm_seasons() 는 collect 뒤 실행과 사람이 sync 를 켠(또는 mode = all) 실행에서만 부른다.
+# 입력 없는 깨우기에서는 부르지 않는다(회원 저장마다 모든 농장을 도는 일을 막음. 변경은 DB 트리거가 그 농장만 이미 고친다).
+# 요약(실행 화면 · 알림)에는 처리한 농장 수 · 성공/실패 수 · 시간만 쓴다. 농장 번호 · 주소 · 좌표 · 관수량은 쓰지 않는다.
+# 사람이 Actions 화면에서 눌러 시험할 수도 있다 (dry_run 을 켜면 DB 에 쓰지 않는다).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "계산할 농장: auto(대기 ∪ 오래된 농장) · pending(대기만) · all(작물 공통이 아닌 모든 농장)"
+        type: choice
+        options: [auto, pending, all]
+        default: auto
+      sync:
+        description: "먼저 모든 농장의 작기 줄 고치기(sync_all_farm_seasons). mode 가 all 이면 늘 켠다"
+        type: boolean
+        default: false
+      dry_run:
+        description: "DB에 쓰지 않고 계산만"
+        type: boolean
+        default: false
+  workflow_run:
+    workflows: [collect]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: farm_calc
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  farm-calc:
+    # collect 가 실패로 끝난 뒤에는 돌지 않는다(쓴 것이 없거나 일부뿐 — 다음 collect 뒤에 오래된 농장으로 잡힌다)
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: 설치
+        run: pip install .
+      - name: 농장 계산
+        env:
+          IN_MODE: ${{ inputs.mode }}
+          IN_SYNC: ${{ inputs.sync }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          args=(--out out)
+          mode="${IN_MODE:-auto}"
+          args+=(--mode "$mode")
+          if [ "$EVENT" = "workflow_run" ] || [ "$IN_SYNC" = "true" ] || [ "$mode" = "all" ]; then args+=(--sync); fi
+          if [ "$IN_DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          set +e
+          python -m croplib_dp.collectors.farm_calc "${args[@]}" 2> err.txt
+          code=$?
+          cat err.txt >&2
+          exit $code
+      - name: 요약을 실행 화면과 알림(annotation)에 표시
+        if: always()
+        run: |
+          esc() { sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g'; }
+          # 오류 문구에 농장 줄 내용이 섞일 수 있어 종류가 담긴 마지막 줄만 알린다
+          if [ -s err.txt ]; then echo "::error title=농장 계산 오류::$(tail -n 3 err.txt | cut -c1-200 | esc)"; fi
+          for f in out/farm_calc/brief.md; do
+            [ -f "$f" ] || continue
+            cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=농장 계산 요약::$(cat "$f" | esc)"
+          done
+      - name: 결과 파일 올리기
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: farm_calc
+          path: out/farm_calc/*.md
+          retention-days: 7
+          if-no-files-found: warn

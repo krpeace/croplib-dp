@@ -228,7 +228,7 @@ def test_monitor_workflow_python_reads_the_switch_from_the_environment(monkeypat
     monkeypatch.setenv("GITHUB_TOKEN", "tok")
     monkeypatch.setenv("OBS_ALL_STATIONS", "true")
 
-    def fake_state(base, key, http=None, now=None, include_krei=False, obs_all=False):
+    def fake_state(base, key, http=None, now=None, include_krei=False, obs_all=False, include_farm=False):
         seen["obs_all"] = obs_all
         return dict(
             runs=RUNS, names=NAMES, weather_last={"101": D(2026, 10, 25)}, heat_last={"101": D(2026, 10, 25)}

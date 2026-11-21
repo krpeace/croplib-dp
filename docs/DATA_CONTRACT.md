@@ -8,6 +8,12 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 
 현재 맞춘 계약 버전: v1.5 (2026-10-28, 작물 공통 토양 물 상태 `soil_water_daily`, `soil_types.is_estimated` 및 추정 3종, `crops.common`, CropMon#35·결정 0014). v1.4: 적산온도 `heat_daily`·적산일사 `sun_daily`, 작물 사전 `t_base_c` (2026-10-26). v1.3: 3일 전망 요약 `water_outlook_summary` (2026-10-28, 구조 그대로·문구만: `status_start` 휴면기 판정 기준 = 회차 발표 날짜, CropMon#37·결정 0015). v1.2: 3일 전망 선행일 0~4, 원자료 버킷 `raw`. 업로드 전 검사는 `io/contract.py`. 계산 결과의 열 이름과 상태 코드를 맞췄다. 재배 방식별 Kc(`crop_kc_sets`)는 기후보정 전 표값이고, 보정은 `core/kc.py`가 한다.
 
+## 농장별 계산 결과 `farm_water_daily`·`farm_water_outlook`·`farm_water_outlook_summary` (계약 v2.1, 결정 0040)
+- 공개 표와 같은 열에서 `scenario_id` → `farm_id`. `farm_water_daily` 키 `(farm_id, date)`(+ `farm_season_id` · `irr_l` · `irr_net_mm` · `taw_mm` · `raw_mm`), `farm_water_outlook` 키 `(farm_id, target_date)` · **최신 회차만**(`run_id` → `forecast_runs`), `farm_water_outlook_summary` 키 `farm_id` · 최신만. 상태 코드는 공개 표와 같은 여섯(`etc_only` 포함, 전망은 `wet` 없음). 이 저장소가 서버 키로 쓴다(`farm_calc.yml`).
+- 계산 규칙: 작기는 `farm_seasons`의 날짜로 고른다(해를 넘어도 Dr 이어받음). 관수 mm = 그날 합(L) ÷ 관수 면적 × 관수효율 0.95, 작기 밖 기록은 넣지 않는다(`irr_l`도 0). 시설은 그날까지 기록 0건인 날 `etc_only`, **첫 기록 날의 끝 Dr = 0**, 다음 날부터 비 0 물수지. 노지는 공개 조건과 같은 값. 작물 공통 농장은 계산하지 않는다. 오늘 기록은 3일 전망의 오늘(lead 0, 저녁 회차는 출발일) 단계에 들어간다.
+- 입력: 관측은 `weather_daily`, 3일 전망은 같은 회차의 공개 전망 줄(`water_outlook`)로 되살린 예보표(공공 API 호출 없음). 시작 전인 작기만 있는 농장은 물수지 · 전망 · 요약 줄이 없다.
+- `farm_calc_status`는 `done_at` · `result`(`ok`/`failed`) · `error`(짧은 말) · `calc_version`만 쓴다(`requested_at` · `recalc_from`은 DB 트리거). `done_at`은 그 계산이 대기 줄을 읽기 시작한 시각(대기 중이던 농장은 읽은 `requested_at` 값).
+
 ## 시설 재배 공개 조건 `etc_only` (계약 v2.1, CropMon PR #185·결정 0039)
 - `crop_seasons.is_protected = true`(포도 비가림 · 시설가온)는 지붕 아래라 **비를 계산에 넣지 않고**, 공개 조건은 **판정하지 않고 "쓰는 물"(ETc)만** 낸다. 사과 · 고랭지배추는 거짓이라 바뀌지 않는다.
 - 상태 값 `etc_only`: `water_balance_daily.status` · `water_outlook.status` · `water_outlook_summary.status_start`. 판정 순서 `dormant`(작기 밖, Kc ≤ 0) → `etc_only` → 그 밖. `water_outlook`은 지금처럼 `wet` 없음.
