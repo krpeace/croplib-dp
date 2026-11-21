@@ -12,6 +12,7 @@
 
 import json
 import re
+import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -22,6 +23,12 @@ CHUNK = 50  # in.(…) 조건에 한 번에 넣는 값 수
 DEL_CHUNK = 100  # 날짜 삭제를 한 번에 보내는 날짜 수
 UUID = re.compile(r"^[0-9a-fA-F-]{32,36}$")
 FARM_TABLES = ("farm_water_daily", "farm_water_outlook", "farm_water_outlook_summary")
+
+
+def _q(value: str) -> str:
+    """주소 질의에 넣는 자유 값(시각 · 지점 번호)을 안전하게 인코딩한다. 날것의 '+'(시각의 +00:00)는 질의에서
+    빈칸으로 읽혀 PostgREST 가 400 을 낸다(이슈 #133). 숫자 · 날짜는 그대로다."""
+    return urllib.parse.quote(str(value), safe="")
 
 
 def _chunks(items: Sequence[Any], n: int):
@@ -81,7 +88,7 @@ class FarmDb:
             "weather_daily",
             "date,eto_mm,rain_mm,filled,u2_ms,rh_min_pct",
             "date",
-            f"&stn_id=eq.{stn_id}&date=gte.{start}",
+            f"&stn_id=eq.{_q(stn_id)}&date=gte.{start}",
         )
 
     def latest_fetched(self, stn_id: str) -> str | None:
@@ -91,7 +98,7 @@ class FarmDb:
             self.key,
             "weather_daily",
             self.http,
-            f"select=fetched_at&stn_id=eq.{stn_id}&order=fetched_at.desc&limit=1",
+            f"select=fetched_at&stn_id=eq.{_q(stn_id)}&order=fetched_at.desc&limit=1",
         )
         return rows[0]["fetched_at"] if rows else None
 
@@ -102,7 +109,7 @@ class FarmDb:
             "forecast_runs",
             "run_id,stn_id,run_at,run_name,result,src_run_at,finished_at",
             "run_at.desc,run_id",
-            f"&run_at=gte.{since_iso}",
+            f"&run_at=gte.{_q(since_iso)}",
         )
 
     def outlook_src(self, run_ids: Sequence[Any]) -> list[dict]:
