@@ -94,7 +94,8 @@ def read_state(
       (어제 이후 줄 → 지점별 마지막 날, 없으면 None). 호출이 지점 수만큼에서 한 번으로 줄었다(결정 0026).
     - obs_all(OBS_ALL_STATIONS=true)면 관측만 하는 지점(운영 지점 중 예보 지점이 아닌 곳)을 soil_water_daily
       (기본 토성 하나, 최근 5일)로 한 번에 본다. forecast_runs 줄이 없는 지점이라 표 최신성으로 본다(D2).
-    - 적산온도(heat_daily)는 운영 지점(is_active) 전부를 보되, 지점마다 묻지 않고 한 번에 묻는다
+    - 적산온도(heat_series_daily, 기준온도 5·누적 시작 01-01 = 옛 작물 공통 줄, 이슈 #135)는
+      운영 지점(is_active) 전부를 보되, 지점마다 묻지 않고 한 번에 묻는다
       (어제·작물 공통 값이 있는 지점 목록 → 운영 지점과 비교). 지점이 늘어도 매시간 호출 수가 늘지 않는다."""
     now = pd.Timestamp(now) if now is not None else kst_now()
     yesterday = (now - pd.Timedelta(days=1)).date()
@@ -138,9 +139,9 @@ def read_state(
         for r in read_table(
             base,
             key,
-            "heat_daily",
+            "heat_series_daily",
             http,
-            f"select=stn_id&date=eq.{yesterday}&crop_id=eq.common&gdd_cum=not.is.null",
+            f"select=stn_id&date=eq.{yesterday}&t_base_c=eq.5&cum_start_mmdd=eq.01-01&gdd_cum=not.is.null",
         )
     }
     # check_health 가 날짜로 비교하므로, 어제 값이 있는 지점은 어제 날짜, 없으면 None

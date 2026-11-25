@@ -1,4 +1,4 @@
-"""적산온도·적산일사 수집기 (CropMon 계약 v1.5 heat_daily·sun_daily, 온1·작물 공통).
+"""적산온도·적산일사 수집기 (CropMon 계약 v2.5 heat_series_daily·sun_series_daily, 온1).
 
 하루 한 번: 지점마다 ASOS 일자료를 평년 기간(지난 10년)과 올해(1월 1일 ~ 어제) 받아,
 core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Supabase 에 덮어쓴다.
@@ -15,11 +15,12 @@ core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Sup
   돌지 않고 실패로도 남기지 않는다. `--stations` 를 주면 그 지점만 돈다.
 - `--cache-dir` 를 주면 지난 해(올해 이전) ASOS 일자료는 파일 캐시에서 읽고, 없는 해만 받는다.
   올해는 늘 새로 받는다. 결과 계산은 같다 (결정 0017).
-- 적산 계열 2단계 (이슈 #127, 결정 0038): 옛 표(heat_daily·sun_daily)는 지금 그대로 쓰고,
-  뷰 `crop_accum_series` 에서 읽은 계열(기준온도 × 누적 시작 월-일)마다
-  새 표(heat_series_daily·sun_series_daily)에도 쓴다.
-  같은 기준온도의 일값·평년은 한 번만 계산하고 누적만 계열마다 따로 낸다. 쓰기 순서는 옛 표 → 새 표.
-  새 표를 쓰지 못하거나 뷰를 읽지 못해도 옛 표는 평소처럼 쓰고, 그 일은 문제 목록에 남긴다(회차 실패).
+- 적산 계열 (이슈 #127 · #135, 결정 0038 · 0041): 뷰 `crop_accum_series` 에서 읽은
+  계열(기준온도 × 누적 시작 월-일)마다 새 표(heat_series_daily·sun_series_daily)에 쓴다.
+  3단계부터 옛 표(heat_daily·sun_daily)에는 쓰지 않는다.
+  같은 기준온도의 일값·평년은 한 번만 계산하고 누적만 계열마다 따로 낸다.
+  새 표가 유일한 출력이라, 계약에 어긋나거나 올리지 못하거나 뷰를 읽지 못하면 아무것도 올리지 않거나
+  문제 목록에 남기고 회차를 실패로 한다. 알림 요약(지점 줄)은 옛 줄 모양의 계산 결과(메모리에만 둠)에서 낸다.
 """
 
 import argparse
@@ -55,8 +56,6 @@ from croplib_dp.io.dictionaries import Dictionaries, load_dictionaries, read_tab
 NORMAL_YEARS = 10
 BLANK_REPORT_DAYS = 7  # 요약에 알리는 끝 날 빈 줄의 최근 일수
 PREV_YEAR_DAYS = 3  # 1월 1~3일은 작년도 다시 계산한다 (12/31 관측이 늦게 올라올 때를 위해)
-HEAT_KEY = SPECS["heat_daily"].key
-SUN_KEY = SPECS["sun_daily"].key
 HEAT_SERIES_KEY = SPECS["heat_series_daily"].key
 SUN_SERIES_KEY = SPECS["sun_series_daily"].key
 SERIES_COLUMNS = "crop_id,season_type_id,heat_t_base_c,heat_cum_start_mmdd,sun_cum_start_mmdd"
@@ -73,11 +72,15 @@ class AccumSeries:
 def build_series(rows: list[dict]) -> tuple[AccumSeries | None, list[str]]:
     """뷰 줄 → (계열 목록, 문제 목록). 비었거나 쓸 수 있는 계열이 없으면 (None, 문제) 새 표를 만들지 않음."""
     if not rows:
-        return None, [f"뷰 {VIEW} 가 비어 있어 새 표(heat_series_daily·sun_series_daily)를 만들지 않음"]
+        return None, [f"뷰 {VIEW} 가 비어 있어 계열 목록이 없음 — 새 표 줄을 만들 수 없어 올릴 것이 없음"]
     heat, p_heat = group_heat_series(rows)
     sun, p_sun = group_sun_series(rows)
     if not heat and not sun:
-        return None, [*p_heat, *p_sun, f"뷰 {VIEW} 에 쓸 수 있는 계열이 없어 새 표를 만들지 않음"]
+        return None, [
+            *p_heat,
+            *p_sun,
+            f"뷰 {VIEW} 에 쓸 수 있는 계열이 없음 — 새 표 줄을 만들 수 없어 올릴 것이 없음",
+        ]
     return AccumSeries(heat, sun), [*p_heat, *p_sun]
 
 
@@ -118,9 +121,7 @@ class HeatSunResult:
     problems: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)  # 실패는 아니지만 사람이 알아야 할 일 (건너뜀·빈 줄 등)
     log: RunLog = field(default_factory=RunLog)
-    uploaded: bool = False  # 옛 표를 올렸나
-    series_used: bool = False  # 뷰에서 계열 목록을 받아 새 표 줄을 만들었나
-    series_uploaded: bool = False  # 새 표를 올렸나
+    uploaded: bool = False  # 새 표(heat_series_daily · sun_series_daily)를 올렸나
     cache_used: bool = False  # --cache-dir 를 줬나
     cache_hit_years: int = 0  # 캐시에서 읽은 (지점, 해) 수
     cache_fetched_years: int = 0  # 캐시를 쓰는데 못 찾아 새로 받은 지난 해 수
@@ -233,7 +234,8 @@ def build_station(
     lat: float,
     series: AccumSeries | None = None,
 ) -> StationRows:
-    """한 지점의 ASOS 일자료 → 옛 표 줄(heat·sun) + 새 표 줄(series 가 있을 때) + 요약.
+    """한 지점의 ASOS 일자료 → 옛 줄 모양 계산 결과(heat·sun, 요약용·올리지 않음)
+    + 새 표 줄(series 가 있을 때) + 요약.
     lat 는 일사 하한(0.01×Ra)을 구하는 데 쓴다. 같은 기준온도의 일값·평년은 한 번만 계산하고,
     계열(누적 시작)마다 누적만 따로 낸다."""
     by_day = {d: it for it in items if (d := _date(it)) is not None}
@@ -342,7 +344,8 @@ def run(
     cache: AsosCache | None = None,
     series: AccumSeries | None = None,
 ) -> HeatSunResult:
-    """series: 뷰에서 읽은 적산 계열. 없으면(None) 새 표 줄은 만들지 않는다(옛 표만, 지금과 같다)."""
+    """series: 뷰에서 읽은 적산 계열. 없으면(None) 새 표 줄은 만들지 않는다
+    (올릴 것이 없어 부르는 쪽이 실패로 남김)."""
     clock = clock or Clock()
     today = clock.now().date()
     year, end = today.year, today - dt.timedelta(days=1)
@@ -350,7 +353,6 @@ def run(
     years = [year - 1, year] if in_prev_window else [year]  # 작년은 항상 12/31 까지, 올해는 어제까지
     r = HeatSunResult(year=year, normal_from=year - NORMAL_YEARS, normal_to=year - 1)
     r.blocks = [YearBlock(y, y - NORMAL_YEARS, y - 1) for y in years]
-    r.series_used = series is not None
     crops = {}
     for c in d.crops.values():
         if c.get("t_base_c") is None:
@@ -408,11 +410,13 @@ def run(
 
 def read_done(table: str, dates: list[dt.date]) -> set[tuple[str, dt.date]]:
     """DB 에 이미 올라간 관측 줄의 (지점, 날짜). 실패하면 오류를 낸다(부르는 쪽이 평소처럼 돌린다).
-    heat_daily 는 작물 공통만 본다. 둘 다 관측 줄(filled = false)에 값이 있는 것만 센다."""
+    새 표(heat_series_daily · sun_series_daily)에서 옛 줄과 같은 줄만 본다(이슈 #135):
+    적산온도는 기준온도 5 · 누적 시작 01-01(= 옛 작물 공통), 적산일사는 누적 시작 01-01.
+    둘 다 관측 줄(filled = false)에 값이 있는 것만 센다."""
     url, key = _env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY")
-    cond = "date=in.(" + ",".join(d.isoformat() for d in dates) + ")&filled=eq.false"
-    if table == "heat_daily":
-        q = f"select=stn_id,date&crop_id=eq.common&gdd_cum=not.is.null&{cond}"
+    cond = "date=in.(" + ",".join(d.isoformat() for d in dates) + ")&filled=eq.false&cum_start_mmdd=eq.01-01"
+    if table == "heat_series_daily":
+        q = f"select=stn_id,date&t_base_c=eq.5&gdd_cum=not.is.null&{cond}"
     else:
         q = f"select=stn_id,date&rs_cum_mj=not.is.null&{cond}"
     rows = read_table(url, key, table, query=q + "&limit=5000")
@@ -428,8 +432,8 @@ def skip_check(d: Dictionaries, today: dt.date, read=None) -> tuple[bool, str]:
         return False, ""
     req = required_dates(today)
     try:
-        heat = read("heat_daily", req)
-        sun = read("sun_daily", req + [x - dt.timedelta(days=1) for x in req])
+        heat = read("heat_series_daily", req)
+        sun = read("sun_series_daily", req + [x - dt.timedelta(days=1) for x in req])
     except Exception as e:
         return False, f"건너뛸지 확인 못 함({type(e).__name__}: {str(e)[:120]}) — 평소처럼 실행"
     left = pending_stations(targets, req, heat, sun)
@@ -439,40 +443,29 @@ def skip_check(d: Dictionaries, today: dt.date, read=None) -> tuple[bool, str]:
     return True, f"건너뜀: {days} 값을 운영 지점 {len(targets)}곳 모두 이미 갖고 있음 — 받지도 쓰지도 않음"
 
 
-def check_old(r: HeatSunResult) -> list[str]:
-    return check_rows("heat_daily", r.heat_daily) + check_rows("sun_daily", r.sun_daily)
-
-
 def check_series(r: HeatSunResult) -> list[str]:
+    """새 표 둘이 유일한 출력이다. 올릴 줄이 하나도 없어도 문제로 남긴다(조용히 넘기지 않음)."""
+    if not (r.heat_series_daily or r.sun_series_daily):
+        return [
+            "새 표(heat_series_daily·sun_series_daily)에 올릴 줄이 없음 — "
+            "계열 목록을 못 받았거나 지점 계산이 모두 실패했다"
+        ]
     return check_rows("heat_series_daily", r.heat_series_daily) + check_rows(
         "sun_series_daily", r.sun_series_daily
     )
 
 
 def check(r: HeatSunResult) -> list[str]:
-    return check_old(r) + check_series(r)
+    return check_series(r)
 
 
 def publish(r: HeatSunResult, writer) -> None:
-    """계약 검사를 통과하면 옛 표 둘을 덮어쓰고, 이어서 새 표 둘(적산 계열)을 덮어쓴다 (옛 표 → 새 표).
-    옛 표가 계약에 어긋나면 아무것도 올리지 않고 문제로 남긴다(지금과 같다).
-    새 표가 계약에 어긋나거나 올리지 못하면 옛 표는 이미 올라간 채 두고, 새 표 문제를 남긴다(회차 실패)."""
-    probs = check_old(r)
+    """계약 검사를 통과하면 새 표 둘(heat_series_daily · sun_series_daily)만 덮어쓴다 (이슈 #135, 결정 0041).
+    옛 표(heat_daily · sun_daily)에는 쓰지 않는다. 새 표가 유일한 출력이므로
+    계약에 어긋나면 아무것도 올리지 않고, 올리기가 실패해도 문제로 남겨 회차를 실패로 한다."""
+    probs = check_series(r)
     if probs:
         r.problems += probs
-        return
-    new_probs = check_series(r)
-    try:
-        if r.heat_daily:
-            writer.upsert("heat_daily", r.heat_daily, on_conflict=HEAT_KEY)
-        if r.sun_daily:
-            writer.upsert("sun_daily", r.sun_daily, on_conflict=SUN_KEY)
-        r.uploaded = True
-    except Exception as e:  # 올리기 실패도 문제로 남긴다
-        r.problems.append(f"DB 올리기 실패: {type(e).__name__}: {str(e)[:200]}")
-        return
-    if new_probs:
-        r.problems += new_probs
         return
     table = ""
     try:
@@ -482,9 +475,9 @@ def publish(r: HeatSunResult, writer) -> None:
         ):
             if rows:
                 writer.upsert(table, rows, on_conflict=key)
-        r.series_uploaded = bool(r.heat_series_daily or r.sun_series_daily)
-    except Exception as e:  # 옛 표는 이미 올라갔다. 새 표 문제는 조용히 넘기지 않는다
-        r.problems.append(f"새 표 {table} 올리기 실패(옛 표는 올라감): {type(e).__name__}: {str(e)[:200]}")
+        r.uploaded = True
+    except Exception as e:  # 올리기 실패도 문제로 남긴다
+        r.problems.append(f"DB 올리기 실패({table}): {type(e).__name__}: {str(e)[:200]}")
 
 
 CROP_KO = {"common": "작물 공통", "apple": "사과", "kimchi_cabbage": "배추", "grape": "포도"}
@@ -493,8 +486,8 @@ CROP_KO = {"common": "작물 공통", "apple": "사과", "kimchi_cabbage": "배�
 def _new_year_line(r: HeatSunResult) -> str:
     """1/1~3 에만: 작년을 마감하는 실행에서 새해 줄이 몇 줄 만들어졌는지 한 줄로 (지점 줄은 늘리지 않는다)"""
     b = r.blocks[-1]
-    heat = sum(1 for x in r.heat_daily if x["date"].startswith(f"{b.year}-"))
-    sun = sum(1 for x in r.sun_daily if x["date"].startswith(f"{b.year}-"))
+    heat = sum(1 for x in r.heat_series_daily if x["date"].startswith(f"{b.year}-"))
+    sun = sum(1 for x in r.sun_series_daily if x["date"].startswith(f"{b.year}-"))
     seen = [s["last_obs"] for s in b.stations if s.get("last_obs")]
     state = f"관측 ~{max(seen)[5:]}까지" if seen else "평년선만 생성"
     return f"새해 {b.year}: {state} (heat {heat}줄 · sun {sun}줄)"
@@ -551,13 +544,7 @@ def brief_text(r: HeatSunResult) -> str:
         lines.append(_new_year_line(r))
     lines.append(
         f"DB 올리기: {'완료' if r.uploaded else '안 함'} · "
-        f"heat {len(r.heat_daily)}줄 · sun {len(r.sun_daily)}줄"
-        + (
-            f" · 새 표 {'올림' if r.series_uploaded else '안 올림'}: "
-            f"heat_series {len(r.heat_series_daily)}줄 · sun_series {len(r.sun_series_daily)}줄"
-            if r.series_used
-            else ""
-        )
+        f"heat_series {len(r.heat_series_daily)}줄 · sun_series {len(r.sun_series_daily)}줄"
     )
     return "\n".join(lines) + "\n"
 
@@ -565,7 +552,7 @@ def brief_text(r: HeatSunResult) -> str:
 def write_outputs(r: HeatSunResult, out_dir: Path) -> Path:
     d = out_dir / f"heat_sun_{r.year}"
     d.mkdir(parents=True, exist_ok=True)
-    for t in ("heat_daily", "sun_daily", "heat_series_daily", "sun_series_daily", "stations", "problems"):
+    for t in ("heat_series_daily", "sun_series_daily", "stations", "problems"):
         (d / f"{t}.json").write_text(
             json.dumps(getattr(r, t), ensure_ascii=False, indent=1), encoding="utf-8"
         )
@@ -608,15 +595,16 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             notes.append(why)
     series, series_problems = None, []
-    # 적산 계열 목록은 뷰에서 읽는다. 못 읽어도 옛 표는 평소처럼 올리고,
-    # 그 일은 문제로 남긴다(조용히 넘기지 않음).
+    # 적산 계열 목록은 뷰에서 읽는다. 새 표가 유일한 출력이라, 못 읽거나 비어 있으면
+    # 올릴 것이 없다 — 원인을 문제로 남기고 회차를 실패로 한다(조용히 넘기지 않음).
     try:
         series, series_problems = build_series(
             read_series_rows(_env("SUPABASE_URL"), _env("SUPABASE_SERVICE_ROLE_KEY"))
         )
     except Exception as e:
         series_problems = [
-            f"뷰 {VIEW} 읽기 실패: {type(e).__name__}: {str(e)[:200]} — 새 표 줄은 만들지 않고 옛 표만 올림"
+            f"뷰 {VIEW} 읽기 실패: {type(e).__name__}: {str(e)[:200]} — 계열 목록이 없어 "
+            "새 표 줄을 만들 수 없음, 올릴 것이 없어 회차 실패"
         ]
     r = run(d, _env("DATA_GO_KR"), stations=stations, cache=cache, series=series)
     r.problems += series_problems

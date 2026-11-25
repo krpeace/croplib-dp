@@ -119,6 +119,17 @@ def test_existing_null_row_in_db_is_overwritten_by_the_filled_row():
         KEY,
         http=BlankDaysAsos(blank_days=[dt.date(2026, 11, 10)]),
         clock=FakeClock(when),
+        series=H.build_series(
+            [
+                dict(
+                    crop_id="common",
+                    season_type_id=None,
+                    heat_t_base_c=5,
+                    heat_cum_start_mmdd="01-01",
+                    sun_cum_start_mmdd="01-01",
+                )
+            ]
+        )[0],
     )
     sent = {}
 
@@ -129,10 +140,19 @@ def test_existing_null_row_in_db_is_overwritten_by_the_filled_row():
 
     H.publish(r, W())
     assert r.uploaded
-    key = ("101", "common", "2026-11-10")
-    rows = [x for x in sent["heat_daily"] if (x["stn_id"], x["crop_id"], x["date"]) == key]
+    assert set(sent) == {"heat_series_daily", "sun_series_daily"}  # 옛 표에는 쓰지 않는다
+    key = ("101", 5, "01-01", "2026-11-10")
+    rows = [
+        x
+        for x in sent["heat_series_daily"]
+        if (x["stn_id"], x["t_base_c"], x["cum_start_mmdd"], x["date"]) == key
+    ]
     assert len(rows) == 1 and rows[0]["gdd_cum"] is not None and rows[0]["filled"] is True
-    assert [x for x in sent["sun_daily"] if (x["stn_id"], x["date"]) == ("101", "2026-11-10")]
+    assert [
+        x
+        for x in sent["sun_series_daily"]
+        if (x["stn_id"], x["cum_start_mmdd"], x["date"]) == ("101", "01-01", "2026-11-10")
+    ]
 
 
 def test_brief_reports_only_trailing_blank_days_of_the_last_seven_days():
@@ -290,7 +310,7 @@ def test_pending_with_no_operating_station_is_empty_list_and_caller_must_not_ski
 
 # ── main --skip-if-done ───────────────────────────────────────────────
 class Db:
-    """읽기 전용 가짜 DB: heat_daily·sun_daily 에서 이미 있는 (지점, 날짜) 를 돌려준다"""
+    """읽기 전용 가짜 DB: heat_series_daily·sun_series_daily 에서 이미 있는 (지점, 날짜) 를 돌려준다"""
 
     def __init__(self, heat=(), sun=(), fail=False):
         self.heat, self.sun, self.fail, self.queries = set(heat), set(sun), fail, []
@@ -298,8 +318,8 @@ class Db:
     def __call__(self, table, dates):
         self.queries.append((table, tuple(dates)))
         if self.fail:
-            raise RuntimeError("Supabase heat_daily 읽기 실패: HTTP 503")
-        return self.heat if table == "heat_daily" else self.sun
+            raise RuntimeError("Supabase heat_series_daily 읽기 실패: HTTP 503")
+        return self.heat if table == "heat_series_daily" else self.sun
 
 
 @pytest.fixture
@@ -389,3 +409,40 @@ def test_skip_if_done_with_explicit_stations_is_not_skipped(app):
     db = Db(**ALL_DONE)
     assert _main(app, db, "--skip-if-done", "--stations", "101") == 0
     assert app["api"].calls and db.queries == []
+
+
+# ── 건너뛰기 판단은 새 표 기준 (이슈 #135) ─────────────────────────────────────
+def test_read_done_asks_the_new_tables_with_the_old_row_equivalent_conditions(monkeypatch):
+    """옛 heat_daily 의 crop_id=common = 새 표의 t_base_c=5 · cum_start_mmdd=01-01, 옛 sun_daily = 01-01."""
+    monkeypatch.setenv("SUPABASE_URL", "https://x.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "k")
+    seen = []
+
+    def fake_read_table(url, key, table, http=None, query="select=*", schema=None):
+        seen.append((table, query))
+        return [{"stn_id": "101", "date": "2026-10-24"}]
+
+    monkeypatch.setattr(H, "read_table", fake_read_table)
+    dates = [D(2026, 10, 24)]
+    assert H.read_done("heat_series_daily", dates) == {("101", D(2026, 10, 24))}
+    assert H.read_done("sun_series_daily", dates) == {("101", D(2026, 10, 24))}
+    (t1, q1), (t2, q2) = seen
+    assert t1 == "heat_series_daily" and t2 == "sun_series_daily"
+    for q in (q1, q2):
+        assert "cum_start_mmdd=eq.01-01" in q and "filled=eq.false" in q and "date=in.(2026-10-24)" in q
+        assert "crop_id" not in q  # 새 표에는 crop_id 열이 없다
+    assert "t_base_c=eq.5" in q1 and "gdd_cum=not.is.null" in q1
+    assert "t_base_c" not in q2 and "rs_cum_mj=not.is.null" in q2
+
+
+def test_skip_check_reads_only_the_new_tables_and_keeps_its_meaning():
+    d = _dicts()
+    today = D(2026, 10, 25)
+    all_done = Db(**ALL_DONE)
+    assert H.skip_check(d, today, all_done)[0] is True  # 전부 있음 → 건너뜀
+    assert {t for t, _ in all_done.queries} == {"heat_series_daily", "sun_series_daily"}
+    assert (
+        H.skip_check(d, today, Db(heat={("101", Y)}, sun=ALL_DONE["sun"]))[0] is False
+    )  # 한 곳 비면 안 건너뜀
+    skip, why = H.skip_check(d, today, Db(fail=True))  # 읽기 실패면 안 건너뜀
+    assert skip is False and "확인 못 함" in why

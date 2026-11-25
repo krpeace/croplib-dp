@@ -22,6 +22,26 @@ from croplib_dp.io.contract import check_rows  # noqa: E402
 
 TODAY = pd.Timestamp("2026-10-25 09:20")
 
+# 운영 뷰 crop_accum_series 의 일부: (기준온도 4 · 5, 누적 시작 01-01) 두 계열, 일사 01-01 (이슈 #135)
+SERIES, _ = H.build_series(
+    [
+        dict(
+            crop_id="apple",
+            season_type_id="apple-main",
+            heat_t_base_c=4,
+            heat_cum_start_mmdd="01-01",
+            sun_cum_start_mmdd="01-01",
+        ),
+        dict(
+            crop_id="common",
+            season_type_id=None,
+            heat_t_base_c=5,
+            heat_cum_start_mmdd="01-01",
+            sun_cum_start_mmdd="01-01",
+        ),
+    ]
+)
+
 
 def _run(**kw):
     api = FakeAsos(**kw)
@@ -79,8 +99,9 @@ def test_station_failure_is_recorded_not_silent():
     assert clock.slept > 0  # 다시 시도했다
 
 
-def test_publish_upserts_both_tables_and_brief():
-    r, _, _ = _run()
+def test_publish_upserts_only_the_new_tables_and_brief():
+    api = FakeAsos()
+    r = H.run(_dicts(), KEY, http=api, clock=FakeClock(TODAY), series=SERIES)
 
     class W:
         def __init__(self):
@@ -93,24 +114,29 @@ def test_publish_upserts_both_tables_and_brief():
     w = W()
     H.publish(r, w)
     assert w.calls == [
-        ("heat_daily", 1460, ("stn_id", "crop_id", "date")),  # 2지점 × 2작물 × 365일
-        ("sun_daily", 365, ("stn_id", "date")),
-    ]
+        (
+            "heat_series_daily",
+            1460,
+            ("stn_id", "t_base_c", "cum_start_mmdd", "date"),
+        ),  # 2지점 × 2계열 × 365일
+        ("sun_series_daily", 365, ("stn_id", "cum_start_mmdd", "date")),
+    ]  # 옛 표(heat_daily · sun_daily)에는 쓰지 않는다
     assert r.uploaded
     text = H.brief_text(r)
-    assert "101 춘천" in text and "평년보다" in text and "DB 올리기: 완료" in text
+    assert "101 춘천" in text and "평년보다" in text
+    assert "DB 올리기: 완료 · heat_series 1460줄 · sun_series 365줄" in text
 
 
 def test_publish_refuses_on_contract_problem():
-    r, _, _ = _run()
-    r.heat_daily[0]["gdd_day"] = -5.0
+    r = H.run(_dicts(), KEY, http=FakeAsos(), clock=FakeClock(TODAY), series=SERIES)
+    r.heat_series_daily[0]["gdd_day"] = -5.0
 
     class W:
         def upsert(self, *a, **k):
             raise AssertionError("계약 검사에 걸리면 올리지 않는다")
 
     H.publish(r, W())
-    assert not r.uploaded and r.failed and any("heat_daily" in p for p in r.problems)
+    assert not r.uploaded and r.failed and any("heat_series_daily" in p for p in r.problems)
 
 
 def test_common_crop_base_5c_included_in_heat_daily():
@@ -263,7 +289,7 @@ NEW_YEAR = "2027-01-01 09:20"
 
 def _new_year(when=NEW_YEAR, cache=None, **kw):
     api = FakeAsos(**kw)
-    r = H.run(dicts_with_common(), KEY, http=api, clock=FakeClock(when), cache=cache)
+    r = H.run(dicts_with_common(), KEY, http=api, clock=FakeClock(when), cache=cache, series=SERIES)
     return r, api
 
 
@@ -362,9 +388,9 @@ def test_new_year_brief_keeps_station_lines_and_adds_one_new_year_line():
     weekday, _ = _new_year("2027-01-04 09:20")
     weekday_lines = [ln for ln in H.brief_text(weekday).splitlines() if ln.startswith("- ")]
     assert len(station_lines) == len(weekday_lines) == 2  # 지점 줄 수는 평일과 같다 (101, 216)
-    assert "새해 2027: 평년선만 생성 (heat 2190줄 · sun 365줄)" in text
+    assert "새해 2027: 평년선만 생성 (heat 1460줄 · sun 365줄)" in text
     r2, _ = _new_year("2027-01-02 09:20")
-    assert "새해 2027: 관측 ~01-01까지 (heat 2190줄 · sun 365줄)" in H.brief_text(r2)
+    assert "새해 2027: 관측 ~01-01까지 (heat 1460줄 · sun 365줄)" in H.brief_text(r2)
 
 
 # ── 일사 무효 처리 (이슈 #44, 결정 0020) ────────────────────────────────────
@@ -388,7 +414,7 @@ def test_station_that_never_reports_radiation_still_gets_no_rows():
 
 
 def test_empty_overwrite_rows_are_upserted_not_deleted():
-    r, _, _ = _run(zero_gsr=("101",))
+    r = H.run(_dicts(), KEY, http=FakeAsos(zero_gsr=("101",)), clock=FakeClock(TODAY), series=SERIES)
     calls = []
 
     class W:
@@ -396,7 +422,7 @@ def test_empty_overwrite_rows_are_upserted_not_deleted():
             calls.append((table, len(rows)))
 
     H.publish(r, W())
-    assert r.uploaded and ("sun_daily", 365) in calls
+    assert r.uploaded and ("sun_series_daily", 365) in calls
     assert not hasattr(W, "delete")
 
 
