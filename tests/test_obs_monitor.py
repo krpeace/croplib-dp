@@ -107,7 +107,7 @@ class Db:
             if q.get("is_active") == "eq.true":
                 rows = [s for s in rows if s["is_active"]]
             return 200, json.dumps([{"stn_id": s["stn_id"], "name_ko": s["name_ko"]} for s in rows]).encode()
-        if table == "heat_daily":
+        if table == "heat_series_daily":
             return 200, json.dumps([{"stn_id": s["stn_id"]} for s in STATIONS if s["is_active"]]).encode()
         if table == "soil_types":
             return 200, json.dumps(

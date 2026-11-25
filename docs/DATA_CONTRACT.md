@@ -27,7 +27,7 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 - `sun_series_daily` 키 `(stn_id, cum_start_mmdd, date)`, 값 열은 `sun_daily`와 같다.
 - 계열 목록은 뷰 `crop_accum_series`(작형마다 한 줄 + 작물 공통 한 줄: `crop_id`, `season_type_id`, `heat_t_base_c`, `heat_cum_start_mmdd`, `sun_cum_start_mmdd`)에서 읽는다. 시설가온은 `heat_*`가 비어 적산온도를 내지 않는다.
 - **누적 시작 전 날은 줄을 쓰지 않는다.** 누적·평년 누적·`lead_days`는 누적 시작부터 센다. 일값은 시작이 달라도 같다. 식·평년·빈 날 처리는 옛 표와 같다. (5, 01-01) 계열 = `heat_daily`의 `crop_id = common` 줄, `sun_series_daily`의 01-01 계열 = `sun_daily`.
-- 쓰기 순서는 옛 표 → 새 표. 새 표가 실패해도 옛 표는 그대로 두고 수집 결과(문제 목록)에 남긴다. 옛 표는 3단계(CropMon 화면 전환) 전까지 지금 그대로 쓴다. 업로드 전 검사는 `io/contract.py`의 `SPECS`.
+- **3단계(#135, 결정 0041, 2026-11-25)부터 새 표 둘만 쓴다.** 옛 표 `heat_daily`·`sun_daily`에는 더 쓰지 않는다(이미 있는 줄은 그대로 두고, 지우는 것은 CropMon 몫). 새 표가 계약에 어긋나거나 올리기에 실패하면 수집 결과(문제 목록)에 남기고 회차를 실패로 한다. 옛 줄과 같은 줄을 새 표에서 찾는 법은 위 (5, 01-01) · 01-01 계열이다. 업로드 전 검사는 `io/contract.py`의 `SPECS`.
 
 ## `soil_water_daily` (계약 v1.5, CropMon#35·결정 0014)
 - 키: `(stn_id, soil_code, date)`. 대표 10곳(`has_forecast`) × 토성 12종(FAO-56 Table 19 9종 + Saxton & Rawls 추정 3종). `OBS_ALL_STATIONS=true`면 운영 지점(`is_active`) 전부(관측만 하는 지점은 이 표와 `weather_daily`만, 결정 0026). CropMon 계약서의 "대표 10곳" 문구 정정은 CropMon 요청 P5.

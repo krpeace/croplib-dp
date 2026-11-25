@@ -194,7 +194,7 @@ def test_read_state_and_run(monkeypatch):
             return 200, json.dumps(
                 [{"stn_id": "101", "name_ko": "춘천"}, {"stn_id": "216", "name_ko": "태백"}]
             ).encode()
-        if table == "heat_daily":  # 적산온도는 한 번에: 어제 값이 있는 지점 목록
+        if table == "heat_series_daily":  # 적산온도는 한 번에: 어제 값이 있는 지점 목록
             return 200, json.dumps([{"stn_id": "101"}]).encode()
         assert q["stn_id"].startswith("in.(") and q["date"] == "gte.2026-10-25"  # 지점마다 묻지 않고 한 번에
         ids = q["stn_id"].removeprefix("in.(").removesuffix(")").split(",")
@@ -310,7 +310,8 @@ STATIONS_105 = [
 class FakeDb:
     """가짜 Supabase REST. 요청 주소를 그대로 기록하고, stations 는 has_forecast·is_active 조건대로 걸러 준다
     (조건이 없으면 전부 돌려준다 — 조건을 빼면 시험이 깨지게).
-    heat_daily 는 지점마다 묻지 않고 한 번에 묻는다: 어제 날짜·작물 공통 값이 있는 지점 목록을 돌려준다."""
+    heat_series_daily 는 지점마다 묻지 않고 한 번에 묻는다: 어제 날짜·기준온도 5·누적 시작 01-01
+    값이 있는 지점 목록을 돌려준다(이슈 #135)."""
 
     def __init__(
         self, obs: dict[str, str], heat: set[str] | None = None, stations=None, heat_date: str = YESTERDAY
@@ -334,9 +335,10 @@ class FakeDb:
             if q.get("is_active") == "eq.true":
                 rows = [s for s in rows if s["is_active"] is True]
             return 200, json.dumps([{"stn_id": s["stn_id"], "name_ko": s["name_ko"]} for s in rows]).encode()
-        if table == "heat_daily":
+        if table == "heat_series_daily":
             assert "stn_id" not in q or q["stn_id"] == ""  # 지점마다 묻지 않는다
-            assert q["date"] == f"eq.{self.heat_date}" and q["crop_id"] == "eq.common"
+            assert q["date"] == f"eq.{self.heat_date}" and "crop_id" not in q  # 새 표에는 crop_id 가 없다
+            assert q["t_base_c"] == "eq.5" and q["cum_start_mmdd"] == "eq.01-01"
             assert q["gdd_cum"] == "not.is.null"
             return 200, json.dumps([{"stn_id": s} for s in sorted(self.heat)]).encode()
         # 관측: 지점마다가 아니라 수집 지점 전체를 한 번에, 어제 이후 줄만(지점별 마지막 날이 어제 이상인 것)
@@ -363,9 +365,15 @@ def test_read_state_asks_collected_for_obs_and_active_for_heat_in_few_calls():
     assert (
         "stn_id=in.(101,216)" in urllib.parse.unquote(obs[0]) and "108" not in obs[0] and "999" not in obs[0]
     )
-    heat = [u for u in db.urls if "/rest/v1/heat_daily" in u]
+    assert not [u for u in db.urls if "/rest/v1/heat_daily" in u]  # 옛 표는 더 읽지 않는다
+    heat = [u for u in db.urls if "/rest/v1/heat_series_daily" in u]
     assert len(heat) == 1  # 적산온도는 지점 수와 상관없이 REST 한 번
-    assert "stn_id=eq" not in heat[0] and f"date=eq.{YESTERDAY}" in heat[0] and "crop_id=eq.common" in heat[0]
+    assert "stn_id=eq" not in heat[0] and f"date=eq.{YESTERDAY}" in heat[0]
+    assert (
+        "t_base_c=eq.5" in heat[0]
+        and "cum_start_mmdd=eq.01-01" in heat[0]
+        and "gdd_cum=not.is.null" in heat[0]
+    )
     assert len(db.urls) == 1 + 2 + 1 + 1  # 회차, 지점 2번, 관측 1번, 적산온도 1번
 
 

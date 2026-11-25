@@ -1,7 +1,8 @@
-"""적산 계열 2단계 (이슈 #127, 결정 0038): heat_series_daily · sun_series_daily 에도 쓰기.
+"""적산 계열 (이슈 #127 · #135, 결정 0038 · 0041): heat_series_daily · sun_series_daily 에만 쓰기.
 
 값을 가르는 것은 작물이 아니라 기준온도와 누적 시작 월-일 둘뿐이다(적산 계열).
-뷰 `crop_accum_series`에서 계열 목록을 읽고, 옛 표(heat_daily·sun_daily)는 지금 그대로 쓰고 새 표에도 쓴다.
+뷰 `crop_accum_series`에서 계열 목록을 읽고 새 표 둘에 쓴다.
+3단계(#135)부터 옛 표(heat_daily·sun_daily)에는 쓰지 않는다.
 가짜 ASOS·가짜 시계·가짜 DB 쓰기로 돈다. 입력은 모두 가짜 값이다.
 """
 
@@ -477,11 +478,11 @@ class W:
         return []
 
 
-def test_publish_writes_old_tables_first_then_new_tables():
+def test_publish_writes_only_the_new_tables():
     r = _run(series=_series())[0]
     w = W()
     H.publish(r, w)
-    assert [c[0] for c in w.calls] == ["heat_daily", "sun_daily", "heat_series_daily", "sun_series_daily"]
+    assert [c[0] for c in w.calls] == ["heat_series_daily", "sun_series_daily"]  # 옛 표 이름은 없다
     keys = {t: k for t, _, k in w.calls}
     assert keys["heat_series_daily"] == ("stn_id", "t_base_c", "cum_start_mmdd", "date")
     assert keys["sun_series_daily"] == ("stn_id", "cum_start_mmdd", "date")
@@ -490,45 +491,46 @@ def test_publish_writes_old_tables_first_then_new_tables():
     assert counts["heat_series_daily"] == 2 * 986 and counts["sun_series_daily"] == 365 + 256
 
 
-def test_publish_without_series_writes_only_old_tables_as_before():
+def test_publish_without_series_writes_nothing_and_fails_loudly():
     r = _run(series=None)[0]
     w = W()
     H.publish(r, w)
-    assert [c[0] for c in w.calls] == ["heat_daily", "sun_daily"] and r.uploaded and not r.failed
+    assert w.calls == [] and not r.uploaded and r.failed
+    assert any("올릴 줄이 없음" in p for p in r.problems)
 
 
-def test_new_table_write_failure_keeps_old_tables_and_is_recorded():
+def test_new_table_write_failure_is_recorded():
     r = _run(series=_series())[0]
     w = W(fail_on=("heat_series_daily",))
     H.publish(r, w)
-    assert [c[0] for c in w.calls] == ["heat_daily", "sun_daily"]  # 옛 표는 쓴 채
+    assert w.calls == [] and not r.uploaded
     assert r.failed and any("heat_series_daily" in p and "실패" in p for p in r.problems)
-    assert r.uploaded and not r.series_uploaded
 
 
-def test_new_table_contract_problem_does_not_block_old_tables_but_is_recorded():
+def test_second_new_table_write_failure_is_recorded():
+    r = _run(series=_series())[0]
+    w = W(fail_on=("sun_series_daily",))
+    H.publish(r, w)
+    assert [c[0] for c in w.calls] == ["heat_series_daily"] and not r.uploaded
+    assert r.failed and any("sun_series_daily" in p and "실패" in p for p in r.problems)
+
+
+def test_new_table_contract_problem_uploads_nothing_and_is_recorded():
     r = _run(series=_series())[0]
     r.heat_series_daily[0]["gdd_day"] = -5.0
     w = W()
     H.publish(r, w)
-    assert [c[0] for c in w.calls] == ["heat_daily", "sun_daily"]  # 새 표는 쓰지 않음
+    assert w.calls == [] and not r.uploaded  # 아무것도 올리지 않는다
     assert r.failed and any("heat_series_daily" in p for p in r.problems)
-    assert r.uploaded and not r.series_uploaded
 
 
-def test_old_table_contract_problem_blocks_everything():
+def test_old_tables_are_never_checked_or_written_even_if_their_rows_are_bad():
+    """옛 줄 모양 계산 결과는 메모리에만 있다. 그 값이 어긋나도 DB 로 가지 않으므로 올리기에 영향이 없다."""
     r = _run(series=_series())[0]
     r.heat_daily[0]["gdd_day"] = -5.0
     w = W()
     H.publish(r, w)
-    assert w.calls == [] and not r.uploaded and r.failed
-
-
-def test_old_table_write_failure_does_not_try_the_new_tables():
-    r = _run(series=_series())[0]
-    w = W(fail_on=("sun_daily",))
-    H.publish(r, w)
-    assert [c[0] for c in w.calls] == ["heat_daily"] and not r.uploaded and r.failed
+    assert [c[0] for c in w.calls] == ["heat_series_daily", "sun_series_daily"] and not r.failed
 
 
 # ── 뷰 읽기 · main ──────────────────────────────────────────────────────
@@ -576,19 +578,17 @@ def _brief(app):
     return (app["out"] / "heat_sun_2026" / "brief.md").read_text(encoding="utf-8")
 
 
-def test_main_writes_old_then_new_tables_and_reports_counts(app):
+def test_main_writes_only_new_tables_and_reports_counts(app):
     app["monkeypatch"].setattr(H, "read_series_rows", lambda *a, **k: VIEW_ROWS)
     assert H.main(["--out", str(app["out"]), "--write"]) == 0
-    assert [t for t, _ in app["writes"]] == [
-        "heat_daily",
-        "sun_daily",
-        "heat_series_daily",
-        "sun_series_daily",
-    ]
+    assert [t for t, _ in app["writes"]] == ["heat_series_daily", "sun_series_daily"]
     text = _brief(app)
-    assert "heat_series 1972줄" in text and "sun_series 621줄" in text
+    assert "DB 올리기: 완료 · heat_series 1972줄 · sun_series 621줄" in text
+    assert "heat 2190줄" not in text and "새 표" not in text  # 옛 표 줄 수는 더 내지 않는다
     for name in ("heat_series_daily", "sun_series_daily"):
         assert (app["out"] / "heat_sun_2026" / f"{name}.json").is_file()
+    for name in ("heat_daily", "sun_daily"):  # 올리지 않는 옛 표 JSON 은 쓰지 않는다
+        assert not (app["out"] / "heat_sun_2026" / f"{name}.json").exists()
 
 
 def test_main_dry_run_checks_the_new_tables_without_writing(app):
@@ -597,22 +597,70 @@ def test_main_dry_run_checks_the_new_tables_without_writing(app):
     assert app["writes"] == []
 
 
-def test_main_view_read_failure_still_writes_old_tables_and_fails_loudly(app):
+def test_main_view_read_failure_writes_nothing_and_fails_with_the_cause(app):
     def boom(*a, **k):
         raise RuntimeError("Supabase crop_accum_series 읽기 실패: HTTP 503")
 
     app["monkeypatch"].setattr(H, "read_series_rows", boom)
     assert H.main(["--out", str(app["out"]), "--write"]) == 1  # 조용히 넘기지 않는다
-    assert [t for t, _ in app["writes"]] == ["heat_daily", "sun_daily"]
+    assert app["writes"] == []
     text = _brief(app)
-    assert "뷰 crop_accum_series" in text and "읽기 실패" in text
+    assert "뷰 crop_accum_series" in text and "읽기 실패" in text and "올릴 것이 없어 회차 실패" in text
 
 
-def test_main_empty_view_still_writes_old_tables_and_fails_loudly(app):
+def test_main_empty_view_writes_nothing_and_fails_with_the_cause(app):
     app["monkeypatch"].setattr(H, "read_series_rows", lambda *a, **k: [])
     assert H.main(["--out", str(app["out"]), "--write"]) == 1
-    assert [t for t, _ in app["writes"]] == ["heat_daily", "sun_daily"]
-    assert "뷰 crop_accum_series" in _brief(app) and "비어" in _brief(app)
+    assert app["writes"] == []
+    text = _brief(app)
+    assert "뷰 crop_accum_series" in text and "비어" in text and "올릴 것이 없음" in text
+
+
+def test_main_dry_run_without_series_also_fails(app):
+    app["monkeypatch"].setattr(H, "read_series_rows", lambda *a, **k: [])
+    assert H.main(["--out", str(app["out"])]) == 1
+
+
+# ── 병합 전후 같은 날 값: 알림 지점 줄은 글자까지 같다 (이슈 #135) ──────────────
+# 옛 줄을 올리던 main(a1ff7b5) 에서 같은 가짜 입력(_series(), 가짜 ASOS)으로 떠 둔 지점 줄이다.
+GOLDEN_STATION_LINES = {
+    "2026-10-25 09:20": [
+        "- 101 춘천: 관측 ~10-24 · 사과 4758/4462℃·일 평년보다 22일 빠름"
+        " · 배추 4758/4462℃·일 평년보다 22일 빠름"
+        " · 작물 공통 4461/4165℃·일 평년보다 24일 빠름 · 햇빛 100%",
+        "- 216 태백: 관측 ~10-24 · 사과 4758/4462℃·일 평년보다 22일 빠름"
+        " · 배추 4758/4462℃·일 평년보다 22일 빠름"
+        " · 작물 공통 4461/4165℃·일 평년보다 24일 빠름 · 햇빛 자료 없음",
+    ],
+    # 1/1~3 경계: 작년 마감 기준 지점 줄 + 새해 줄
+    "2027-01-02 09:20": [
+        "- 101 춘천: 관측 ~12-31 · 사과 5649/5284℃·일 평년 미도달 · 배추 5649/5284℃·일 평년 미도달"
+        " · 작물 공통 5284/4919℃·일 평년 미도달 · 햇빛 100%",
+        "- 216 태백: 관측 ~12-31 · 사과 5649/5284℃·일 평년 미도달 · 배추 5649/5284℃·일 평년 미도달"
+        " · 작물 공통 5284/4919℃·일 평년 미도달 · 햇빛 자료 없음",
+    ],
+}
+
+
+@pytest.mark.parametrize("when", sorted(GOLDEN_STATION_LINES))
+def test_brief_station_lines_are_unchanged_from_before_the_old_tables_stopped(when):
+    r, _ = _run(series=_series(), when=pd.Timestamp(when))
+    lines = [x for x in H.brief_text(r).splitlines() if x.startswith("- ")]
+    assert lines == GOLDEN_STATION_LINES[when]
+
+
+def test_brief_db_line_and_new_year_line_count_the_new_tables():
+    r, _ = _run(series=_series())
+    assert H.brief_text(r).splitlines()[-1] == "DB 올리기: 안 함 · heat_series 1972줄 · sun_series 621줄"
+    r2, _ = _run(series=_series(), when=pd.Timestamp("2027-01-02 09:20"))
+    text = H.brief_text(r2)
+    assert text.splitlines()[-1] == "DB 올리기: 안 함 · heat_series 3944줄 · sun_series 1242줄"
+    new_year = [x for x in text.splitlines() if x.startswith("새해 2027")]
+    assert len(new_year) == 1
+    heat = sum(1 for x in r2.heat_series_daily if x["date"].startswith("2027-"))
+    sun = sum(1 for x in r2.sun_series_daily if x["date"].startswith("2027-"))
+    assert new_year[0] == f"새해 2027: 관측 ~01-01까지 (heat {heat}줄 · sun {sun}줄)"
+    assert heat == 1972 and sun == 621
 
 
 # ── 알림 문구: 포도 ─────────────────────────────────────────────────────
