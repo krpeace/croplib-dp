@@ -228,7 +228,10 @@ def test_core_observed_water_balance_protected_flag_directly():
 
 # ── ② 작기 밖은 dormant ─────────────────────────────────────────────────────
 def test_outside_the_season_is_dormant_and_dr_stays_empty():
-    r, _ = run()
+    d = protected_dicts()
+    for s in d.scenarios:  # 끝난 작기는 지난 줄을 올리지 않으므로(결정 0042) 작기 끝을 비워 전체 줄을 본다
+        s["season_end"] = None
+    r, _ = run(d=d)
     rows = wb_rows(r, "grape-short")  # 5/1 ~ 5/20 만 작기, 오늘(6/10)은 끝난 뒤
     by = {x["date"]: x for x in rows}
     assert by["2026-05-20"]["status"] == ETC_ONLY and by["2026-05-20"]["kc"] > 0

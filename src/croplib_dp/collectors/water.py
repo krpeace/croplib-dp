@@ -67,6 +67,7 @@ from croplib_dp.core.retention import ROW_BYTES, raw_prefix
 from croplib_dp.core.retention import raw_path as storage_raw_path
 from croplib_dp.core.soil_water import MissingPrior, soil_water_rows, window_needs_prior
 from croplib_dp.core.water_balance import observed_water_balance
+from croplib_dp.core.wb_upload import upload_rows
 from croplib_dp.io import egress, kma
 from croplib_dp.io.coefficients import load_error_rows, load_s3_coef, load_s4_coef
 from croplib_dp.io.contract import SPECS, check_rows
@@ -568,6 +569,30 @@ def season_protection(
     return _is_true(v)
 
 
+def _add_wb_rows(
+    result: "SlotResult",
+    stn_id: str,
+    s: Mapping[str, Any],
+    wb: list[dict],
+    prev: dt.date,
+    window_only: bool,
+) -> None:
+    """한 조건의 물수지에서 올릴 줄만 결과에 더한다(core/wb_upload, 결정 0042: 끝난 작기의 지난 줄은
+    다시 쓰지 않음). 끝난 작기인데 dormant 가 아닌 줄을 뺐으면 경고에 남긴다."""
+    rows, dropped = upload_rows(
+        wb, s.get("season_end"), prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1), window_only
+    )
+    for r in rows:
+        result.water_balance_daily.append(
+            _jsonable(dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS}))
+        )
+    if dropped:
+        result.warnings.append(
+            f"{stn_id} {s['scenario_id']}: 끝난 작기(season_end {str(s['season_end'])[:10]}) 뒤인데 "
+            f"dormant 가 아닌 물수지 {dropped}줄은 올리지 않음 — 작형의 단계 일수가 작기 끝보다 긴지 확인"
+        )
+
+
 def _scenario_info(d: Dictionaries, s: Mapping[str, Any], crop: Any, protected: bool, wb: list[dict]) -> dict:
     """지점 요약의 조건 한 줄. 시설 재배는 Dr 대신 마지막 날 ETc(쓰는 물)를 싣는다."""
     info = dict(
@@ -611,9 +636,8 @@ def run_station(
     # 대표 밖 지점은 water_balance_daily 도 어제 포함 14일 창만 올린다(결정 0026 12번 확장, 0030).
     # 계산은 작기 시작부터
     # 다시 하므로 창 안 값은 전체와 같다. 소급(--soil-backfill)은 창이 없다.
-    wb_cutoff = (
-        None if soil_backfill or is_representative(st) else prev - dt.timedelta(days=SOIL_UPLOAD_DAYS - 1)
-    )
+    # 작기가 끝난 조건은 지점·소급과 상관없이 창 줄만 올린다(결정 0042).
+    window_only = not (soil_backfill or is_representative(st))
     summary = dict(
         stn_id=stn_id,
         name=st.get("name_ko"),
@@ -670,12 +694,7 @@ def run_station(
             if days or end
             else []
         )
-        for r in wb:
-            if wb_cutoff is not None and r["date"] < wb_cutoff:
-                continue
-            result.water_balance_daily.append(
-                _jsonable(dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS}))
-            )
+        _add_wb_rows(result, stn_id, s, wb, prev, window_only)
         info = _scenario_info(d, s, crop, protected, wb)
         if ft is not None and svc["ok"] and wb:
             try:
@@ -1010,7 +1029,8 @@ def run_wb_backfill(
 ) -> SlotResult:
     """water_balance_daily 소급(결정 0030): **예보·전망·forecast_runs 없이** ASOS만 받아
     그해 작기 시작~어제(ASOS가 있는 마지막 날)까지 물수지를 계산한다.
-    정기 회차와 같은 날짜부터(3/1) 같은 계산을 하므로 값이 같다. 어제가 아직 ASOS에
+    정기 회차와 같은 날짜부터(3/1) 같은 계산을 하므로 값이 같다. 작기가 끝난 조건은 14일 창의
+    dormant 줄만 올린다(지난 줄은 다시 쓰지 않음, 결정 0042). 어제가 아직 ASOS에
     없으면 그날 줄은 정기 회차가 예보로 채운다. ASOS가 실패한 지점이 있으면 문제로 남긴다(쓰지 않는다)."""
     clock = clock or Clock()
     issue = pd.Timestamp(issue)
@@ -1057,12 +1077,7 @@ def run_wb_backfill(
                 if days
                 else []
             )
-            for r in wb:
-                result.water_balance_daily.append(
-                    _jsonable(
-                        dict(scenario_id=s["scenario_id"], date=r["date"], **{k: r[k] for k in WB_COLS})
-                    )
-                )
+            _add_wb_rows(result, stn_id, s, wb, prev, window_only=False)
             info = _scenario_info(d, s, crop, protected, wb)
             summary["scenarios"].append(info)
         result.calc_seconds += time.perf_counter() - t_calc
