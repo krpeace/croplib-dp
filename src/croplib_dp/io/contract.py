@@ -195,60 +195,7 @@ SPECS["water_outlook_summary"] = TableSpec(
     enums={"status_start": STATUS},
     key=("run_id", "scenario_id"),
 )
-SPECS["heat_daily"] = TableSpec(
-    columns=(
-        "stn_id",
-        "crop_id",
-        "date",
-        "t_base_c",
-        "gdd_day",
-        "gdd_cum",
-        "gdd_normal_day",
-        "gdd_normal_cum",
-        "lead_days",
-        "normal_from",
-        "normal_to",
-        "filled",
-        "calc_version",
-    ),
-    required=("stn_id", "crop_id", "date", "t_base_c", "normal_from", "normal_to", "filled", "calc_version"),
-    ranges={
-        "t_base_c": (-10, 30),
-        "gdd_day": (0, 40),
-        "gdd_cum": (0, 8000),
-        "gdd_normal_day": (0, 40),
-        "gdd_normal_cum": (0, 8000),
-        "lead_days": (-366, 366),
-        "normal_from": (1900, 2100),
-        "normal_to": (1900, 2100),
-    },
-    key=("stn_id", "crop_id", "date"),
-)
-SPECS["sun_daily"] = TableSpec(
-    columns=(
-        "stn_id",
-        "date",
-        "rs_day_mj",
-        "rs_cum_mj",
-        "rs_normal_day_mj",
-        "rs_normal_cum_mj",
-        "normal_from",
-        "normal_to",
-        "filled",
-        "calc_version",
-    ),
-    required=("stn_id", "date", "normal_from", "normal_to", "filled", "calc_version"),
-    ranges={
-        "rs_day_mj": (0, 40),
-        "rs_cum_mj": (0, 10000),
-        "rs_normal_day_mj": (0, 40),
-        "rs_normal_cum_mj": (0, 10000),
-        "normal_from": (1900, 2100),
-        "normal_to": (1900, 2100),
-    },
-    key=("stn_id", "date"),
-)
-# 적산 계열 표 (CropMon 데이터 계약 v2.2, 이슈 #127): 값 열 · 필수 · 범위는 옛 표와 같고 키만 다르다.
+# 적산 계열 표 (CropMon 데이터 계약 v2.2, 이슈 #127)
 # heat_series_daily: crop_id 대신 누적 시작 월-일(cum_start_mmdd, 'MM-DD'). 키는 기준온도 · 시작일 · 날짜
 SPECS["heat_series_daily"] = TableSpec(
     columns=(
@@ -276,7 +223,16 @@ SPECS["heat_series_daily"] = TableSpec(
         "filled",
         "calc_version",
     ),
-    ranges=SPECS["heat_daily"].ranges,
+    ranges={
+        "t_base_c": (-10, 30),
+        "gdd_day": (0, 40),
+        "gdd_cum": (0, 8000),
+        "gdd_normal_day": (0, 40),
+        "gdd_normal_cum": (0, 8000),
+        "lead_days": (-366, 366),
+        "normal_from": (1900, 2100),
+        "normal_to": (1900, 2100),
+    },
     key=("stn_id", "t_base_c", "cum_start_mmdd", "date"),
 )
 SPECS["sun_series_daily"] = TableSpec(
@@ -294,7 +250,14 @@ SPECS["sun_series_daily"] = TableSpec(
         "calc_version",
     ),
     required=("stn_id", "cum_start_mmdd", "date", "normal_from", "normal_to", "filled", "calc_version"),
-    ranges=SPECS["sun_daily"].ranges,
+    ranges={
+        "rs_day_mj": (0, 40),
+        "rs_cum_mj": (0, 10000),
+        "rs_normal_day_mj": (0, 40),
+        "rs_normal_cum_mj": (0, 10000),
+        "normal_from": (1900, 2100),
+        "normal_to": (1900, 2100),
+    },
     key=("stn_id", "cum_start_mmdd", "date"),
 )
 # 농장별 계산 결과 (CropMon 데이터 계약 v2.1, 이슈 #131): 공개 표와 같은 열에서 scenario_id → farm_id.

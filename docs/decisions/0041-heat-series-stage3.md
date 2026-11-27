@@ -20,3 +20,6 @@ CropMon #207(PR #208, 결정 0072)이 2026-11-25 운영에 배포되어 화면�
 
 ## 병합 뒤 확인
 heat-sun 09:20 회차 success, 요약 "DB 올리기"가 새 표 줄 수만 보이고 problems 없음 → 09:50 회차가 건너뜀 문구 → 12시 뒤 monitor에 `heat` 경고 없음 → 읽기 전용 조회로 옛 표 `max(date) filter (where not filled)`가 멈춰 있고 새 표는 어제까지 있음. 정상이면 CropMon이 옛 표를 지운다.
+
+## 뒤이은 일
+- 옛 표는 지워졌고(CropMon #211, 2026-11-26) 남은 이름은 이슈 #137에서 정리했다. 메모리 안의 계산 필드 이름(`heat_daily` · `sun_daily`)은 그대로 두었다.

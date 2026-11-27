@@ -209,7 +209,7 @@ class _Db:
             if not self.with_grid_columns:
                 rows = [{"stn_id": s["stn_id"], "name_ko": s["name_ko"]} for s in rows]
             return 200, json.dumps(rows).encode()
-        if table == "heat_daily":
+        if table == "heat_series_daily":
             return 200, json.dumps([]).encode()
         return 200, json.dumps([{"stn_id": "101", "date": "2026-10-25"}]).encode()
 

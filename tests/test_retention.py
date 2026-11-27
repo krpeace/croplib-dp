@@ -284,17 +284,15 @@ def test_storage_thresholds_800_and_950():
 
 
 E2_COUNTS = {
-    "heat_daily": 114_975, "soil_water_daily": 37_200, "sun_daily": 26_280, "water_balance_daily": 10_140,
+    "heat_series_daily": 114_975, "soil_water_daily": 37_200, "sun_series_daily": 26_280, "water_balance_daily": 10_140,
     "water_outlook": 5_640, "weather_daily": 3_187, "water_outlook_summary": 1_405, "forecast_runs": 282,
 }  # fmt: skip
 
 
 def test_estimate_reproduces_the_measured_57mb_from_the_e2_row_counts():
-    # 줄 수를 읽는 표 13개 = E2 의 8개 + 적산 계열 새 표 2개(#127) + 농장 결과 표 3개(#131)
-    # (E2 때는 없던 표라 줄 수 0 으로 본다)
+    # 줄 수를 읽는 표 11개 = E2 의 8개 + 농장 결과 표 3개(#131, E2 때는 없던 표라 줄 수 0 으로 본다).
+    # E2 때의 heat_daily · sun_daily 는 지워졌다(#137). 그 줄 수는 줄당 크기가 같은 적산 계열 새 표로 옮겼다
     assert set(R.COUNT_TABLES) == set(E2_COUNTS) | {
-        "heat_series_daily",
-        "sun_series_daily",
         "farm_water_daily",
         "farm_water_outlook",
         "farm_water_outlook_summary",
@@ -302,9 +300,16 @@ def test_estimate_reproduces_the_measured_57mb_from_the_e2_row_counts():
     assert R.estimate_db_mb(E2_COUNTS) == pytest.approx(57.0, abs=1.0)  # E2 실측 전체 57MB
 
 
+def test_dropped_old_tables_are_not_counted():
+    """#137: 없는 표를 세면 HEAD 가 404 라서 DB 크기 추정(대비 경로)이 실패한다"""
+    assert not {"heat_daily", "sun_daily"} & (set(R.COUNT_TABLES) | set(R.ROW_BYTES))
+    assert len(R.COUNT_TABLES) == 11
+    assert (R.ROW_BYTES["heat_series_daily"], R.ROW_BYTES["sun_series_daily"]) == (219, 187)
+
+
 def test_estimate_grows_with_rows_and_has_a_floor_of_system_and_small_tables():
     empty = R.estimate_db_mb({t: 0 for t in R.COUNT_TABLES})
     assert empty == pytest.approx(R.SYSTEM_MB + R.EXTRA_MB)
-    assert R.estimate_db_mb({**{t: 0 for t in R.COUNT_TABLES}, "heat_daily": 1_000_000}) == pytest.approx(
-        empty + 1_000_000 * 219 / 1024 / 1024
-    )
+    assert R.estimate_db_mb(
+        {**{t: 0 for t in R.COUNT_TABLES}, "heat_series_daily": 1_000_000}
+    ) == pytest.approx(empty + 1_000_000 * 219 / 1024 / 1024)

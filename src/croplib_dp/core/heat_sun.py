@@ -1,4 +1,4 @@
-"""적산온도(GDD)·적산일사 (CropMon 계약 v1.4 heat_daily·sun_daily).
+"""적산온도(GDD)·적산일사 (CropMon 계약 v2.5 heat_series_daily·sun_series_daily).
 
 원본: cropweather `temp_core.py`(calc_gdd, gdd_reaching_dates). 식은 그대로 옮겼다.
 CropMon 표를 위해 더한 것: 같은 날 평균으로 구한 평년(normals_by_day),

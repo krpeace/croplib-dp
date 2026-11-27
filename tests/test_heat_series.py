@@ -343,12 +343,40 @@ def test_contract_specs_have_the_new_tables_with_new_keys():
     assert s.key == ("stn_id", "cum_start_mmdd", "date")
     assert "crop_id" not in h.columns and "cum_start_mmdd" in h.columns and "cum_start_mmdd" in s.columns
     assert "cum_start_mmdd" in h.required and "cum_start_mmdd" in s.required
-    old_h, old_s = SPECS["heat_daily"], SPECS["sun_daily"]
-    assert [c for c in h.columns if c not in ("t_base_c", "cum_start_mmdd")] == [
-        c for c in old_h.columns if c not in ("crop_id", "t_base_c")
-    ]
-    assert [c for c in s.columns if c != "cum_start_mmdd"] == list(old_s.columns)
-    assert h.ranges == old_h.ranges and s.ranges == old_s.ranges
+    assert h.columns == (
+        "stn_id", "t_base_c", "cum_start_mmdd", "date", "gdd_day", "gdd_cum", "gdd_normal_day",
+        "gdd_normal_cum", "lead_days", "normal_from", "normal_to", "filled", "calc_version",
+    )  # fmt: skip
+    assert s.columns == (
+        "stn_id", "cum_start_mmdd", "date", "rs_day_mj", "rs_cum_mj", "rs_normal_day_mj",
+        "rs_normal_cum_mj", "normal_from", "normal_to", "filled", "calc_version",
+    )  # fmt: skip
+
+
+def test_series_ranges_keep_the_values_of_the_removed_old_specs():
+    """#137: 옛 SPECS 를 지워도 새 표의 값 범위는 한 글자도 바뀌지 않는다"""
+    assert dict(SPECS["heat_series_daily"].ranges) == {
+        "t_base_c": (-10, 30),
+        "gdd_day": (0, 40),
+        "gdd_cum": (0, 8000),
+        "gdd_normal_day": (0, 40),
+        "gdd_normal_cum": (0, 8000),
+        "lead_days": (-366, 366),
+        "normal_from": (1900, 2100),
+        "normal_to": (1900, 2100),
+    }
+    assert dict(SPECS["sun_series_daily"].ranges) == {
+        "rs_day_mj": (0, 40),
+        "rs_cum_mj": (0, 10000),
+        "rs_normal_day_mj": (0, 40),
+        "rs_normal_cum_mj": (0, 10000),
+        "normal_from": (1900, 2100),
+        "normal_to": (1900, 2100),
+    }
+
+
+def test_contract_has_no_specs_for_the_dropped_old_tables():
+    assert not {"heat_daily", "sun_daily"} & set(SPECS)
 
 
 def test_contract_catches_duplicate_keys_and_bad_values_in_series_rows(base):
