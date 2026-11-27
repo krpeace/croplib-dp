@@ -14,11 +14,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / "data"))
 
-from heat_sun_fakes import KEY, FakeAsos, FakeClock, _dicts, dicts_with_common  # noqa: E402
+from heat_sun_fakes import (  # noqa: E402
+    KEY,
+    FakeAsos,
+    FakeClock,
+    _dicts,
+    check_memory_rows,
+    dicts_with_common,
+)
 
 from croplib_dp.collectors import heat_sun as H  # noqa: E402
 from croplib_dp.core import heat_sun as C  # noqa: E402
-from croplib_dp.io.contract import check_rows  # noqa: E402
 
 TODAY = pd.Timestamp("2026-10-25 09:20")  # 어제 = 2026-10-24
 BLANK = ("maxTa", "minTa", "avgTa", "avgRhm", "avgWs", "sumGsr", "sumRn")
@@ -71,7 +77,7 @@ def test_no_row_with_a_date_up_to_yesterday_has_null_cum_after_a_blank_day():
     r = _run(blank=[dt.date(2026, 10, 24)])
     ok = [x for x in r.heat_daily if x["date"] <= "2026-10-23"]
     assert ok and all(x["gdd_cum"] is not None for x in ok)
-    assert check_rows("heat_daily", r.heat_daily) == [] and check_rows("sun_daily", r.sun_daily) == []
+    assert check_memory_rows(r.heat_daily, r.sun_daily) == []
 
 
 def test_blank_day_is_reported_not_silent():

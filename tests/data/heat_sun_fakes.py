@@ -11,6 +11,7 @@ import urllib.parse
 
 import pandas as pd
 
+from croplib_dp.io.contract import check_rows
 from croplib_dp.io.dictionaries import Dictionaries
 
 KEY = "FAKE+KEY/dummy-value=="
@@ -133,3 +134,15 @@ def dicts_with_common() -> Dictionaries:
     d = _dicts()
     d.crops["common"] = dict(crop_id="common", name_ko="작물 공통", t_base_c=5, gdd_stages=[1000, 2000])
     return d
+
+
+def check_memory_rows(heat=(), sun=()):
+    """옛 줄 모양 계산 결과(메모리의 heat_daily · sun_daily)를 새 표 계약으로 검사한다 → 어긋난 곳 목록.
+
+    옛 줄은 1월 1일 누적이라 cum_start_mmdd="01-01" 을 붙인다. crop_id 는 키(extra)에 넣고,
+    새 표 필수 칸이 아니므로 비어 있지 않은지는 여기서 따로 본다."""
+    problems = [f"crop_id 비어 있음: {x}" for x in heat if not x.get("crop_id")]
+    problems += check_rows(
+        "heat_series_daily", [dict(x, cum_start_mmdd="01-01") for x in heat], extra=("crop_id",)
+    )
+    return problems + check_rows("sun_series_daily", [dict(x, cum_start_mmdd="01-01") for x in sun])

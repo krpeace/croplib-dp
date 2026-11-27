@@ -13,12 +13,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent / "data"))
 
-from heat_sun_fakes import KEY, FakeAsos, FakeClock, _dicts, dicts_with_common  # noqa: E402
+from heat_sun_fakes import (  # noqa: E402
+    KEY,
+    FakeAsos,
+    FakeClock,
+    _dicts,
+    check_memory_rows,
+    dicts_with_common,
+)
 
 from croplib_dp.collectors import heat_sun as H  # noqa: E402
 from croplib_dp.collectors.water import RunLog  # noqa: E402
 from croplib_dp.io.asos_cache import AsosCache  # noqa: E402
-from croplib_dp.io.contract import check_rows  # noqa: E402
 
 TODAY = pd.Timestamp("2026-10-25 09:20")
 
@@ -69,8 +75,7 @@ def test_heat_rows_whole_year_with_lead_and_contract():
     assert future["gdd_cum"] is None and future["gdd_normal_cum"] is not None
     assert today["t_base_c"] == 4 and today["normal_from"] == 2016 and today["normal_to"] == 2025
     assert {x["crop_id"] for x in r.heat_daily} == {"apple", "kimchi_cabbage"}
-    assert check_rows("heat_daily", r.heat_daily) == []
-    assert check_rows("sun_daily", r.sun_daily) == []
+    assert check_memory_rows(r.heat_daily, r.sun_daily) == []
 
 
 def test_sun_rows_only_where_sunlight_measured():
@@ -147,7 +152,7 @@ def test_common_crop_base_5c_included_in_heat_daily():
     assert len(common_rows) == 365
     assert common_rows[0]["date"] == "2026-01-01" and common_rows[-1]["date"] == "2026-12-31"
     assert all(x["t_base_c"] == 5.0 for x in common_rows)
-    assert check_rows("heat_daily", r.heat_daily) == []
+    assert check_memory_rows(heat=r.heat_daily) == []
     assert "작물 공통" in H.brief_text(r)
 
 
@@ -327,7 +332,7 @@ def test_new_year_day_makes_only_the_normal_line_for_the_new_year():
     sun = _rows(r.sun_daily, 2027, stn_id="101")
     assert len(sun) == 365
     assert all(x["rs_cum_mj"] is None and x["rs_normal_cum_mj"] is not None for x in sun)
-    assert check_rows("heat_daily", r.heat_daily) == [] and check_rows("sun_daily", r.sun_daily) == []
+    assert check_memory_rows(r.heat_daily, r.sun_daily) == []
 
 
 def test_dec_31_missing_on_jan_1_stays_empty_and_is_not_cached_then_filled_on_jan_2(tmp_path):
@@ -403,7 +408,7 @@ def test_station_with_only_zero_radiation_overwrites_old_rows_with_empty_values(
         assert x["rs_day_mj"] is None and x["rs_cum_mj"] is None
         assert x["rs_normal_day_mj"] is None and x["rs_normal_cum_mj"] is None
         assert x["filled"] is True and x["normal_from"] == 2016 and x["normal_to"] == 2025
-    assert check_rows("sun_daily", rows) == []
+    assert check_memory_rows(sun=rows) == []
     assert next(x for x in r.stations if x["stn_id"] == "101")["sun"] == "자료 없음"
 
 
@@ -457,7 +462,7 @@ def test_yeongju_like_station_with_one_normal_day_gets_empty_rows():
     assert len(rows) == 365 and _normal_days(rows) == 0
     assert all(x["rs_day_mj"] is None and x["rs_cum_mj"] is None and x["filled"] is True for x in rows)
     assert next(x for x in r.stations if x["stn_id"] == "101")["sun"] == "자료 없음"
-    assert check_rows("sun_daily", rows) == []
+    assert check_memory_rows(sun=rows) == []
 
 
 def test_new_station_like_244_normal_days_is_kept():

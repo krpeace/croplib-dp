@@ -5,10 +5,10 @@ core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Sup
 - 새해 1월 1~3일(PREV_YEAR_DAYS)에는 작년도 12/31 까지 다시 계산해 마감한다. 1/1 의 '어제'는 작년 12/31 이라
   올해 구간이 거꾸로(시작 > 끝)라서 올해는 평년선만 만들고, 작년 12/31 값을 채운다 (이슈 #40, 결정 0018).
 - 기준온도는 작물 사전 crops.t_base_c (표준값 층). 비어 있으면 그 작물은 계산하지 않고 문제로 남긴다.
-- 일사를 재지 않는 지점(sumGsr 가 하나도 없음)은 sun_daily 줄을 만들지 않는다.
-- sun_daily 는 관측 일사만 쓴다. 0.01×Ra 보다 작은 값과 한 달 대부분이 무효인 달의 값은 비우고,
+- 일사를 재지 않는 지점(sumGsr 가 하나도 없음)은 sun_series_daily 줄을 만들지 않는다.
+- sun_series_daily 는 관측 일사만 쓴다. 0.01×Ra 보다 작은 값과 한 달 대부분이 무효인 달의 값은 비우고,
   일조시간·기온차 추정값은 섞지 않는다(결정 0020). 값은 있었는데 모두 걸러졌거나 평년선의 유효 일수가
-  100일 미만인 지점(일사 미측정 지점)은, DB 에 이미 올라간 옛 줄을 지우지 않고 같은 키로 값을 비운 줄을
+  100일 미만인 지점(일사 미측정 지점)은, 새 표에 이미 올라간 줄을 지우지 않고 같은 키로 값을 비운 줄을
   올려 덮어쓴다(삭제 없음).
 - 한 지점이 끝내 받지 못하면 그 지점만 빼고, 회차를 실패로 남긴다(조용히 넘어가지 않음).
 - 대상 지점은 운영 중인 지점(stations.is_active = true) 전부다. 폐지·휴지 지점은 올해 관측이 없어
@@ -17,7 +17,7 @@ core/heat_sun 으로 한 해 표를 만들고, 계약 검사를 통과하면 Sup
   올해는 늘 새로 받는다. 결과 계산은 같다 (결정 0017).
 - 적산 계열 (이슈 #127 · #135, 결정 0038 · 0041): 뷰 `crop_accum_series` 에서 읽은
   계열(기준온도 × 누적 시작 월-일)마다 새 표(heat_series_daily·sun_series_daily)에 쓴다.
-  3단계부터 옛 표(heat_daily·sun_daily)에는 쓰지 않는다.
+  옛 표는 3단계(#135)에서 쓰기를 멈췄고 DB 에서 지워졌다(계약 v2.5, 이름 정리 #137).
   같은 기준온도의 일값·평년은 한 번만 계산하고 누적만 계열마다 따로 낸다.
   새 표가 유일한 출력이라, 계약에 어긋나거나 올리지 못하거나 뷰를 읽지 못하면 아무것도 올리지 않거나
   문제 목록에 남기고 회차를 실패로 한다. 알림 요약(지점 줄)은 옛 줄 모양의 계산 결과(메모리에만 둠)에서 낸다.
@@ -113,6 +113,7 @@ class HeatSunResult:
     year: int  # 올해. 아래 normal_from·normal_to 와 stations 도 올해 묶음 기준이다
     normal_from: int
     normal_to: int
+    # heat_daily · sun_daily: 옛 줄 모양의 계산 결과. 메모리에만 두는 이름이고 DB 표가 아니다(#137).
     heat_daily: list[dict] = field(default_factory=list)  # 계산한 모든 해(1/1~3 에는 작년+올해)
     sun_daily: list[dict] = field(default_factory=list)
     heat_series_daily: list[dict] = field(default_factory=list)  # 적산 계열 새 표 (이슈 #127)
@@ -167,7 +168,7 @@ def _r(v, n=2):
 def _empty_sun_rows(
     stn_id: str, year: int, nf: int, nt: int, start: tuple[int, int] = (1, 1), **key
 ) -> list[dict]:
-    """값을 모두 비운 sun 줄(그해 누적 시작 ~ 12/31, 기본 1/1). 옛 줄을 지우지 않고 덮어쓰는 데 쓴다.
+    """값을 모두 비운 sun 줄(그해 누적 시작 ~ 12/31, 기본 1/1). DB 의 줄을 지우지 않고 덮어쓰는 데 쓴다.
     key: 새 표의 cum_start_mmdd"""
     first = dt.date(year, *start)
     return [
@@ -189,7 +190,7 @@ def _empty_sun_rows(
 
 
 def _heat_row(x: dict, stn_id: str, t_base_c, nf: int, nt: int, **key) -> dict:
-    """year_table 한 줄 → heat 줄. key: 옛 표는 crop_id, 새 표는 cum_start_mmdd"""
+    """year_table 한 줄 → heat 줄. key: 옛 줄 모양은 crop_id, 새 표는 cum_start_mmdd"""
     return dict(
         stn_id=stn_id,
         **key,
@@ -303,7 +304,7 @@ def build_station(
     def sun_rows(start=(1, 1), **key) -> list[dict]:
         if not enough and had_raw:
             # 값은 있었는데 모두 걸러졌거나 평년선이 100일 미만(영주형) → 일사 미측정 지점.
-            # DB 의 옛 줄은 지우지 않고 빈 값 줄로 덮어쓴다
+            # DB 에 이미 있는 줄은 지우지 않고 빈 값 줄로 덮어쓴다
             return _empty_sun_rows(stn_id, year, nf, nt, start, **key)
         if not enough:
             return []
@@ -461,7 +462,7 @@ def check(r: HeatSunResult) -> list[str]:
 
 def publish(r: HeatSunResult, writer) -> None:
     """계약 검사를 통과하면 새 표 둘(heat_series_daily · sun_series_daily)만 덮어쓴다 (이슈 #135, 결정 0041).
-    옛 표(heat_daily · sun_daily)에는 쓰지 않는다. 새 표가 유일한 출력이므로
+    새 표가 유일한 출력이므로
     계약에 어긋나면 아무것도 올리지 않고, 올리기가 실패해도 문제로 남겨 회차를 실패로 한다."""
     probs = check_series(r)
     if probs:

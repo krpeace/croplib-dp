@@ -86,7 +86,7 @@ def _read(f):
 
 def test_exact_size_from_the_rpc_when_the_function_exists():
     f = FakeSupabase()
-    f.rpc_result = {"db_bytes": 420 * 1024 * 1024, "tables": {"heat_daily": 1}}
+    f.rpc_result = {"db_bytes": 420 * 1024 * 1024, "tables": {"heat_series_daily": 1}}
     s = _read(f)
     assert s["exact"] is True and s["mb"] == pytest.approx(420.0) and s["source"] == "rpc"
     assert f.head_calls == []  # 정확한 값이 있으면 줄 수를 세지 않는다
@@ -94,11 +94,14 @@ def test_exact_size_from_the_rpc_when_the_function_exists():
 
 def test_falls_back_to_the_estimate_when_the_function_is_missing_404():
     f = FakeSupabase()
-    f.counts = {"heat_daily": 114_975, "soil_water_daily": 37_200, "sun_daily": 26_280, "water_balance_daily": 10_140,
+    f.counts = {"heat_series_daily": 114_975, "soil_water_daily": 37_200, "sun_series_daily": 26_280, "water_balance_daily": 10_140,
                 "water_outlook": 5_640, "weather_daily": 3_187, "water_outlook_summary": 1_405, "forecast_runs": 282}  # fmt: skip
     s = _read(f)
     assert s["exact"] is False and s["source"] == "estimate" and s["mb"] == pytest.approx(57.0, abs=1.0)
-    assert sorted(f.head_calls) == sorted(R.COUNT_TABLES)  # 표 8개만, 한 번씩
+    assert sorted(f.head_calls) == sorted(R.COUNT_TABLES)  # 추정 대상 표만, 한 번씩
+    assert not {"heat_daily", "sun_daily"} & set(
+        f.head_calls
+    )  # 지워진 표는 읽지 않는다(404 → 조회 실패, #137)
 
 
 @pytest.mark.parametrize("status", [401, 403])

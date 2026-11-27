@@ -6,7 +6,7 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 - 업로드 전 검사(컬럼, 단위, 값 범위)는 `src/croplib_dp/io/`에 둔다.
 - **하루 강수량(`rain_mm`, 예보 `rain_fcst_mm`·`rain_expected_mm`)의 상한은 1,000 mm**다(`io/contract.py`의 `DAILY_RAIN_MAX_MM`, 결정 0027). 옛 500 mm는 2026-08-17 294 거제의 실제 654.3 mm를 막았다. DB에는 이 범위 제약이 없다(CropMon 마이그레이션 확인). CropMon 계약서 306행의 "0~500" 문구 정정은 결정 0027의 요청 문안.
 
-현재 맞춘 계약 버전: v1.5 (2026-10-28, 작물 공통 토양 물 상태 `soil_water_daily`, `soil_types.is_estimated` 및 추정 3종, `crops.common`, CropMon#35·결정 0014). v1.4: 적산온도 `heat_daily`·적산일사 `sun_daily`, 작물 사전 `t_base_c` (2026-10-26). v1.3: 3일 전망 요약 `water_outlook_summary` (2026-10-28, 구조 그대로·문구만: `status_start` 휴면기 판정 기준 = 회차 발표 날짜, CropMon#37·결정 0015). v1.2: 3일 전망 선행일 0~4, 원자료 버킷 `raw`. 업로드 전 검사는 `io/contract.py`. 계산 결과의 열 이름과 상태 코드를 맞췄다. 재배 방식별 Kc(`crop_kc_sets`)는 기후보정 전 표값이고, 보정은 `core/kc.py`가 한다.
+현재 맞춘 계약 버전: v1.5 (2026-10-28, 작물 공통 토양 물 상태 `soil_water_daily`, `soil_types.is_estimated` 및 추정 3종, `crops.common`, CropMon#35·결정 0014). v1.4: 적산온도 `heat_daily`·적산일사 `sun_daily`(두 표는 v2.5에서 지워짐), 작물 사전 `t_base_c` (2026-10-26). v1.3: 3일 전망 요약 `water_outlook_summary` (2026-10-28, 구조 그대로·문구만: `status_start` 휴면기 판정 기준 = 회차 발표 날짜, CropMon#37·결정 0015). v1.2: 3일 전망 선행일 0~4, 원자료 버킷 `raw`. 업로드 전 검사는 `io/contract.py`. 계산 결과의 열 이름과 상태 코드를 맞췄다. 재배 방식별 Kc(`crop_kc_sets`)는 기후보정 전 표값이고, 보정은 `core/kc.py`가 한다.
 
 ## 농장별 계산 결과 `farm_water_daily`·`farm_water_outlook`·`farm_water_outlook_summary` (계약 v2.1, 결정 0040)
 - 공개 표와 같은 열에서 `scenario_id` → `farm_id`. `farm_water_daily` 키 `(farm_id, date)`(+ `farm_season_id` · `irr_l` · `irr_net_mm` · `taw_mm` · `raw_mm`), `farm_water_outlook` 키 `(farm_id, target_date)` · **최신 회차만**(`run_id` → `forecast_runs`), `farm_water_outlook_summary` 키 `farm_id` · 최신만. 상태 코드는 공개 표와 같은 여섯(`etc_only` 포함, 전망은 `wet` 없음). 이 저장소가 서버 키로 쓴다(`farm_calc.yml`).
@@ -23,18 +23,18 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 
 ## 적산 계열 `heat_series_daily`·`sun_series_daily` (계약 v2.2, CropMon PR #188·결정 0038)
 - 적산온도는 작목 기준온도와 기상청 기온만으로 계산하므로, 값을 가르는 것은 **기준온도**와 **누적 시작 월-일**(`cum_start_mmdd`, `'MM-DD'`) 둘뿐이다(= 적산 계열). `crop_id`는 없다.
-- `heat_series_daily` 키 `(stn_id, t_base_c, cum_start_mmdd, date)`, 값 열은 `heat_daily`와 같다(`gdd_day`·`gdd_cum`·`gdd_normal_day`·`gdd_normal_cum`·`lead_days`·`normal_from`·`normal_to`·`filled`·`calc_version`). `t_base_c`는 자릿수 없는 `numeric`(-10~30).
-- `sun_series_daily` 키 `(stn_id, cum_start_mmdd, date)`, 값 열은 `sun_daily`와 같다.
+- `heat_series_daily` 키 `(stn_id, t_base_c, cum_start_mmdd, date)`, 값 열은 `gdd_day`·`gdd_cum`·`gdd_normal_day`·`gdd_normal_cum`·`lead_days`·`normal_from`·`normal_to`·`filled`·`calc_version`이다. `t_base_c`는 자릿수 없는 `numeric`(-10~30).
+- `sun_series_daily` 키 `(stn_id, cum_start_mmdd, date)`, 값 열은 `rs_day_mj`·`rs_cum_mj`·`rs_normal_day_mj`·`rs_normal_cum_mj`·`normal_from`·`normal_to`·`filled`·`calc_version`이다.
 - 계열 목록은 뷰 `crop_accum_series`(작형마다 한 줄 + 작물 공통 한 줄: `crop_id`, `season_type_id`, `heat_t_base_c`, `heat_cum_start_mmdd`, `sun_cum_start_mmdd`)에서 읽는다. 시설가온은 `heat_*`가 비어 적산온도를 내지 않는다.
-- **누적 시작 전 날은 줄을 쓰지 않는다.** 누적·평년 누적·`lead_days`는 누적 시작부터 센다. 일값은 시작이 달라도 같다. 식·평년·빈 날 처리는 옛 표와 같다. (5, 01-01) 계열 = `heat_daily`의 `crop_id = common` 줄, `sun_series_daily`의 01-01 계열 = `sun_daily`.
-- **3단계(#135, 결정 0041, 2026-11-25)부터 새 표 둘만 쓴다.** 옛 표 `heat_daily`·`sun_daily`에는 더 쓰지 않는다(이미 있는 줄은 그대로 두고, 지우는 것은 CropMon 몫). 새 표가 계약에 어긋나거나 올리기에 실패하면 수집 결과(문제 목록)에 남기고 회차를 실패로 한다. 옛 줄과 같은 줄을 새 표에서 찾는 법은 위 (5, 01-01) · 01-01 계열이다. 업로드 전 검사는 `io/contract.py`의 `SPECS`.
+- **누적 시작 전 날은 줄을 쓰지 않는다.** 누적·평년 누적·`lead_days`는 누적 시작부터 센다. 일값은 시작이 달라도 같다. 식·평년·빈 날 처리는 옛 표 때와 같다. 옛 표 `heat_daily`·`sun_daily`는 **지워졌다(계약 v2.5, CropMon #211·PR #212, 2026-11-26)**. 옛 `heat_daily`의 `crop_id = common` 줄은 (5, 01-01) 계열, 옛 `sun_daily`는 `sun_series_daily`의 01-01 계열에 해당한다.
+- **3단계(#135, 결정 0041, 2026-11-25)부터 새 표 둘만 쓴다.** 옛 표에는 더 쓰지 않으며, 두 표는 그 뒤 CropMon이 지웠다(v2.5). 새 표가 계약에 어긋나거나 올리기에 실패하면 수집 결과(문제 목록)에 남기고 회차를 실패로 한다. 업로드 전 검사는 `io/contract.py`의 `SPECS`.
 
 ## `soil_water_daily` (계약 v1.5, CropMon#35·결정 0014)
 - 키: `(stn_id, soil_code, date)`. 대표 10곳(`has_forecast`) × 토성 12종(FAO-56 Table 19 9종 + Saxton & Rawls 추정 3종). `OBS_ALL_STATIONS=true`면 운영 지점(`is_active`) 전부(관측만 하는 지점은 이 표와 `weather_daily`만, 결정 0026). CropMon 계약서의 "대표 10곳" 문구 정정은 CropMon 요청 P5.
 - 고정 조건: 겉흙 깊이 Zr = 0.5 m, Kc = 1.0, p = 0.40, 해마다 3/1에 Dr = 0(포장용수량)으로 시작해 11/30까지 계산. 12~2월은 `status = 'winter'`, `dr_mm`·`aw_pct`·`dp_mm`·`days_to_dry`는 빈 칸.
 - 상태 코드 6종(위에서부터 처음 맞는 것): `winter`(12~2월), `pool`(끝 Dr < 0.05 mm 이고 당일 또는 전날 DP ≥ 1 mm), `ample`(`aw_pct` ≥ 80), `fair`(60 ≤ `aw_pct` < 80), `dry`(30 ≤ `aw_pct` < 60), `very_dry`(`aw_pct` < 30).
 - `days_to_dry`: `fair`일 때만 ⌈(RAW − Dr) ÷ 7일 평균 ETo⌉ (평균 ETo 0이면 빈 칸).
-- 작물 공통 적산온도는 `heat_daily`에 `crop_id = 'common'`(기준온도 5℃, 단계 1,000·2,000 ℃·일)으로 저장한다.
+- 작물 공통 적산온도(`crops.common`, 기준온도 5℃, 단계 1,000·2,000 ℃·일)는 `heat_series_daily`의 `t_base_c = 5`·`cum_start_mmdd = '01-01'` 계열로 저장한다.
 
 ## `weather_daily.rs_source` (C7, 결정 0020·0026 — CropMon 칸 반영 대기)
 - 칸: 문자, 비어도 됨. 허용값 `observed`(관측 일사) / `sunshine`(일조시간, 식35) / `temp_range`(기온차, 식50) / 비움(ETo 없음). ETo의 일사를 어디서 얻었는지(일사 없는 32곳의 신뢰도 표시).
