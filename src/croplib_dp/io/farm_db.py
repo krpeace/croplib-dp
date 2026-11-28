@@ -55,9 +55,14 @@ class FarmDb:
     def farms(self) -> list[dict]:
         return self._all(
             "farms",
-            "farm_id,stn_id,soil_code,irrigated_area_m2,crop_id,season_type_id,kc_set_id",
+            "farm_id,stn_id,soil_code,irrigated_area_m2,crop_id,season_type_id,kc_set_id,"
+            "irrigation_method,zr_m,l_ini_d,l_dev_d,l_mid_d,l_late_d",
             "farm_id",
         )
+
+    def irrigation_methods(self) -> list[dict]:
+        """관수 방식 사전(CropMon v2.6): 방식 코드와 관수효율. 공개 계산의 관수효율(코드 기본값)과는 따로다."""
+        return self._all("irrigation_methods", "method_code,efficiency", "method_code")
 
     def seasons(self) -> list[dict]:
         return self._all(

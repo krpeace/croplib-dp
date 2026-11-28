@@ -13,9 +13,21 @@ DB 테이블·컬럼·단위·발표 회차 정의는 CropMon 저장소의 `docs
 
 ## 농장별 계산 결과 `farm_water_daily`·`farm_water_outlook`·`farm_water_outlook_summary` (계약 v2.1, 결정 0040)
 - 공개 표와 같은 열에서 `scenario_id` → `farm_id`. `farm_water_daily` 키 `(farm_id, date)`(+ `farm_season_id` · `irr_l` · `irr_net_mm` · `taw_mm` · `raw_mm`), `farm_water_outlook` 키 `(farm_id, target_date)` · **최신 회차만**(`run_id` → `forecast_runs`), `farm_water_outlook_summary` 키 `farm_id` · 최신만. 상태 코드는 공개 표와 같은 여섯(`etc_only` 포함, 전망은 `wet` 없음). 이 저장소가 서버 키로 쓴다(`farm_calc.yml`).
-- 계산 규칙: 작기는 `farm_seasons`의 날짜로 고른다(해를 넘어도 Dr 이어받음). 관수 mm = 그날 합(L) ÷ 관수 면적 × 관수효율 0.95, 작기 밖 기록은 넣지 않는다(`irr_l`도 0). 시설은 그날까지 기록 0건인 날 `etc_only`, **첫 기록 날의 끝 Dr = 0**, 다음 날부터 비 0 물수지. 노지는 공개 조건과 같은 값. 작물 공통 농장은 계산하지 않는다. 오늘 기록은 3일 전망의 오늘(lead 0, 저녁 회차는 출발일) 단계에 들어간다.
+- 계산 규칙: 작기는 `farm_seasons`의 날짜로 고른다(해를 넘어도 Dr 이어받음). 관수 mm = 그날 합(L) ÷ 관수 면적 × 관수효율(회원의 관수 방식, 아래 v2.6 칸), 작기 밖 기록은 넣지 않는다(`irr_l`도 0). 시설은 그날까지 기록 0건인 날 `etc_only`, **첫 기록 날의 끝 Dr = 0**, 다음 날부터 비 0 물수지. 노지는 공개 조건과 같은 값. 작물 공통 농장은 계산하지 않는다. 오늘 기록은 3일 전망의 오늘(lead 0, 저녁 회차는 출발일) 단계에 들어간다.
 - 입력: 관측은 `weather_daily`, 3일 전망은 같은 회차의 공개 전망 줄(`water_outlook`)로 되살린 예보표(공공 API 호출 없음). 시작 전인 작기만 있는 농장은 물수지 · 전망 · 요약 줄이 없다.
 - `farm_calc_status`는 `done_at` · `result`(`ok`/`failed`) · `error`(짧은 말) · `calc_version`만 쓴다(`requested_at` · `recalc_from`은 DB 트리거). `done_at`은 그 계산이 대기 줄을 읽기 시작한 시각(대기 중이던 농장은 읽은 `requested_at` 값).
+
+### 농장 계산이 읽는 회원 설정 (계약 v2.6, CropMon #215, 결정 0043 — 이 저장소는 읽기만)
+| 칸 | 뜻 | 비었을 때 | 못 읽거나 틀릴 때 |
+| --- | --- | --- | --- |
+| `farms.irrigation_method` → `irrigation_methods.efficiency` (`method_code` 키) | 관수효율(0 < x ≤ 1). 근권 순관수량과 `advice_gross = advice_net ÷ 효율`에 같은 값 | 비어 있으면 안 됨 | 그 농장 `failed` "관수 방식 값을 읽지 못함" |
+| `farms.zr_m` | 뿌리 깊이(m) → TAW · RAW (p는 `crops.p`) | `crops.zr_m` | 0 이하 · 숫자 아님: "뿌리 깊이 값이 올바르지 않음" |
+| `farms.l_ini_d` · `l_dev_d` · `l_mid_d` · `l_late_d` | 생육 단계 일수. Kc 곡선과 기후보정 구간(중기 · 후기)이 따라감 | 넷 다 비면 `crop_seasons` 값 | 일부만 · 1 이상 정수 아님: "단계 일수 값이 올바르지 않음" |
+
+- 지금 작기 줄은 시작일 + 네 단계 합 − 1이 `farm_seasons.end_date`와 같아야 한다. 다르면 그 농장 `failed` "작기 끝 날짜가 단계 일수와 다름"(결과 표는 쓰지도 지우지도 않음). 끝난 지 3일 안인 지난 줄은 확인하지 않는다.
+- 지난 줄에는 작형이 농장의 지금 작형과 같을 때만 `zr_m` · `l_*`를 적용하고, 다르면 사전 값. 관수효율은 지금 값.
+- `irrigation_methods` 표를 읽지 못하면 실행 전체가 오류로 끝난다(대기 요청은 남음).
+- 시작일은 `farm_seasons.start_date`만 읽는다(`start_source`는 읽지 않음). 공개 계산은 이 칸들을 읽지 않고, 공개 관수효율 0.95는 `irrigation_methods.drip`과 따로 관리한다.
 
 ## 시설 재배 공개 조건 `etc_only` (계약 v2.1, CropMon PR #185·결정 0039)
 - `crop_seasons.is_protected = true`(포도 비가림 · 시설가온)는 지붕 아래라 **비를 계산에 넣지 않고**, 공개 조건은 **판정하지 않고 "쓰는 물"(ETc)만** 낸다. 사과 · 고랭지배추는 거짓이라 바뀌지 않는다.

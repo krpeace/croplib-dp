@@ -36,6 +36,7 @@ class Soil:
     taw_mm: float
     raw_mm: float
     dr0_mm: float = 0.0  # 계산 첫날 전날 끝 고갈량 (0 = 포장용수량에서 출발)
+    # 공개 계산의 값. CropMon 의 irrigation_methods.drip(0.95)과는 따로 관리한다(농장 계산은 그 사전을 읽음)
     ea: float = 0.95  # 관수효율 (공급 관수량 × ea = 순관수량)
 
     @classmethod
