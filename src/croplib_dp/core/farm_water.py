@@ -13,6 +13,7 @@ DB·API·파일을 모르는 순수 함수만 둔다. 공개 조건의 계산 �
 import datetime as dt
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -55,6 +56,37 @@ def to_date(v: Any) -> dt.date:
     if isinstance(v, pd.Timestamp):
         return v.date()
     return v if isinstance(v, dt.date) else dt.date.fromisoformat(str(v)[:10])
+
+
+# ── 회원 설정 (CropMon v2.6, 이슈 #140) ──────────────────────────────────────
+STAGE_COLS = ("l_ini_d", "l_dev_d", "l_mid_d", "l_late_d")
+
+
+def irrigation_efficiency(code: Any, efficiencies: Mapping[str, Any]) -> float:
+    """관수 방식 코드 → 관수효율(`irrigation_methods.efficiency`, 0 < x <= 1). 코드가 비었거나 사전에 없거나
+    값을 읽을 수 없으면 ValueError — 기본값으로 대신하지 않는다."""
+    v = num(efficiencies.get(code)) if code else None
+    if v is None or not 0 < v <= 1:
+        raise ValueError("관수 방식 값을 읽지 못함")
+    return v
+
+
+def with_stage_days(crop: CropParams, settings: Mapping) -> CropParams:
+    """회원의 생육 단계 일수(`l_ini_d` ~ `l_late_d`)가 넷 다 있으면 덮어쓰고, 넷 다 비면 그대로.
+    일부만 있거나 1 이상의 정수가 아니면 ValueError(0 일은 Kc 곡선이 0 으로 나눈다)."""
+    raw = [settings.get(c) for c in STAGE_COLS]
+    if all(v is None for v in raw):
+        return crop
+    days = [num(v) for v in raw]
+    if any(v is None or v < 1 or not v.is_integer() for v in days):
+        raise ValueError("단계 일수 값이 올바르지 않음")
+    ini, dev, mid, late = (int(v) for v in days)
+    return replace(crop, l_ini=ini, l_dev=dev, l_mid=mid, l_late=late)
+
+
+def season_last_day(crop: CropParams) -> dt.date:
+    """작기 마지막 날(끝 포함) = 시작일 + 네 단계 일수 합 - 1"""
+    return crop.season_start + dt.timedelta(days=crop.l_ini + crop.l_dev + crop.l_mid + crop.l_late - 1)
 
 
 # ── 작기 고르기 ──────────────────────────────────────────────────────────────

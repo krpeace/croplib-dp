@@ -35,12 +35,15 @@ from croplib_dp.core.farm_water import (
     daily_logs,
     farm_outlook,
     first_record,
+    irrigation_efficiency,
     num,
     rebuild_ft,
+    season_last_day,
     seasons_to_calc,
     stale_dates,
     to_date,
     water_rows,
+    with_stage_days,
 )
 from croplib_dp.core.kc import adjust_crop, stage_climate
 from croplib_dp.core.outlook import fill_from_forecast, pooled_errors
@@ -174,11 +177,27 @@ def _protected(d: Dictionaries, season_type_id: str) -> bool:
     return v is True or str(v).strip().lower() == "true"
 
 
-def _soil(d: Dictionaries, farm: dict, crop_id: str) -> Soil:
+def _soil(d: Dictionaries, farm: dict, crop_id: str, settings: dict, ea: float) -> Soil:
+    """TAW · RAW 는 토성과 뿌리 깊이(회원 설정 `zr_m`, 비면 작물 사전)로, 관수효율 ea 는 회원의 관수 방식으로.
+    근권 순관수량과 권장 공급량(advice_gross = advice_net ÷ ea)은 모두 이 Soil.ea 하나를 쓴다."""
     s, c = d.soils.get(farm["soil_code"]) or {}, d.crops.get(crop_id) or {}
     if s.get("fc") is None or s.get("wp") is None or c.get("zr_m") is None or c.get("p") is None:
         raise FarmError("토성 · 작물 값이 비어 있음")
-    return Soil.from_soil(float(s["fc"]), float(s["wp"]), float(c["zr_m"]), float(c["p"]))
+    zr = float(c["zr_m"])
+    if settings.get("zr_m") is not None:
+        try:
+            zr = num(settings["zr_m"])
+        except ValueError as e:
+            raise FarmError("뿌리 깊이 값이 올바르지 않음") from e
+        if zr is None or zr <= 0:
+            raise FarmError("뿌리 깊이 값이 올바르지 않음")
+    return Soil.from_soil(float(s["fc"]), float(s["wp"]), zr, float(c["p"]), ea=ea)
+
+
+def _settings(farm: dict, season_type_id: str) -> dict:
+    """이 작기 줄에 적용할 회원의 작물 설정(뿌리 깊이 · 단계 일수). 지금 줄의 작형은 늘 농장의 작형이다.
+    지난 줄의 작형이 지금과 다르면(작물을 바꾼 농장) 새 작물의 설정을 섞지 않고 사전 값을 쓴다."""
+    return farm if season_type_id == farm["season_type_id"] else {}
 
 
 # ── 입력 모으기 (지점마다 한 번) ──────────────────────────────────────────────
@@ -263,7 +282,13 @@ class FarmOut:
 
 
 def calc_farm(
-    farm: dict, seasons: list[dict], logs: list[dict], d: Dictionaries, inp: Inputs, today: dt.date
+    farm: dict,
+    seasons: list[dict],
+    logs: list[dict],
+    d: Dictionaries,
+    inp: Inputs,
+    today: dt.date,
+    efficiencies: dict[str, Any],
 ) -> FarmOut:
     """농장 한 곳의 계산 결과(DB 에 쓰기 전). 실패하면 FarmError(짧은 말)."""
     out = FarmOut()
@@ -283,9 +308,20 @@ def calc_farm(
     area = num(farm["irrigated_area_m2"])
     if not area or area <= 0:
         raise FarmError("관수 면적 값이 올바르지 않음")
+    try:
+        ea = irrigation_efficiency(farm.get("irrigation_method"), efficiencies)
+    except ValueError as e:
+        raise FarmError("관수 방식 값을 읽지 못함") from e
     for s in todo:
         scen = _season_scenario(d, s)
-        crop0 = crop_params(d, scen)
+        settings = _settings(farm, s["season_type_id"])
+        try:
+            crop0 = with_stage_days(crop_params(d, scen), settings)  # 기후보정 구간보다 먼저
+        except ValueError as e:
+            raise FarmError("단계 일수 값이 올바르지 않음") from e
+        # 지금 줄만 확인한다: 지난 줄은 sync_farm_seasons 가 다시 맞추지 않는다(옛 끝이 남거나 잘린다)
+        if s is cur and season_last_day(crop0) != to_date(s["end_date"]):
+            raise FarmError("작기 끝 날짜가 단계 일수와 다름")
         crop = adjust_crop(
             crop0,
             stage_climate([w for w in weather if w["date"] >= crop0.season_start], crop0),
@@ -293,7 +329,7 @@ def calc_farm(
         )
         sd, ed = to_date(s["start_date"]), to_date(s["end_date"])
         prot = _protected(d, s["season_type_id"])
-        soil = _soil(d, farm, s["crop_id"])
+        soil = _soil(d, farm, s["crop_id"], settings, ea)
         # 예보표의 ETc 는 이 작기의 Kc 로 만든다(지난 작기 마감에는 채움에 쓰는 ETo 만 필요하다)
         ft, newest = inp.ft(stn, crop.kc)
         fill = fill_from_forecast(ft) if len(ft) else {}
@@ -447,6 +483,8 @@ def run(
     existing_by: dict[str, list[dict]] = defaultdict(list)
     for r in db.existing_daily(sorted(ids)):
         existing_by[r["farm_id"]].append(r)
+    # 관수 방식 사전은 한 번만. 읽지 못하면 농장마다가 아니라 실행 전체가 이유를 남기고 오류로 끝난다
+    efficiencies = {r["method_code"]: r.get("efficiency") for r in db.irrigation_methods()}
     for farm, pend in chosen:
         fid = farm["farm_id"]
         done_at = status[fid]["requested_at"] if pend else read_at
@@ -458,7 +496,7 @@ def run(
                 )  # 계산 없음: 어떤 작기 줄에도 안 드는 옛 줄 · 전망 · 요약만 지운다
                 res.n_common += 1
             else:
-                out = calc_farm(farm, seasons, logs_by.get(fid, []), d, inp, today)
+                out = calc_farm(farm, seasons, logs_by.get(fid, []), d, inp, today, efficiencies)
                 check_out(out)
                 if out.warn:
                     res.n_outlook_warn += 1

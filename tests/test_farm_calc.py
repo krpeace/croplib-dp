@@ -63,6 +63,12 @@ class FakeDb:
         self.fetched, self.strs = dict(fetched or {}), strs
         self.daily, self.outlook, self.summary = {}, {}, {}
         self.calls, self.synced, self.hooks = Counter(), 0, {}
+        # drip 0.95 = 공개 계산의 관수효율과 같은 값 (설정이 빈 농장이 공개 결과와 같다는 시험의 전제)
+        self.methods = [
+            dict(method_code="drip", efficiency="0.95"),
+            dict(method_code="sprinkler", efficiency="0.75"),
+            dict(method_code="furrow", efficiency="0.40"),
+        ]
 
     def _hook(self, name):
         if name in self.hooks:
@@ -107,6 +113,10 @@ class FakeDb:
         self.calls["outlook_src"] += 1
         ids = set(run_ids)
         return [_strs(r) if self.strs else r for r in copy.deepcopy(self.ol) if r["run_id"] in ids]
+
+    def irrigation_methods(self):
+        self.calls["irrigation_methods"] += 1
+        return copy.deepcopy(self.methods)
 
     # 쓰기
     def sync_all(self):
@@ -180,7 +190,7 @@ def make_db(world, farms, seasons, logs=(), status=None, **kw):
 
 
 def farm(fid=FARM, crop="apple", season="apple-main", **kw):
-    return dict(
+    row = dict(
         farm_id=fid,
         stn_id="101",
         soil_code="loam",
@@ -188,8 +198,15 @@ def farm(fid=FARM, crop="apple", season="apple-main", **kw):
         crop_id=crop,
         season_type_id=season,
         kc_set_id=None,
-        **kw,
+        irrigation_method="drip",  # v2.6 회원 설정 (모두 기본 · 빈칸)
+        zr_m=None,
+        l_ini_d=None,
+        l_dev_d=None,
+        l_mid_d=None,
+        l_late_d=None,
     )
+    row.update(kw)
+    return row
 
 
 def fseason(
@@ -342,7 +359,7 @@ def wx_rows(start, n, eto=3.0, rain=0.0):
 def test_season_crossing_the_new_year_keeps_dr_continuous_and_is_not_cut_at_jan_1(world):
     now = pd.Timestamp("2027-02-10 10:00", tz="Asia/Seoul")
     f = farm()
-    s = fseason(start="2026-12-01", end="2027-06-30", sid="s-x")
+    s = fseason(start="2026-12-01", end="2027-06-28", sid="s-x")
     db = FakeDb(
         [f],
         [s],
@@ -376,7 +393,7 @@ def test_moving_the_start_later_ignores_old_logs_and_removes_old_rows(world):
     db = make_db(
         world,
         [f],
-        [fseason(start="2026-06-03", end="2026-12-01")],
+        [fseason(start="2026-06-03", end="2026-12-29")],
         [
             dict(log_id=1, farm_id=FARM, date="2026-06-01", volume_l=5000.0),
             dict(log_id=2, farm_id=FARM, date="2026-06-05", volume_l=1000.0),
@@ -412,7 +429,7 @@ def test_season_that_ended_two_days_ago_gets_its_last_day_recalculated(world):
 
 
 def test_season_not_started_yet_has_no_rows_and_old_outlook_rows_are_deleted(world):
-    db = make_db(world, [farm()], [fseason(start="2026-07-01", end="2026-11-30")])
+    db = make_db(world, [farm()], [fseason(start="2026-07-01", end="2027-01-26")])
     db.outlook[(FARM, "2026-06-09")] = dict(farm_id=FARM, run_id=1, target_date="2026-06-09")
     db.summary[FARM] = dict(farm_id=FARM, run_id=1)
     res = go(db, world)
@@ -422,7 +439,8 @@ def test_season_not_started_yet_has_no_rows_and_old_outlook_rows_are_deleted(wor
 # ── ③ ④ ⑤ 시설 ───────────────────────────────────────────────────────────────
 def prot_db(world, logs=(), status=None, season_start="2026-06-01"):
     f = farm(crop="grape", season="grape-heated")
-    s = fseason(crop="grape", season="grape-heated", start=season_start, end="2026-11-10", sid="s-p")
+    end = (dt.date.fromisoformat(season_start) + dt.timedelta(days=189)).isoformat()  # 시설가온 190일
+    s = fseason(crop="grape", season="grape-heated", start=season_start, end=end, sid="s-p")
     return make_db(world, [f], [s], list(logs), status=status)
 
 
